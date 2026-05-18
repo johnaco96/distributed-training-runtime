@@ -7,10 +7,12 @@ use std::time::{Duration, SystemTime};
 
 use runtime_proto::runtime::v1::{
     CheckpointId, CheckpointState, DatasetId, DatasetMetadata, RegisterDatasetRequest,
-    RegisterRunRequest, RegisterWorkerRequest, RunId, ShardMetadata, WorkerId, WorkerState,
+    RegisterRunRequest, RegisterWorkerRequest, RunId, ShardLeaseState, ShardMetadata, WorkerId,
+    WorkerState,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const SHARD_LEASE_DURATION: Duration = Duration::from_secs(30);
 
 /// Shared coordinator state.
 ///
@@ -115,6 +117,34 @@ pub struct RegisteredDataset {
     pub dataset_id: DatasetId,
     pub accepted_shard_count: u32,
     pub registered_at: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShardAssignmentRecord {
+    pub run_id: String,
+    pub dataset_id: String,
+    pub shard_id: String,
+    pub worker_id: String,
+    pub lease_epoch: u64,
+    pub lease_state: i32,
+    pub lease_expires_at: SystemTime,
+    pub progress_offset: i64,
+    pub shard_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShardAssignments {
+    pub assignments: Vec<ShardAssignmentRecord>,
+    pub assignment_policy: i32,
+    pub server_time: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GetShardAssignmentsError {
+    RunNotFound,
+    WorkerNotFound,
+    DatasetNotFound,
+    EmptyWorldSize,
 }
 
 impl CoordinatorState {
@@ -244,6 +274,62 @@ impl CoordinatorState {
             dataset_id: DatasetId { value: dataset_id },
             accepted_shard_count,
             registered_at,
+        })
+    }
+
+    pub fn get_shard_assignments(
+        &self,
+        run_id: &RunId,
+        worker_id: &WorkerId,
+        dataset_id: &DatasetId,
+    ) -> Result<ShardAssignments, GetShardAssignmentsError> {
+        let inner = self.inner.read().expect("coordinator state lock poisoned");
+        let run = inner
+            .runs
+            .get(&run_id.value)
+            .ok_or(GetShardAssignmentsError::RunNotFound)?;
+
+        let worker = inner
+            .workers_by_run
+            .get(&run_id.value)
+            .and_then(|workers| workers.get(&worker_id.value))
+            .ok_or(GetShardAssignmentsError::WorkerNotFound)?;
+        let dataset = inner
+            .datasets_by_run
+            .get(&run_id.value)
+            .and_then(|datasets| datasets.get(&dataset_id.value))
+            .ok_or(GetShardAssignmentsError::DatasetNotFound)?;
+
+        if run.world_size == 0 {
+            return Err(GetShardAssignmentsError::EmptyWorldSize);
+        }
+
+        let server_time = SystemTime::now();
+        let lease_expires_at = server_time + SHARD_LEASE_DURATION;
+        let world_size = run.world_size as usize;
+        let worker_rank = worker.rank as usize;
+        let assignments = dataset
+            .shards
+            .iter()
+            .enumerate()
+            .filter(|(shard_index, _)| *shard_index % world_size == worker_rank)
+            .map(|(_, shard)| ShardAssignmentRecord {
+                run_id: run.run_id.clone(),
+                dataset_id: dataset.dataset_id.clone(),
+                shard_id: shard.shard_id.clone(),
+                worker_id: worker.worker_id.clone(),
+                lease_epoch: 1,
+                lease_state: ShardLeaseState::Leased as i32,
+                lease_expires_at,
+                progress_offset: 0,
+                shard_uri: shard.shard_uri.clone(),
+            })
+            .collect();
+
+        Ok(ShardAssignments {
+            assignments,
+            assignment_policy: run.assignment_policy,
+            server_time,
         })
     }
 

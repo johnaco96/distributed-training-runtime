@@ -6,7 +6,7 @@ use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
 
-use crate::state::CoordinatorState;
+use crate::state::{CoordinatorState, GetShardAssignmentsError};
 
 #[derive(Clone, Debug)]
 pub struct CoordinatorServiceImpl {
@@ -113,11 +113,68 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn get_shard_assignment(
         &self,
-        _request: Request<GetShardAssignmentRequest>,
+        request: Request<GetShardAssignmentRequest>,
     ) -> Result<Response<GetShardAssignmentResponse>, Status> {
-        Err(Status::unimplemented(
-            "GetShardAssignment is not implemented yet",
-        ))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let worker_id = request
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let dataset_id = request
+            .dataset_id
+            .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
+
+        let shard_assignments = self
+            .state
+            .get_shard_assignments(&run_id, &worker_id, &dataset_id)
+            .map_err(|error| match error {
+                GetShardAssignmentsError::RunNotFound => {
+                    Status::not_found(format!("run {} was not found", run_id.value))
+                }
+                GetShardAssignmentsError::WorkerNotFound => {
+                    Status::not_found(format!("worker {} was not found", worker_id.value))
+                }
+                GetShardAssignmentsError::DatasetNotFound => {
+                    Status::not_found(format!("dataset {} was not found", dataset_id.value))
+                }
+                GetShardAssignmentsError::EmptyWorldSize => {
+                    Status::failed_precondition("run world_size must be greater than zero")
+                }
+            })?;
+
+        let assignments = shard_assignments
+            .assignments
+            .into_iter()
+            .map(|assignment| ShardAssignment {
+                run_id: Some(RunId {
+                    value: assignment.run_id,
+                }),
+                dataset_id: Some(DatasetId {
+                    value: assignment.dataset_id,
+                }),
+                shard_id: Some(ShardId {
+                    value: assignment.shard_id,
+                }),
+                worker_id: Some(WorkerId {
+                    value: assignment.worker_id,
+                }),
+                lease_epoch: assignment.lease_epoch,
+                lease_state: assignment.lease_state,
+                lease_expires_at: Some(assignment.lease_expires_at.into()),
+                progress_offset: assignment.progress_offset,
+                shard_uri: assignment.shard_uri,
+            })
+            .collect();
+
+        let response = GetShardAssignmentResponse {
+            assignments,
+            assignment_policy: shard_assignments.assignment_policy,
+            server_time: Some(shard_assignments.server_time.into()),
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn renew_shard_lease(
@@ -209,22 +266,37 @@ mod tests {
     use runtime_proto::runtime::v1::{AssignmentPolicy, StorageBackendKind};
 
     fn register_request(idempotency_key: &str) -> RegisterRunRequest {
+        register_request_with_world_size(idempotency_key, 8)
+    }
+
+    fn register_request_with_world_size(
+        idempotency_key: &str,
+        world_size: u32,
+    ) -> RegisterRunRequest {
         RegisterRunRequest {
             idempotency_key: idempotency_key.to_string(),
             run_name: "service-test-run".to_string(),
             assignment_policy: AssignmentPolicy::ReassignQueue as i32,
             storage_backend_kind: StorageBackendKind::S3Compatible as i32,
-            world_size: 8,
+            world_size,
             run_version: "2026-05-18".to_string(),
         }
     }
 
     fn worker_request(run_id: RunId, idempotency_key: &str) -> RegisterWorkerRequest {
+        worker_request_with_rank(run_id, idempotency_key, 3)
+    }
+
+    fn worker_request_with_rank(
+        run_id: RunId,
+        idempotency_key: &str,
+        rank: u32,
+    ) -> RegisterWorkerRequest {
         RegisterWorkerRequest {
             idempotency_key: idempotency_key.to_string(),
             run_id: Some(run_id),
             worker_id: None,
-            rank: 3,
+            rank,
             host: "worker-host".to_string(),
             sdk_version: "sdk-0.1.0".to_string(),
             protocol_version: "runtime.v1".to_string(),
@@ -232,8 +304,18 @@ mod tests {
     }
 
     async fn create_run(service: &CoordinatorServiceImpl) -> RunId {
+        create_run_with_world_size(service, 8).await
+    }
+
+    async fn create_run_with_world_size(
+        service: &CoordinatorServiceImpl,
+        world_size: u32,
+    ) -> RunId {
         service
-            .register_run(Request::new(register_request("service-key")))
+            .register_run(Request::new(register_request_with_world_size(
+                "service-key",
+                world_size,
+            )))
             .await
             .expect("register_run should succeed")
             .into_inner()
@@ -648,6 +730,238 @@ mod tests {
         assert_eq!(first.worker_id, second.worker_id);
         assert_eq!(first.state, second.state);
         assert_eq!(first.lease_renewal_deadline, second.lease_renewal_deadline);
+    }
+
+    async fn register_dataset_for_assignment(
+        service: &CoordinatorServiceImpl,
+        run_id: RunId,
+    ) -> DatasetId {
+        service
+            .register_dataset(Request::new(dataset_request(
+                run_id,
+                "dataset-key",
+                Some("dataset-explicit"),
+                &[
+                    Some("shard-0"),
+                    Some("shard-1"),
+                    Some("shard-2"),
+                    Some("shard-3"),
+                    Some("shard-4"),
+                ],
+            )))
+            .await
+            .expect("register_dataset should succeed")
+            .into_inner()
+            .dataset_id
+            .expect("register dataset response should include dataset_id")
+    }
+
+    async fn register_worker_for_assignment(
+        service: &CoordinatorServiceImpl,
+        run_id: RunId,
+        rank: u32,
+        idempotency_key: &str,
+    ) -> WorkerId {
+        service
+            .register_worker(Request::new(worker_request_with_rank(
+                run_id,
+                idempotency_key,
+                rank,
+            )))
+            .await
+            .expect("register_worker should succeed")
+            .into_inner()
+            .worker_id
+            .expect("register worker response should include worker_id")
+    }
+
+    #[tokio::test]
+    async fn get_shard_assignment_under_unknown_run_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+
+        let error = service
+            .get_shard_assignment(Request::new(GetShardAssignmentRequest {
+                run_id: Some(RunId {
+                    value: "missing-run".to_string(),
+                }),
+                worker_id: Some(WorkerId {
+                    value: "worker-1".to_string(),
+                }),
+                dataset_id: Some(DatasetId {
+                    value: "dataset-1".to_string(),
+                }),
+                idempotency_key: "assignment-key".to_string(),
+            }))
+            .await
+            .expect_err("unknown run should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_shard_assignment_under_unknown_worker_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+
+        let error = service
+            .get_shard_assignment(Request::new(GetShardAssignmentRequest {
+                run_id: Some(run_id),
+                worker_id: Some(WorkerId {
+                    value: "missing-worker".to_string(),
+                }),
+                dataset_id: Some(dataset_id),
+                idempotency_key: "assignment-key".to_string(),
+            }))
+            .await
+            .expect_err("unknown worker should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_shard_assignment_under_unknown_dataset_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-key").await;
+
+        let error = service
+            .get_shard_assignment(Request::new(GetShardAssignmentRequest {
+                run_id: Some(run_id),
+                worker_id: Some(worker_id),
+                dataset_id: Some(DatasetId {
+                    value: "missing-dataset".to_string(),
+                }),
+                idempotency_key: "assignment-key".to_string(),
+            }))
+            .await
+            .expect_err("unknown dataset should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn static_rank_assignment_returns_matching_shards() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 1, "worker-key").await;
+
+        let response = service
+            .get_shard_assignment(Request::new(GetShardAssignmentRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_id.clone()),
+                dataset_id: Some(dataset_id.clone()),
+                idempotency_key: "assignment-key".to_string(),
+            }))
+            .await
+            .expect("get_shard_assignment should succeed")
+            .into_inner();
+
+        let shard_ids = response
+            .assignments
+            .iter()
+            .map(|assignment| assignment.shard_id.as_ref().unwrap().value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(shard_ids, vec!["shard-1", "shard-3"]);
+        assert_eq!(
+            response.assignment_policy,
+            AssignmentPolicy::ReassignQueue as i32
+        );
+        assert!(response.server_time.is_some());
+        for assignment in response.assignments {
+            assert_eq!(assignment.run_id, Some(run_id.clone()));
+            assert_eq!(assignment.dataset_id, Some(dataset_id.clone()));
+            assert_eq!(assignment.worker_id, Some(worker_id.clone()));
+            assert_eq!(assignment.lease_epoch, 1);
+            assert_eq!(assignment.lease_state, ShardLeaseState::Leased as i32);
+            assert!(assignment.lease_expires_at.is_some());
+            assert_eq!(assignment.progress_offset, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn rank_zero_and_rank_one_get_different_deterministic_shard_subsets() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_zero =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-zero").await;
+        let worker_one =
+            register_worker_for_assignment(&service, run_id.clone(), 1, "worker-one").await;
+
+        let rank_zero = service
+            .get_shard_assignment(Request::new(GetShardAssignmentRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_zero),
+                dataset_id: Some(dataset_id.clone()),
+                idempotency_key: "assignment-zero".to_string(),
+            }))
+            .await
+            .expect("rank zero assignment should succeed")
+            .into_inner();
+        let rank_one = service
+            .get_shard_assignment(Request::new(GetShardAssignmentRequest {
+                run_id: Some(run_id),
+                worker_id: Some(worker_one),
+                dataset_id: Some(dataset_id),
+                idempotency_key: "assignment-one".to_string(),
+            }))
+            .await
+            .expect("rank one assignment should succeed")
+            .into_inner();
+
+        let rank_zero_shards = rank_zero
+            .assignments
+            .iter()
+            .map(|assignment| assignment.shard_id.as_ref().unwrap().value.as_str())
+            .collect::<Vec<_>>();
+        let rank_one_shards = rank_one
+            .assignments
+            .iter()
+            .map(|assignment| assignment.shard_id.as_ref().unwrap().value.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rank_zero_shards, vec!["shard-0", "shard-2", "shard-4"]);
+        assert_eq!(rank_one_shards, vec!["shard-1", "shard-3"]);
+        assert_ne!(rank_zero_shards, rank_one_shards);
+    }
+
+    #[tokio::test]
+    async fn get_shard_assignment_includes_shard_uri_from_metadata() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-key").await;
+
+        let response = service
+            .get_shard_assignment(Request::new(GetShardAssignmentRequest {
+                run_id: Some(run_id),
+                worker_id: Some(worker_id),
+                dataset_id: Some(dataset_id),
+                idempotency_key: "assignment-key".to_string(),
+            }))
+            .await
+            .expect("get_shard_assignment should succeed")
+            .into_inner();
+
+        let shard_uris = response
+            .assignments
+            .iter()
+            .map(|assignment| assignment.shard_uri.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            shard_uris,
+            vec![
+                "s3://bucket/dataset/shard-0.jsonl",
+                "s3://bucket/dataset/shard-2.jsonl",
+                "s3://bucket/dataset/shard-4.jsonl",
+            ]
+        );
     }
 
     #[tokio::test]
