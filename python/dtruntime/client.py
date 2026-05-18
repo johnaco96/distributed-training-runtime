@@ -106,6 +106,22 @@ class RuntimeClient:
             checksum_algorithm=shard.get("checksum_algorithm", ""),
         )
 
+    def request_shard(
+        self,
+        run_id: str,
+        worker_id: str,
+        dataset_id: str,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.GetShardAssignmentResponse":
+        """Request shard assignments from the coordinator and return its response."""
+        request = self._runtime_pb2.GetShardAssignmentRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            dataset_id=self._runtime_pb2.DatasetId(value=dataset_id),
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.GetShardAssignment(request)
+
     def heartbeat(
         self,
         run_id: str,
