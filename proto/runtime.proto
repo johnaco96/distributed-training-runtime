@@ -1,0 +1,303 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// CoordinatorService is the control-plane API used by Python SDK and worker
+// helpers to coordinate runs, workers, shard leases, and checkpoints.
+// Large dataset/checkpoint payload bytes stay on the data plane.
+service CoordinatorService {
+  rpc RegisterRun(RegisterRunRequest) returns (RegisterRunResponse);
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  rpc RegisterDataset(RegisterDatasetRequest) returns (RegisterDatasetResponse);
+  rpc GetShardAssignment(GetShardAssignmentRequest) returns (GetShardAssignmentResponse);
+  rpc RenewShardLease(RenewShardLeaseRequest) returns (RenewShardLeaseResponse);
+  rpc ReportShardProgress(ReportShardProgressRequest) returns (ReportShardProgressResponse);
+
+  rpc BeginCheckpoint(BeginCheckpointRequest) returns (BeginCheckpointResponse);
+  rpc ReportCheckpointArtifact(ReportCheckpointArtifactRequest) returns (ReportCheckpointArtifactResponse);
+  rpc CommitCheckpoint(CommitCheckpointRequest) returns (CommitCheckpointResponse);
+  rpc GetLatestCheckpoint(GetLatestCheckpointRequest) returns (GetLatestCheckpointResponse);
+
+  rpc GetRunStatus(GetRunStatusRequest) returns (GetRunStatusResponse);
+}
+
+// Identifier wrappers keep message signatures explicit while using MVP string IDs.
+message RunId { string value = 1; }
+message WorkerId { string value = 1; }
+message DatasetId { string value = 1; }
+message ShardId { string value = 1; }
+message CheckpointId { string value = 1; }
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  WORKER_STATE_REGISTERING = 1;
+  WORKER_STATE_ACTIVE = 2;
+  WORKER_STATE_STALE = 3;
+  WORKER_STATE_FAILED = 4;
+  WORKER_STATE_RECOVERING = 5;
+  WORKER_STATE_REMOVED = 6;
+}
+
+enum ShardLeaseState {
+  SHARD_LEASE_STATE_UNSPECIFIED = 0;
+  SHARD_LEASE_STATE_AVAILABLE = 1;
+  SHARD_LEASE_STATE_LEASED = 2;
+  SHARD_LEASE_STATE_EXPIRED = 3;
+  SHARD_LEASE_STATE_COMPLETED = 4;
+  SHARD_LEASE_STATE_REVOKED = 5;
+}
+
+enum CheckpointState {
+  CHECKPOINT_STATE_UNSPECIFIED = 0;
+  CHECKPOINT_STATE_INITIATED = 1;
+  CHECKPOINT_STATE_UPLOAD_IN_PROGRESS = 2;
+  CHECKPOINT_STATE_VALIDATING = 3;
+  CHECKPOINT_STATE_COMMITTED = 4;
+  CHECKPOINT_STATE_FAILED = 5;
+  CHECKPOINT_STATE_ABORTED = 6;
+}
+
+enum AssignmentPolicy {
+  ASSIGNMENT_POLICY_UNSPECIFIED = 0;
+  ASSIGNMENT_POLICY_STATIC_RANK = 1;
+  ASSIGNMENT_POLICY_REASSIGN_QUEUE = 2;
+}
+
+enum StorageBackendKind {
+  STORAGE_BACKEND_KIND_UNSPECIFIED = 0;
+  STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM = 1;
+  STORAGE_BACKEND_KIND_S3_COMPATIBLE = 2;
+}
+
+message RegisterRunRequest {
+  string idempotency_key = 1;
+  string run_name = 2;
+  AssignmentPolicy assignment_policy = 3;
+  StorageBackendKind storage_backend_kind = 4;
+  uint32 world_size = 5;
+  string run_version = 6;
+}
+
+message RegisterRunResponse {
+  RunId run_id = 1;
+  string coordinator_version = 2;
+  google.protobuf.Timestamp registered_at = 3;
+}
+
+message DatasetMetadata {
+  DatasetId dataset_id = 1;
+  string name = 2;
+  string dataset_uri = 3;
+  string format = 4;
+  uint32 shard_count = 5;
+  string dataset_version = 6;
+  map<string, string> labels = 7;
+  google.protobuf.Timestamp registered_at = 8;
+}
+
+message ShardMetadata {
+  ShardId shard_id = 1;
+  DatasetId dataset_id = 2;
+  string shard_uri = 3;
+  int64 byte_range_start = 4;
+  int64 byte_range_end = 5;
+  int64 size_bytes = 6;
+  string checksum = 7;
+  string checksum_algorithm = 8;
+}
+
+message RegisterDatasetRequest {
+  string idempotency_key = 1;
+  RunId run_id = 2;
+  DatasetMetadata dataset = 3;
+  repeated ShardMetadata shards = 4;
+}
+
+message RegisterDatasetResponse {
+  DatasetId dataset_id = 1;
+  uint32 accepted_shard_count = 2;
+  google.protobuf.Timestamp registered_at = 3;
+}
+
+message RegisterWorkerRequest {
+  string idempotency_key = 1;
+  RunId run_id = 2;
+  WorkerId worker_id = 3;
+  uint32 rank = 4;
+  string host = 5;
+  string sdk_version = 6;
+  string protocol_version = 7;
+}
+
+message RegisterWorkerResponse {
+  WorkerId worker_id = 1;
+  WorkerState state = 2;
+  google.protobuf.Timestamp lease_renewal_deadline = 3;
+  google.protobuf.Timestamp server_time = 4;
+}
+
+message HeartbeatRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  string idempotency_key = 3;
+  google.protobuf.Timestamp client_time = 4;
+  repeated ShardId active_shard_ids = 5;
+}
+
+message HeartbeatResponse {
+  WorkerState state = 1;
+  google.protobuf.Timestamp next_heartbeat_deadline = 2;
+  google.protobuf.Timestamp server_time = 3;
+}
+
+message GetShardAssignmentRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  DatasetId dataset_id = 3;
+  string idempotency_key = 4;
+}
+
+message ShardAssignment {
+  RunId run_id = 1;
+  DatasetId dataset_id = 2;
+  ShardId shard_id = 3;
+  WorkerId worker_id = 4;
+  uint64 lease_epoch = 5;
+  ShardLeaseState lease_state = 6;
+  google.protobuf.Timestamp lease_expires_at = 7;
+  int64 progress_offset = 8;
+  string shard_uri = 9;
+}
+
+message GetShardAssignmentResponse {
+  repeated ShardAssignment assignments = 1;
+  AssignmentPolicy assignment_policy = 2;
+  google.protobuf.Timestamp server_time = 3;
+}
+
+message RenewShardLeaseRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  ShardId shard_id = 3;
+  uint64 lease_epoch = 4;
+  string idempotency_key = 5;
+}
+
+message RenewShardLeaseResponse {
+  bool accepted = 1;
+  ShardLeaseState lease_state = 2;
+  google.protobuf.Timestamp lease_expires_at = 3;
+  google.protobuf.Timestamp server_time = 4;
+}
+
+message ReportShardProgressRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  DatasetId dataset_id = 3;
+  ShardId shard_id = 4;
+  uint64 lease_epoch = 5;
+  int64 progress_offset = 6;
+  bool is_complete = 7;
+  string idempotency_key = 8;
+}
+
+message ReportShardProgressResponse {
+  bool accepted = 1;
+  int64 stored_progress_offset = 2;
+  ShardLeaseState lease_state = 3;
+}
+
+message BeginCheckpointRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  uint64 step = 4;
+  string idempotency_key = 5;
+}
+
+message ArtifactSpec {
+  string artifact_name = 1;
+  WorkerId owner_worker_id = 2;
+  string upload_uri = 3;
+  int64 expected_size_bytes = 4;
+  string expected_checksum = 5;
+  string checksum_algorithm = 6;
+}
+
+message BeginCheckpointResponse {
+  CheckpointId checkpoint_id = 1;
+  CheckpointState state = 2;
+  google.protobuf.Timestamp created_at = 3;
+  repeated ArtifactSpec artifact_specs = 4;
+}
+
+message ArtifactReport {
+  string artifact_name = 1;
+  string artifact_uri = 2;
+  int64 size_bytes = 3;
+  string checksum = 4;
+  string checksum_algorithm = 5;
+  google.protobuf.Timestamp uploaded_at = 6;
+}
+
+message ReportCheckpointArtifactRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  ArtifactReport artifact_report = 4;
+  string idempotency_key = 5;
+}
+
+message ReportCheckpointArtifactResponse {
+  bool accepted = 1;
+  CheckpointState checkpoint_state = 2;
+}
+
+message CommitCheckpointRequest {
+  RunId run_id = 1;
+  CheckpointId checkpoint_id = 2;
+  string idempotency_key = 3;
+}
+
+message CommitCheckpointResponse {
+  CheckpointState state = 1;
+  google.protobuf.Timestamp committed_at = 2;
+}
+
+message CheckpointManifest {
+  RunId run_id = 1;
+  CheckpointId checkpoint_id = 2;
+  uint64 step = 3;
+  CheckpointState state = 4;
+  StorageBackendKind storage_backend_kind = 5;
+  repeated ArtifactReport artifacts = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp committed_at = 8;
+}
+
+message GetLatestCheckpointRequest {
+  RunId run_id = 1;
+}
+
+message GetLatestCheckpointResponse {
+  CheckpointManifest manifest = 1;
+}
+
+message GetRunStatusRequest {
+  RunId run_id = 1;
+}
+
+message GetRunStatusResponse {
+  RunId run_id = 1;
+  string run_version = 2;
+  AssignmentPolicy assignment_policy = 3;
+  StorageBackendKind storage_backend_kind = 4;
+  CheckpointId latest_checkpoint_id = 5;
+  CheckpointState latest_checkpoint_state = 6;
+  uint32 active_worker_count = 7;
+  google.protobuf.Timestamp server_time = 8;
+}
