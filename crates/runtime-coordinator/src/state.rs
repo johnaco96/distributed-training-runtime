@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use runtime_proto::runtime::v1::{
     CheckpointId, CheckpointState, DatasetId, DatasetMetadata, RegisterDatasetRequest,
-    RegisterRunRequest, RegisterWorkerRequest, RunId, ShardLeaseState, ShardMetadata, WorkerId,
+    RegisterRunRequest, RegisterWorkerRequest, RunId, ShardId, ShardLeaseState, ShardMetadata, WorkerId,
     WorkerState,
 };
 
