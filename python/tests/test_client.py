@@ -98,6 +98,19 @@ class HeartbeatResponse:
     state: int = 0
 
 
+@dataclass
+class GetShardAssignmentRequest:
+    run_id: Optional[RunId] = None
+    worker_id: Optional[WorkerId] = None
+    dataset_id: Optional[DatasetId] = None
+    idempotency_key: str = ""
+
+
+@dataclass
+class GetShardAssignmentResponse:
+    assignments: list[object] = field(default_factory=list)
+
+
 def install_fake_generated_modules(monkeypatch):
     channel = object()
     grpc_module = types.SimpleNamespace(insecure_channel=Mock(return_value=channel))
@@ -114,6 +127,8 @@ def install_fake_generated_modules(monkeypatch):
         RegisterWorkerResponse=RegisterWorkerResponse,
         HeartbeatRequest=HeartbeatRequest,
         HeartbeatResponse=HeartbeatResponse,
+        GetShardAssignmentRequest=GetShardAssignmentRequest,
+        GetShardAssignmentResponse=GetShardAssignmentResponse,
     )
     stub = Mock()
     runtime_pb2_grpc = types.SimpleNamespace(
@@ -256,6 +271,30 @@ def test_heartbeat_builds_request_and_converts_active_shard_ids(monkeypatch):
             worker_id=WorkerId(value="worker-1"),
             idempotency_key="idem-2",
             active_shard_ids=[ShardId(value="shard-a"), ShardId(value="shard-b")],
+        )
+    )
+    assert result == response
+
+
+def test_request_shard_builds_request_and_calls_stub(monkeypatch):
+    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    response = GetShardAssignmentResponse(assignments=[object()])
+    stub.GetShardAssignment.return_value = response
+
+    client = RuntimeClient("127.0.0.1:50051")
+    result = client.request_shard(
+        run_id="run-1",
+        worker_id="worker-1",
+        dataset_id="dataset-1",
+        idempotency_key="idem-shard-1",
+    )
+
+    stub.GetShardAssignment.assert_called_once_with(
+        GetShardAssignmentRequest(
+            run_id=RunId(value="run-1"),
+            worker_id=WorkerId(value="worker-1"),
+            dataset_id=DatasetId(value="dataset-1"),
+            idempotency_key="idem-shard-1",
         )
     )
     assert result == response
