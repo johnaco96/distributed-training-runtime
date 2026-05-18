@@ -3,9 +3,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use runtime_proto::runtime::v1::{CheckpointId, CheckpointState, RegisterRunRequest, RunId};
+use runtime_proto::runtime::v1::{
+    CheckpointId, CheckpointState, RegisterRunRequest, RegisterWorkerRequest, RunId, WorkerId,
+    WorkerState,
+};
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Shared coordinator state.
 ///
@@ -15,12 +20,15 @@ use runtime_proto::runtime::v1::{CheckpointId, CheckpointState, RegisterRunReque
 pub struct CoordinatorState {
     inner: RwLock<CoordinatorStateInner>,
     next_run_id: AtomicU64,
+    next_worker_id: AtomicU64,
 }
 
 #[derive(Debug, Default)]
 struct CoordinatorStateInner {
     runs: HashMap<String, RunRecord>,
-    idempotency_keys: HashMap<String, String>,
+    run_idempotency_keys: HashMap<String, String>,
+    workers_by_run: HashMap<String, HashMap<String, WorkerRecord>>,
+    worker_idempotency_keys: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,16 +46,47 @@ pub struct RunRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct WorkerRecord {
+    pub run_id: String,
+    pub worker_id: String,
+    pub rank: u32,
+    pub host: String,
+    pub sdk_version: String,
+    pub protocol_version: String,
+    pub state: i32,
+    pub registered_at: SystemTime,
+    pub last_heartbeat_at: SystemTime,
+    pub next_heartbeat_deadline: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RegisteredRun {
     pub run_id: RunId,
     pub registered_at: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegisteredWorker {
+    pub worker_id: WorkerId,
+    pub state: i32,
+    pub lease_renewal_deadline: SystemTime,
+    pub server_time: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkerHeartbeat {
+    pub state: i32,
+    pub next_heartbeat_deadline: SystemTime,
+    pub server_time: SystemTime,
 }
 
 impl CoordinatorState {
     pub fn register_run(&self, request: RegisterRunRequest) -> RegisteredRun {
         let mut inner = self.inner.write().expect("coordinator state lock poisoned");
 
-        if let Some(run_id) = idempotency_lookup(&inner, &request.idempotency_key) {
+        if let Some(run_id) =
+            idempotency_lookup(&inner.run_idempotency_keys, &request.idempotency_key)
+        {
             let record = inner
                 .runs
                 .get(&run_id)
@@ -77,7 +116,7 @@ impl CoordinatorState {
 
         if !request.idempotency_key.is_empty() {
             inner
-                .idempotency_keys
+                .run_idempotency_keys
                 .insert(request.idempotency_key, run_id.clone());
         }
         inner.runs.insert(run_id.clone(), record);
@@ -93,18 +132,152 @@ impl CoordinatorState {
         inner.runs.get(&run_id.value).cloned()
     }
 
+    pub fn register_worker(&self, request: RegisterWorkerRequest) -> Option<RegisteredWorker> {
+        let run_id = request.run_id.as_ref()?.value.clone();
+        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
+
+        if !inner.runs.contains_key(&run_id) {
+            return None;
+        }
+
+        let idempotency_key = worker_idempotency_key(&run_id, &request.idempotency_key);
+        if let Some(worker_id) =
+            idempotency_lookup(&inner.worker_idempotency_keys, &idempotency_key)
+        {
+            let record = inner
+                .workers_by_run
+                .get(&run_id)
+                .and_then(|workers| workers.get(&worker_id))
+                .expect("worker idempotency key must reference an existing worker");
+            return Some(RegisteredWorker {
+                worker_id: WorkerId {
+                    value: record.worker_id.clone(),
+                },
+                state: record.state,
+                lease_renewal_deadline: record.registered_at + HEARTBEAT_INTERVAL,
+                server_time: record.registered_at,
+            });
+        }
+
+        let worker_id = request
+            .worker_id
+            .as_ref()
+            .map(|worker_id| worker_id.value.as_str())
+            .filter(|worker_id| !worker_id.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.generate_worker_id());
+        let now = SystemTime::now();
+        let next_heartbeat_deadline = now + HEARTBEAT_INTERVAL;
+        let worker = WorkerRecord {
+            run_id: run_id.clone(),
+            worker_id: worker_id.clone(),
+            rank: request.rank,
+            host: request.host,
+            sdk_version: request.sdk_version,
+            protocol_version: request.protocol_version,
+            state: WorkerState::Active as i32,
+            registered_at: now,
+            last_heartbeat_at: now,
+            next_heartbeat_deadline,
+        };
+
+        inner
+            .workers_by_run
+            .entry(run_id.clone())
+            .or_default()
+            .insert(worker_id.clone(), worker);
+        refresh_active_worker_count(&mut inner, &run_id);
+
+        if !request.idempotency_key.is_empty() {
+            inner
+                .worker_idempotency_keys
+                .insert(idempotency_key, worker_id.clone());
+        }
+
+        Some(RegisteredWorker {
+            worker_id: WorkerId { value: worker_id },
+            state: WorkerState::Active as i32,
+            lease_renewal_deadline: next_heartbeat_deadline,
+            server_time: now,
+        })
+    }
+
+    pub fn record_heartbeat(
+        &self,
+        run_id: &RunId,
+        worker_id: &WorkerId,
+    ) -> Option<WorkerHeartbeat> {
+        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
+
+        if !inner.runs.contains_key(&run_id.value) {
+            return None;
+        }
+
+        let worker = inner
+            .workers_by_run
+            .get_mut(&run_id.value)
+            .and_then(|workers| workers.get_mut(&worker_id.value))?;
+        let now = SystemTime::now();
+        let next_heartbeat_deadline = now + HEARTBEAT_INTERVAL;
+        worker.last_heartbeat_at = now;
+        worker.next_heartbeat_deadline = next_heartbeat_deadline;
+        worker.state = WorkerState::Active as i32;
+        let state = worker.state;
+
+        refresh_active_worker_count(&mut inner, &run_id.value);
+
+        Some(WorkerHeartbeat {
+            state,
+            next_heartbeat_deadline,
+            server_time: now,
+        })
+    }
+
     fn generate_run_id(&self) -> String {
         let id = self.next_run_id.fetch_add(1, Ordering::Relaxed) + 1;
         format!("run-{id}")
     }
+
+    fn generate_worker_id(&self) -> String {
+        let id = self.next_worker_id.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("worker-{id}")
+    }
 }
 
-fn idempotency_lookup(inner: &CoordinatorStateInner, idempotency_key: &str) -> Option<String> {
+fn idempotency_lookup(
+    idempotency_keys: &HashMap<String, String>,
+    idempotency_key: &str,
+) -> Option<String> {
     if idempotency_key.is_empty() {
         return None;
     }
 
-    inner.idempotency_keys.get(idempotency_key).cloned()
+    idempotency_keys.get(idempotency_key).cloned()
+}
+
+fn refresh_active_worker_count(inner: &mut CoordinatorStateInner, run_id: &str) {
+    let active_worker_count = inner
+        .workers_by_run
+        .get(run_id)
+        .map(|workers| {
+            workers
+                .values()
+                .filter(|worker| worker.state == WorkerState::Active as i32)
+                .count() as u32
+        })
+        .unwrap_or_default();
+
+    if let Some(run) = inner.runs.get_mut(run_id) {
+        run.active_worker_count = active_worker_count;
+    }
+}
+
+fn worker_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
+    if idempotency_key.is_empty() {
+        return String::new();
+    }
+
+    format!("{run_id}:{idempotency_key}")
 }
 
 #[cfg(test)]
