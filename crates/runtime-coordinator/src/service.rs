@@ -5,7 +5,6 @@ use std::sync::Arc;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
-use tracing::debug;
 
 use crate::state::CoordinatorState;
 
@@ -120,20 +119,21 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn get_run_status(
         &self,
-        _request: Request<GetRunStatusRequest>,
+        request: Request<GetRunStatusRequest>,
     ) -> Result<Response<GetRunStatusResponse>, Status> {
-        debug!("GetRunStatus called; returning minimal skeleton response");
+        let request = request.into_inner();
 
-        Ok(Response::new(GetRunStatusResponse {
-            run_id: None,
-            run_name: String::new(),
-            world_size: 0,
-            worker_count: 0,
-            active_leases: 0,
+        let response = GetRunStatusResponse {
+            run_id: request.run_id,
+            run_version: String::new(),
+            assignment_policy: 0,
+            storage_backend_kind: 0,
             latest_checkpoint_id: None,
-            last_updated_at: None,
-            status_message: "runtime-coordinator skeleton: status tracking not implemented"
-                .to_string(),
-        }))
+            latest_checkpoint_state: 0,
+            active_worker_count: 0,
+            server_time: None,
+        };
+
+        Ok(Response::new(response))
     }
 }
