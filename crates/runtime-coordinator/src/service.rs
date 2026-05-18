@@ -89,11 +89,26 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn register_dataset(
         &self,
-        _request: Request<RegisterDatasetRequest>,
+        request: Request<RegisterDatasetRequest>,
     ) -> Result<Response<RegisterDatasetResponse>, Status> {
-        Err(Status::unimplemented(
-            "RegisterDataset is not implemented yet",
-        ))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let registered = self
+            .state
+            .register_dataset(request)
+            .ok_or_else(|| Status::not_found(format!("run {} was not found", run_id.value)))?;
+
+        let response = RegisterDatasetResponse {
+            dataset_id: Some(registered.dataset_id),
+            accepted_shard_count: registered.accepted_shard_count,
+            registered_at: Some(registered.registered_at.into()),
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn get_shard_assignment(
@@ -226,6 +241,51 @@ mod tests {
             .expect("register response should include run_id")
     }
 
+    fn dataset_request(
+        run_id: RunId,
+        idempotency_key: &str,
+        dataset_id: Option<&str>,
+        shard_ids: &[Option<&str>],
+    ) -> RegisterDatasetRequest {
+        let dataset_id = dataset_id.map(|value| DatasetId {
+            value: value.to_string(),
+        });
+        let shards = shard_ids
+            .iter()
+            .enumerate()
+            .map(|(index, shard_id)| ShardMetadata {
+                shard_id: (*shard_id).map(|value| ShardId {
+                    value: value.to_string(),
+                }),
+                dataset_id: None,
+                shard_uri: format!("s3://bucket/dataset/shard-{index}.jsonl"),
+                byte_range_start: (index as i64) * 100,
+                byte_range_end: ((index as i64) + 1) * 100 - 1,
+                size_bytes: 100,
+                checksum: format!("checksum-{index}"),
+                checksum_algorithm: "sha256".to_string(),
+            })
+            .collect();
+
+        RegisterDatasetRequest {
+            idempotency_key: idempotency_key.to_string(),
+            run_id: Some(run_id),
+            dataset: Some(DatasetMetadata {
+                dataset_id,
+                name: "training-data".to_string(),
+                dataset_uri: "s3://bucket/dataset".to_string(),
+                format: "jsonl".to_string(),
+                shard_count: shard_ids.len() as u32,
+                dataset_version: "v1".to_string(),
+                labels: [("split".to_string(), "train".to_string())]
+                    .into_iter()
+                    .collect(),
+                registered_at: None,
+            }),
+            shards,
+        }
+    }
+
     #[tokio::test]
     async fn register_run_and_get_run_status_round_trip() {
         let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
@@ -284,6 +344,179 @@ mod tests {
 
         assert_eq!(first.run_id, second.run_id);
         assert_eq!(first.registered_at, second.registered_at);
+    }
+
+    #[tokio::test]
+    async fn register_dataset_under_existing_run_succeeds() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let response = service
+            .register_dataset(Request::new(dataset_request(
+                run_id,
+                "dataset-key",
+                Some("dataset-explicit"),
+                &[Some("shard-a"), Some("shard-b")],
+            )))
+            .await
+            .expect("register_dataset should succeed")
+            .into_inner();
+
+        assert_eq!(
+            response.dataset_id,
+            Some(DatasetId {
+                value: "dataset-explicit".to_string(),
+            })
+        );
+        assert_eq!(response.accepted_shard_count, 2);
+        assert!(response.registered_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn register_dataset_under_unknown_run_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+
+        let error = service
+            .register_dataset(Request::new(dataset_request(
+                RunId {
+                    value: "missing".to_string(),
+                },
+                "dataset-key",
+                Some("dataset-explicit"),
+                &[Some("shard-a")],
+            )))
+            .await
+            .expect_err("unknown run should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn register_dataset_stores_shard_metadata() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let response = service
+            .register_dataset(Request::new(dataset_request(
+                run_id.clone(),
+                "dataset-key",
+                Some("dataset-explicit"),
+                &[Some("shard-a"), Some("shard-b")],
+            )))
+            .await
+            .expect("register_dataset should succeed")
+            .into_inner();
+        let dataset_id = response
+            .dataset_id
+            .expect("register dataset response should include dataset_id");
+        let record = service
+            .state
+            .get_dataset(&run_id, &dataset_id)
+            .expect("registered dataset should be stored");
+
+        assert_eq!(record.run_id, run_id.value);
+        assert_eq!(record.dataset_id, "dataset-explicit");
+        assert_eq!(record.name, "training-data");
+        assert_eq!(record.dataset_uri, "s3://bucket/dataset");
+        assert_eq!(record.format, "jsonl");
+        assert_eq!(record.shard_count, 2);
+        assert_eq!(record.dataset_version, "v1");
+        assert_eq!(record.labels.get("split"), Some(&"train".to_string()));
+        assert_eq!(record.shards.len(), 2);
+        assert_eq!(record.shards[0].shard_id, "shard-a");
+        assert_eq!(record.shards[0].dataset_id, "dataset-explicit");
+        assert_eq!(
+            record.shards[0].shard_uri,
+            "s3://bucket/dataset/shard-0.jsonl"
+        );
+        assert_eq!(record.shards[0].byte_range_start, 0);
+        assert_eq!(record.shards[0].byte_range_end, 99);
+        assert_eq!(record.shards[0].size_bytes, 100);
+        assert_eq!(record.shards[0].checksum, "checksum-0");
+        assert_eq!(record.shards[0].checksum_algorithm, "sha256");
+        assert_eq!(record.shards[1].shard_id, "shard-b");
+    }
+
+    #[tokio::test]
+    async fn register_dataset_reuses_dataset_for_idempotency_key() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let first = service
+            .register_dataset(Request::new(dataset_request(
+                run_id.clone(),
+                "dataset-key",
+                None,
+                &[Some("shard-a")],
+            )))
+            .await
+            .expect("first register_dataset should succeed")
+            .into_inner();
+        let second = service
+            .register_dataset(Request::new(dataset_request(
+                run_id,
+                "dataset-key",
+                Some("different-dataset"),
+                &[Some("different-shard"), Some("another-shard")],
+            )))
+            .await
+            .expect("second register_dataset should succeed")
+            .into_inner();
+
+        assert_eq!(first.dataset_id, second.dataset_id);
+        assert_eq!(first.accepted_shard_count, second.accepted_shard_count);
+        assert_eq!(first.registered_at, second.registered_at);
+    }
+
+    #[tokio::test]
+    async fn empty_dataset_id_generates_dataset_id() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let response = service
+            .register_dataset(Request::new(dataset_request(
+                run_id,
+                "dataset-key",
+                None,
+                &[Some("shard-a")],
+            )))
+            .await
+            .expect("register_dataset should succeed")
+            .into_inner();
+
+        assert_eq!(
+            response.dataset_id,
+            Some(DatasetId {
+                value: "dataset-1".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_shard_id_generates_shard_ids() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let response = service
+            .register_dataset(Request::new(dataset_request(
+                run_id.clone(),
+                "dataset-key",
+                Some("dataset-explicit"),
+                &[None, None],
+            )))
+            .await
+            .expect("register_dataset should succeed")
+            .into_inner();
+        let dataset_id = response
+            .dataset_id
+            .expect("register dataset response should include dataset_id");
+        let record = service
+            .state
+            .get_dataset(&run_id, &dataset_id)
+            .expect("registered dataset should be stored");
+
+        assert_eq!(record.shards[0].shard_id, "shard-1");
+        assert_eq!(record.shards[1].shard_id, "shard-2");
     }
 
     #[tokio::test]

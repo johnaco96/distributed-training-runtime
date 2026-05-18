@@ -6,8 +6,8 @@ use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
 use runtime_proto::runtime::v1::{
-    CheckpointId, CheckpointState, RegisterRunRequest, RegisterWorkerRequest, RunId, WorkerId,
-    WorkerState,
+    CheckpointId, CheckpointState, DatasetId, DatasetMetadata, RegisterDatasetRequest,
+    RegisterRunRequest, RegisterWorkerRequest, RunId, ShardMetadata, WorkerId, WorkerState,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -21,6 +21,8 @@ pub struct CoordinatorState {
     inner: RwLock<CoordinatorStateInner>,
     next_run_id: AtomicU64,
     next_worker_id: AtomicU64,
+    next_dataset_id: AtomicU64,
+    next_shard_id: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -29,6 +31,8 @@ struct CoordinatorStateInner {
     run_idempotency_keys: HashMap<String, String>,
     workers_by_run: HashMap<String, HashMap<String, WorkerRecord>>,
     worker_idempotency_keys: HashMap<String, String>,
+    datasets_by_run: HashMap<String, HashMap<String, DatasetRecord>>,
+    dataset_idempotency_keys: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +64,32 @@ pub struct WorkerRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DatasetRecord {
+    pub run_id: String,
+    pub dataset_id: String,
+    pub name: String,
+    pub dataset_uri: String,
+    pub format: String,
+    pub shard_count: u32,
+    pub dataset_version: String,
+    pub labels: HashMap<String, String>,
+    pub registered_at: SystemTime,
+    pub shards: Vec<ShardRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShardRecord {
+    pub shard_id: String,
+    pub dataset_id: String,
+    pub shard_uri: String,
+    pub byte_range_start: i64,
+    pub byte_range_end: i64,
+    pub size_bytes: i64,
+    pub checksum: String,
+    pub checksum_algorithm: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RegisteredRun {
     pub run_id: RunId,
     pub registered_at: SystemTime,
@@ -78,6 +108,13 @@ pub struct WorkerHeartbeat {
     pub state: i32,
     pub next_heartbeat_deadline: SystemTime,
     pub server_time: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegisteredDataset {
+    pub dataset_id: DatasetId,
+    pub accepted_shard_count: u32,
+    pub registered_at: SystemTime,
 }
 
 impl CoordinatorState {
@@ -130,6 +167,84 @@ impl CoordinatorState {
     pub fn get_run(&self, run_id: &RunId) -> Option<RunRecord> {
         let inner = self.inner.read().expect("coordinator state lock poisoned");
         inner.runs.get(&run_id.value).cloned()
+    }
+
+    pub fn get_dataset(&self, run_id: &RunId, dataset_id: &DatasetId) -> Option<DatasetRecord> {
+        let inner = self.inner.read().expect("coordinator state lock poisoned");
+        inner
+            .datasets_by_run
+            .get(&run_id.value)
+            .and_then(|datasets| datasets.get(&dataset_id.value))
+            .cloned()
+    }
+
+    pub fn register_dataset(&self, request: RegisterDatasetRequest) -> Option<RegisteredDataset> {
+        let run_id = request.run_id.as_ref()?.value.clone();
+        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
+
+        if !inner.runs.contains_key(&run_id) {
+            return None;
+        }
+
+        let idempotency_key = dataset_idempotency_key(&run_id, &request.idempotency_key);
+        if let Some(dataset_id) =
+            idempotency_lookup(&inner.dataset_idempotency_keys, &idempotency_key)
+        {
+            let record = inner
+                .datasets_by_run
+                .get(&run_id)
+                .and_then(|datasets| datasets.get(&dataset_id))
+                .expect("dataset idempotency key must reference an existing dataset");
+            return Some(RegisteredDataset {
+                dataset_id: DatasetId {
+                    value: record.dataset_id.clone(),
+                },
+                accepted_shard_count: record.shards.len() as u32,
+                registered_at: record.registered_at,
+            });
+        }
+
+        let dataset = request.dataset.unwrap_or_default();
+        let dataset_id =
+            dataset_id_from_metadata(&dataset).unwrap_or_else(|| self.generate_dataset_id());
+        let registered_at = SystemTime::now();
+        let shards = request
+            .shards
+            .into_iter()
+            .map(|shard| self.shard_record(shard, &dataset_id))
+            .collect::<Vec<_>>();
+
+        let record = DatasetRecord {
+            run_id: run_id.clone(),
+            dataset_id: dataset_id.clone(),
+            name: dataset.name,
+            dataset_uri: dataset.dataset_uri,
+            format: dataset.format,
+            shard_count: dataset.shard_count,
+            dataset_version: dataset.dataset_version,
+            labels: dataset.labels,
+            registered_at,
+            shards,
+        };
+        let accepted_shard_count = record.shards.len() as u32;
+
+        inner
+            .datasets_by_run
+            .entry(run_id.clone())
+            .or_default()
+            .insert(dataset_id.clone(), record);
+
+        if !request.idempotency_key.is_empty() {
+            inner
+                .dataset_idempotency_keys
+                .insert(idempotency_key, dataset_id.clone());
+        }
+
+        Some(RegisteredDataset {
+            dataset_id: DatasetId { value: dataset_id },
+            accepted_shard_count,
+            registered_at,
+        })
     }
 
     pub fn register_worker(&self, request: RegisterWorkerRequest) -> Option<RegisteredWorker> {
@@ -242,6 +357,44 @@ impl CoordinatorState {
         let id = self.next_worker_id.fetch_add(1, Ordering::Relaxed) + 1;
         format!("worker-{id}")
     }
+
+    fn generate_dataset_id(&self) -> String {
+        let id = self.next_dataset_id.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("dataset-{id}")
+    }
+
+    fn generate_shard_id(&self) -> String {
+        let id = self.next_shard_id.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("shard-{id}")
+    }
+
+    fn shard_record(&self, shard: ShardMetadata, dataset_id: &str) -> ShardRecord {
+        let shard_id = shard
+            .shard_id
+            .as_ref()
+            .map(|shard_id| shard_id.value.as_str())
+            .filter(|shard_id| !shard_id.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.generate_shard_id());
+        let shard_dataset_id = shard
+            .dataset_id
+            .as_ref()
+            .map(|dataset_id| dataset_id.value.as_str())
+            .filter(|dataset_id| !dataset_id.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| dataset_id.to_string());
+
+        ShardRecord {
+            shard_id,
+            dataset_id: shard_dataset_id,
+            shard_uri: shard.shard_uri,
+            byte_range_start: shard.byte_range_start,
+            byte_range_end: shard.byte_range_end,
+            size_bytes: shard.size_bytes,
+            checksum: shard.checksum,
+            checksum_algorithm: shard.checksum_algorithm,
+        }
+    }
 }
 
 fn idempotency_lookup(
@@ -273,11 +426,28 @@ fn refresh_active_worker_count(inner: &mut CoordinatorStateInner, run_id: &str) 
 }
 
 fn worker_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
+    scoped_idempotency_key(run_id, idempotency_key)
+}
+
+fn dataset_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
+    scoped_idempotency_key(run_id, idempotency_key)
+}
+
+fn scoped_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
     if idempotency_key.is_empty() {
         return String::new();
     }
 
     format!("{run_id}:{idempotency_key}")
+}
+
+fn dataset_id_from_metadata(dataset: &DatasetMetadata) -> Option<String> {
+    dataset
+        .dataset_id
+        .as_ref()
+        .map(|dataset_id| dataset_id.value.as_str())
+        .filter(|dataset_id| !dataset_id.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
