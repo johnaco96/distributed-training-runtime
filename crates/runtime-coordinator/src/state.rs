@@ -139,12 +139,30 @@ pub struct ShardAssignments {
     pub server_time: SystemTime,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenewedShardLease {
+    pub accepted: bool,
+    pub lease_state: i32,
+    pub lease_expires_at: SystemTime,
+    pub server_time: SystemTime,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GetShardAssignmentsError {
     RunNotFound,
     WorkerNotFound,
     DatasetNotFound,
     EmptyWorldSize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenewShardLeaseError {
+    RunNotFound,
+    WorkerNotFound,
+    ShardNotFound,
+    EmptyWorldSize,
+    NotShardOwner,
+    InvalidLeaseEpoch,
 }
 
 impl CoordinatorState {
@@ -329,6 +347,62 @@ impl CoordinatorState {
         Ok(ShardAssignments {
             assignments,
             assignment_policy: run.assignment_policy,
+            server_time,
+        })
+    }
+
+    pub fn renew_shard_lease(
+        &self,
+        run_id: &RunId,
+        worker_id: &WorkerId,
+        shard_id: &ShardId,
+        lease_epoch: u64,
+    ) -> Result<RenewedShardLease, RenewShardLeaseError> {
+        let inner = self.inner.read().expect("coordinator state lock poisoned");
+        let run = inner
+            .runs
+            .get(&run_id.value)
+            .ok_or(RenewShardLeaseError::RunNotFound)?;
+
+        let worker = inner
+            .workers_by_run
+            .get(&run_id.value)
+            .and_then(|workers| workers.get(&worker_id.value))
+            .ok_or(RenewShardLeaseError::WorkerNotFound)?;
+
+        let (shard_index, _) = inner
+            .datasets_by_run
+            .get(&run_id.value)
+            .and_then(|datasets| {
+                datasets.values().find_map(|dataset| {
+                    dataset
+                        .shards
+                        .iter()
+                        .enumerate()
+                        .find(|(_, shard)| shard.shard_id == shard_id.value)
+                })
+            })
+            .ok_or(RenewShardLeaseError::ShardNotFound)?;
+
+        if run.world_size == 0 {
+            return Err(RenewShardLeaseError::EmptyWorldSize);
+        }
+
+        let world_size = run.world_size as usize;
+        let worker_rank = worker.rank as usize;
+        if shard_index % world_size != worker_rank {
+            return Err(RenewShardLeaseError::NotShardOwner);
+        }
+
+        if lease_epoch != 1 {
+            return Err(RenewShardLeaseError::InvalidLeaseEpoch);
+        }
+
+        let server_time = SystemTime::now();
+        Ok(RenewedShardLease {
+            accepted: true,
+            lease_state: ShardLeaseState::Leased as i32,
+            lease_expires_at: server_time + SHARD_LEASE_DURATION,
             server_time,
         })
     }

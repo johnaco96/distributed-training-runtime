@@ -6,7 +6,7 @@ use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
 
-use crate::state::{CoordinatorState, GetShardAssignmentsError};
+use crate::state::{CoordinatorState, GetShardAssignmentsError, RenewShardLeaseError};
 
 #[derive(Clone, Debug)]
 pub struct CoordinatorServiceImpl {
@@ -179,11 +179,52 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn renew_shard_lease(
         &self,
-        _request: Request<RenewShardLeaseRequest>,
+        request: Request<RenewShardLeaseRequest>,
     ) -> Result<Response<RenewShardLeaseResponse>, Status> {
-        Err(Status::unimplemented(
-            "RenewShardLease is not implemented yet",
-        ))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let worker_id = request
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let shard_id = request
+            .shard_id
+            .ok_or_else(|| Status::invalid_argument("shard_id is required"))?;
+
+        let renewed = self
+            .state
+            .renew_shard_lease(&run_id, &worker_id, &shard_id, request.lease_epoch)
+            .map_err(|error| match error {
+                RenewShardLeaseError::RunNotFound => {
+                    Status::not_found(format!("run {} was not found", run_id.value))
+                }
+                RenewShardLeaseError::WorkerNotFound => {
+                    Status::not_found(format!("worker {} was not found", worker_id.value))
+                }
+                RenewShardLeaseError::ShardNotFound => {
+                    Status::not_found(format!("shard {} was not found", shard_id.value))
+                }
+                RenewShardLeaseError::EmptyWorldSize => {
+                    Status::failed_precondition("run world_size must be greater than zero")
+                }
+                RenewShardLeaseError::NotShardOwner => Status::failed_precondition(format!(
+                    "worker {} is not the owner of shard {}",
+                    worker_id.value, shard_id.value
+                )),
+                RenewShardLeaseError::InvalidLeaseEpoch => {
+                    Status::failed_precondition("lease_epoch does not match current assignment")
+                }
+            })?;
+
+        let response = RenewShardLeaseResponse {
+            accepted: renewed.accepted,
+            lease_state: renewed.lease_state,
+            lease_expires_at: Some(renewed.lease_expires_at.into()),
+            server_time: Some(renewed.server_time.into()),
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn report_shard_progress(
@@ -962,6 +1003,138 @@ mod tests {
                 "s3://bucket/dataset/shard-4.jsonl",
             ]
         );
+    }
+
+    fn renew_request(
+        run_id: RunId,
+        worker_id: WorkerId,
+        shard_id: &str,
+        lease_epoch: u64,
+    ) -> RenewShardLeaseRequest {
+        RenewShardLeaseRequest {
+            run_id: Some(run_id),
+            worker_id: Some(worker_id),
+            shard_id: Some(ShardId {
+                value: shard_id.to_string(),
+            }),
+            lease_epoch,
+            idempotency_key: "renew-key".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn renew_shard_lease_under_unknown_run_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+
+        let error = service
+            .renew_shard_lease(Request::new(renew_request(
+                RunId {
+                    value: "missing-run".to_string(),
+                },
+                WorkerId {
+                    value: "worker-1".to_string(),
+                },
+                "shard-0",
+                1,
+            )))
+            .await
+            .expect_err("unknown run should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn renew_shard_lease_under_unknown_worker_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        register_dataset_for_assignment(&service, run_id.clone()).await;
+
+        let error = service
+            .renew_shard_lease(Request::new(renew_request(
+                run_id,
+                WorkerId {
+                    value: "missing-worker".to_string(),
+                },
+                "shard-0",
+                1,
+            )))
+            .await
+            .expect_err("unknown worker should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn renew_shard_lease_under_unknown_shard_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-key").await;
+
+        let error = service
+            .renew_shard_lease(Request::new(renew_request(
+                run_id,
+                worker_id,
+                "missing-shard",
+                1,
+            )))
+            .await
+            .expect_err("unknown shard should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn renew_shard_lease_for_deterministic_owner_succeeds() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-key").await;
+
+        let response = service
+            .renew_shard_lease(Request::new(renew_request(run_id, worker_id, "shard-0", 1)))
+            .await
+            .expect("renew_shard_lease should succeed")
+            .into_inner();
+
+        assert!(response.accepted);
+        assert_eq!(response.lease_state, ShardLeaseState::Leased as i32);
+        assert!(response.lease_expires_at.is_some());
+        assert!(response.server_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn renew_shard_lease_for_non_owner_returns_failed_precondition() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 1, "worker-key").await;
+
+        let error = service
+            .renew_shard_lease(Request::new(renew_request(run_id, worker_id, "shard-0", 1)))
+            .await
+            .expect_err("non-owner should not renew shard lease");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn renew_shard_lease_with_wrong_lease_epoch_returns_failed_precondition() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-key").await;
+
+        let error = service
+            .renew_shard_lease(Request::new(renew_request(run_id, worker_id, "shard-0", 0)))
+            .await
+            .expect_err("wrong lease epoch should not renew shard lease");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
