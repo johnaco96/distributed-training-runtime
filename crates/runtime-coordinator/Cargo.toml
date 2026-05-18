@@ -1,0 +1,12 @@
+[package]
+name = "runtime-coordinator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+runtime-proto = { path = "../runtime-proto" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tonic = { version = "0.12", default-features = false, features = ["transport"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
