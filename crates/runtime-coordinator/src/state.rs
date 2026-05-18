@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use runtime_proto::runtime::v1::{
     CheckpointId, CheckpointState, DatasetId, DatasetMetadata, RegisterDatasetRequest,
-    RegisterRunRequest, RegisterWorkerRequest, RunId, ShardId, ShardLeaseState, ShardMetadata, WorkerId,
-    WorkerState,
+    RegisterRunRequest, RegisterWorkerRequest, RunId, ShardId, ShardLeaseState, ShardMetadata,
+    WorkerId, WorkerState,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -35,6 +35,7 @@ struct CoordinatorStateInner {
     worker_idempotency_keys: HashMap<String, String>,
     datasets_by_run: HashMap<String, HashMap<String, DatasetRecord>>,
     dataset_idempotency_keys: HashMap<String, String>,
+    shard_progress: HashMap<ShardProgressKey, ShardProgressRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +90,25 @@ pub struct ShardRecord {
     pub size_bytes: i64,
     pub checksum: String,
     pub checksum_algorithm: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShardProgressKey {
+    run_id: String,
+    dataset_id: String,
+    shard_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShardProgressRecord {
+    pub run_id: String,
+    pub dataset_id: String,
+    pub shard_id: String,
+    pub worker_id: String,
+    pub lease_epoch: u64,
+    pub progress_offset: i64,
+    pub is_complete: bool,
+    pub updated_at: SystemTime,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,6 +167,13 @@ pub struct RenewedShardLease {
     pub server_time: SystemTime,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReportedShardProgress {
+    pub accepted: bool,
+    pub stored_progress_offset: i64,
+    pub lease_state: i32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GetShardAssignmentsError {
     RunNotFound,
@@ -159,6 +186,17 @@ pub enum GetShardAssignmentsError {
 pub enum RenewShardLeaseError {
     RunNotFound,
     WorkerNotFound,
+    ShardNotFound,
+    EmptyWorldSize,
+    NotShardOwner,
+    InvalidLeaseEpoch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportShardProgressError {
+    RunNotFound,
+    WorkerNotFound,
+    DatasetNotFound,
     ShardNotFound,
     EmptyWorldSize,
     NotShardOwner,
@@ -339,7 +377,15 @@ impl CoordinatorState {
                 lease_epoch: 1,
                 lease_state: ShardLeaseState::Leased as i32,
                 lease_expires_at,
-                progress_offset: 0,
+                progress_offset: inner
+                    .shard_progress
+                    .get(&ShardProgressKey {
+                        run_id: run.run_id.clone(),
+                        dataset_id: dataset.dataset_id.clone(),
+                        shard_id: shard.shard_id.clone(),
+                    })
+                    .map(|progress| progress.progress_offset)
+                    .unwrap_or_default(),
                 shard_uri: shard.shard_uri.clone(),
             })
             .collect();
@@ -405,6 +451,95 @@ impl CoordinatorState {
             lease_expires_at: server_time + SHARD_LEASE_DURATION,
             server_time,
         })
+    }
+
+    pub fn report_shard_progress(
+        &self,
+        run_id: &RunId,
+        worker_id: &WorkerId,
+        dataset_id: &DatasetId,
+        shard_id: &ShardId,
+        lease_epoch: u64,
+        progress_offset: i64,
+        is_complete: bool,
+    ) -> Result<ReportedShardProgress, ReportShardProgressError> {
+        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
+        let run = inner
+            .runs
+            .get(&run_id.value)
+            .ok_or(ReportShardProgressError::RunNotFound)?;
+
+        let worker = inner
+            .workers_by_run
+            .get(&run_id.value)
+            .and_then(|workers| workers.get(&worker_id.value))
+            .ok_or(ReportShardProgressError::WorkerNotFound)?;
+
+        let dataset = inner
+            .datasets_by_run
+            .get(&run_id.value)
+            .and_then(|datasets| datasets.get(&dataset_id.value))
+            .ok_or(ReportShardProgressError::DatasetNotFound)?;
+
+        let shard_index = dataset
+            .shards
+            .iter()
+            .position(|shard| shard.shard_id == shard_id.value)
+            .ok_or(ReportShardProgressError::ShardNotFound)?;
+
+        if run.world_size == 0 {
+            return Err(ReportShardProgressError::EmptyWorldSize);
+        }
+
+        let world_size = run.world_size as usize;
+        let worker_rank = worker.rank as usize;
+        if shard_index % world_size != worker_rank {
+            return Err(ReportShardProgressError::NotShardOwner);
+        }
+
+        if lease_epoch != 1 {
+            return Err(ReportShardProgressError::InvalidLeaseEpoch);
+        }
+
+        let key = ShardProgressKey {
+            run_id: run_id.value.clone(),
+            dataset_id: dataset_id.value.clone(),
+            shard_id: shard_id.value.clone(),
+        };
+        let record = ShardProgressRecord {
+            run_id: run_id.value.clone(),
+            dataset_id: dataset_id.value.clone(),
+            shard_id: shard_id.value.clone(),
+            worker_id: worker_id.value.clone(),
+            lease_epoch,
+            progress_offset,
+            is_complete,
+            updated_at: SystemTime::now(),
+        };
+        inner.shard_progress.insert(key, record);
+
+        Ok(ReportedShardProgress {
+            accepted: true,
+            stored_progress_offset: progress_offset,
+            lease_state: ShardLeaseState::Leased as i32,
+        })
+    }
+
+    pub fn get_shard_progress(
+        &self,
+        run_id: &RunId,
+        dataset_id: &DatasetId,
+        shard_id: &ShardId,
+    ) -> Option<ShardProgressRecord> {
+        let inner = self.inner.read().expect("coordinator state lock poisoned");
+        inner
+            .shard_progress
+            .get(&ShardProgressKey {
+                run_id: run_id.value.clone(),
+                dataset_id: dataset_id.value.clone(),
+                shard_id: shard_id.value.clone(),
+            })
+            .cloned()
     }
 
     pub fn register_worker(&self, request: RegisterWorkerRequest) -> Option<RegisteredWorker> {
