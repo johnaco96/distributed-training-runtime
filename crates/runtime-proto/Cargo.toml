@@ -1,0 +1,13 @@
+[package]
+name = "runtime-proto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+prost = "0.13"
+prost-types = "0.13"
+tonic = { version = "0.12", default-features = false, features = ["codegen", "transport"] }
+
+[build-dependencies]
+tonic-build = "0.12"
