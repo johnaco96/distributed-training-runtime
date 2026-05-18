@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dtruntime"
+version = "0.1.0"
+description = "Python SDK skeleton for the Distributed Training Runtime control plane."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "grpcio",
+    "protobuf",
+]
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools",
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.setuptools.package-data]
+dtruntime = ["py.typed"]
