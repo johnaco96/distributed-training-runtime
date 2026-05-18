@@ -6,7 +6,9 @@ use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
 
-use crate::state::{CoordinatorState, GetShardAssignmentsError, RenewShardLeaseError};
+use crate::state::{
+    CoordinatorState, GetShardAssignmentsError, RenewShardLeaseError, ReportShardProgressError,
+};
 
 #[derive(Clone, Debug)]
 pub struct CoordinatorServiceImpl {
@@ -229,11 +231,65 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn report_shard_progress(
         &self,
-        _request: Request<ReportShardProgressRequest>,
+        request: Request<ReportShardProgressRequest>,
     ) -> Result<Response<ReportShardProgressResponse>, Status> {
-        Err(Status::unimplemented(
-            "ReportShardProgress is not implemented yet",
-        ))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let worker_id = request
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let dataset_id = request
+            .dataset_id
+            .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
+        let shard_id = request
+            .shard_id
+            .ok_or_else(|| Status::invalid_argument("shard_id is required"))?;
+
+        let reported = self
+            .state
+            .report_shard_progress(
+                &run_id,
+                &worker_id,
+                &dataset_id,
+                &shard_id,
+                request.lease_epoch,
+                request.progress_offset,
+                request.is_complete,
+            )
+            .map_err(|error| match error {
+                ReportShardProgressError::RunNotFound => {
+                    Status::not_found(format!("run {} was not found", run_id.value))
+                }
+                ReportShardProgressError::WorkerNotFound => {
+                    Status::not_found(format!("worker {} was not found", worker_id.value))
+                }
+                ReportShardProgressError::DatasetNotFound => {
+                    Status::not_found(format!("dataset {} was not found", dataset_id.value))
+                }
+                ReportShardProgressError::ShardNotFound => {
+                    Status::not_found(format!("shard {} was not found", shard_id.value))
+                }
+                ReportShardProgressError::EmptyWorldSize => {
+                    Status::failed_precondition("run world_size must be greater than zero")
+                }
+                ReportShardProgressError::NotShardOwner => Status::failed_precondition(format!(
+                    "worker {} is not the owner of shard {}",
+                    worker_id.value, shard_id.value
+                )),
+                ReportShardProgressError::InvalidLeaseEpoch => {
+                    Status::failed_precondition("lease_epoch does not match current assignment")
+                }
+            })?;
+
+        let response = ReportShardProgressResponse {
+            accepted: reported.accepted,
+            stored_progress_offset: reported.stored_progress_offset,
+            lease_state: reported.lease_state,
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn begin_checkpoint(
@@ -1133,6 +1189,206 @@ mod tests {
             .renew_shard_lease(Request::new(renew_request(run_id, worker_id, "shard-0", 0)))
             .await
             .expect_err("wrong lease epoch should not renew shard lease");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    fn progress_request(
+        run_id: RunId,
+        worker_id: WorkerId,
+        dataset_id: DatasetId,
+        shard_id: &str,
+        lease_epoch: u64,
+        progress_offset: i64,
+        is_complete: bool,
+    ) -> ReportShardProgressRequest {
+        ReportShardProgressRequest {
+            run_id: Some(run_id),
+            worker_id: Some(worker_id),
+            dataset_id: Some(dataset_id),
+            shard_id: Some(ShardId {
+                value: shard_id.to_string(),
+            }),
+            lease_epoch,
+            progress_offset,
+            is_complete,
+            idempotency_key: "progress-key".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn report_shard_progress_under_unknown_run_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+
+        let error = service
+            .report_shard_progress(Request::new(progress_request(
+                RunId {
+                    value: "missing-run".to_string(),
+                },
+                WorkerId {
+                    value: "worker-1".to_string(),
+                },
+                DatasetId {
+                    value: "dataset-explicit".to_string(),
+                },
+                "shard-0",
+                1,
+                10,
+                false,
+            )))
+            .await
+            .expect_err("unknown run should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn report_shard_progress_under_unknown_worker_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+
+        let error = service
+            .report_shard_progress(Request::new(progress_request(
+                run_id,
+                WorkerId {
+                    value: "missing-worker".to_string(),
+                },
+                dataset_id,
+                "shard-0",
+                1,
+                10,
+                false,
+            )))
+            .await
+            .expect_err("unknown worker should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn report_shard_progress_under_unknown_dataset_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-key").await;
+
+        let error = service
+            .report_shard_progress(Request::new(progress_request(
+                run_id,
+                worker_id,
+                DatasetId {
+                    value: "missing-dataset".to_string(),
+                },
+                "shard-0",
+                1,
+                10,
+                false,
+            )))
+            .await
+            .expect_err("unknown dataset should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn report_shard_progress_under_unknown_shard_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-key").await;
+
+        let error = service
+            .report_shard_progress(Request::new(progress_request(
+                run_id,
+                worker_id,
+                dataset_id,
+                "missing-shard",
+                1,
+                10,
+                false,
+            )))
+            .await
+            .expect_err("unknown shard should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn report_shard_progress_for_deterministic_owner_succeeds() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-key").await;
+
+        let response = service
+            .report_shard_progress(Request::new(progress_request(
+                run_id.clone(),
+                worker_id.clone(),
+                dataset_id.clone(),
+                "shard-0",
+                1,
+                123,
+                true,
+            )))
+            .await
+            .expect("report_shard_progress should succeed")
+            .into_inner();
+
+        assert!(response.accepted);
+        assert_eq!(response.stored_progress_offset, 123);
+        assert_eq!(response.lease_state, ShardLeaseState::Leased as i32);
+
+        let stored = service
+            .state
+            .get_shard_progress(
+                &run_id,
+                &dataset_id,
+                &ShardId {
+                    value: "shard-0".to_string(),
+                },
+            )
+            .expect("accepted progress should be stored");
+        assert_eq!(stored.worker_id, worker_id.value);
+        assert_eq!(stored.lease_epoch, 1);
+        assert_eq!(stored.progress_offset, 123);
+        assert!(stored.is_complete);
+    }
+
+    #[tokio::test]
+    async fn report_shard_progress_for_non_owner_returns_failed_precondition() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 1, "worker-key").await;
+
+        let error = service
+            .report_shard_progress(Request::new(progress_request(
+                run_id, worker_id, dataset_id, "shard-0", 1, 10, false,
+            )))
+            .await
+            .expect_err("non-owner should not report shard progress");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn report_shard_progress_with_wrong_lease_epoch_returns_failed_precondition() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id =
+            register_worker_for_assignment(&service, run_id.clone(), 0, "worker-key").await;
+
+        let error = service
+            .report_shard_progress(Request::new(progress_request(
+                run_id, worker_id, dataset_id, "shard-0", 2, 10, false,
+            )))
+            .await
+            .expect_err("wrong lease epoch should not report shard progress");
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     }
