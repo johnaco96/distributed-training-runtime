@@ -38,18 +38,53 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn register_worker(
         &self,
-        _request: Request<RegisterWorkerRequest>,
+        request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
-        Err(Status::unimplemented(
-            "RegisterWorker is not implemented yet",
-        ))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let registered = self
+            .state
+            .register_worker(request)
+            .ok_or_else(|| Status::not_found(format!("run {} was not found", run_id.value)))?;
+
+        let response = RegisterWorkerResponse {
+            worker_id: Some(registered.worker_id),
+            state: registered.state,
+            lease_renewal_deadline: Some(registered.lease_renewal_deadline.into()),
+            server_time: Some(registered.server_time.into()),
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn heartbeat(
         &self,
-        _request: Request<HeartbeatRequest>,
+        request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        Err(Status::unimplemented("Heartbeat is not implemented yet"))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let worker_id = request
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+
+        let heartbeat = self
+            .state
+            .record_heartbeat(&run_id, &worker_id)
+            .ok_or_else(|| Status::not_found("run or worker was not found"))?;
+
+        let response = HeartbeatResponse {
+            state: heartbeat.state,
+            next_heartbeat_deadline: Some(heartbeat.next_heartbeat_deadline.into()),
+            server_time: Some(heartbeat.server_time.into()),
+        };
+
+        Ok(Response::new(response))
     }
 
     async fn register_dataset(
@@ -169,6 +204,28 @@ mod tests {
         }
     }
 
+    fn worker_request(run_id: RunId, idempotency_key: &str) -> RegisterWorkerRequest {
+        RegisterWorkerRequest {
+            idempotency_key: idempotency_key.to_string(),
+            run_id: Some(run_id),
+            worker_id: None,
+            rank: 3,
+            host: "worker-host".to_string(),
+            sdk_version: "sdk-0.1.0".to_string(),
+            protocol_version: "runtime.v1".to_string(),
+        }
+    }
+
+    async fn create_run(service: &CoordinatorServiceImpl) -> RunId {
+        service
+            .register_run(Request::new(register_request("service-key")))
+            .await
+            .expect("register_run should succeed")
+            .into_inner()
+            .run_id
+            .expect("register response should include run_id")
+    }
+
     #[tokio::test]
     async fn register_run_and_get_run_status_round_trip() {
         let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
@@ -227,6 +284,137 @@ mod tests {
 
         assert_eq!(first.run_id, second.run_id);
         assert_eq!(first.registered_at, second.registered_at);
+    }
+
+    #[tokio::test]
+    async fn register_worker_under_existing_run_succeeds() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let response = service
+            .register_worker(Request::new(worker_request(run_id, "worker-key")))
+            .await
+            .expect("register_worker should succeed")
+            .into_inner();
+
+        assert_eq!(
+            response.worker_id,
+            Some(WorkerId {
+                value: "worker-1".to_string(),
+            })
+        );
+        assert_eq!(response.state, WorkerState::Active as i32);
+        assert!(response.lease_renewal_deadline.is_some());
+        assert!(response.server_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn register_worker_under_unknown_run_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+
+        let error = service
+            .register_worker(Request::new(worker_request(
+                RunId {
+                    value: "missing".to_string(),
+                },
+                "worker-key",
+            )))
+            .await
+            .expect_err("unknown run should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_for_registered_worker_succeeds() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .expect("register_worker should succeed")
+            .into_inner()
+            .worker_id
+            .expect("register worker response should include worker_id");
+
+        let response = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                run_id: Some(run_id),
+                worker_id: Some(worker_id),
+                idempotency_key: "heartbeat-key".to_string(),
+                client_time: None,
+                active_shard_ids: Vec::new(),
+            }))
+            .await
+            .expect("heartbeat should succeed")
+            .into_inner();
+
+        assert_eq!(response.state, WorkerState::Active as i32);
+        assert!(response.next_heartbeat_deadline.is_some());
+        assert!(response.server_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_for_unknown_worker_returns_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let error = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                run_id: Some(run_id),
+                worker_id: Some(WorkerId {
+                    value: "missing-worker".to_string(),
+                }),
+                idempotency_key: "heartbeat-key".to_string(),
+                client_time: None,
+                active_shard_ids: Vec::new(),
+            }))
+            .await
+            .expect_err("unknown worker should be missing");
+
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn worker_registration_updates_active_worker_count() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .expect("register_worker should succeed");
+
+        let status = service
+            .get_run_status(Request::new(GetRunStatusRequest {
+                run_id: Some(run_id),
+            }))
+            .await
+            .expect("get_run_status should succeed")
+            .into_inner();
+
+        assert_eq!(status.active_worker_count, 1);
+    }
+
+    #[tokio::test]
+    async fn register_worker_reuses_worker_for_idempotency_key() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let first = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .expect("first register_worker should succeed")
+            .into_inner();
+        let second = service
+            .register_worker(Request::new(worker_request(run_id, "worker-key")))
+            .await
+            .expect("second register_worker should succeed")
+            .into_inner();
+
+        assert_eq!(first.worker_id, second.worker_id);
+        assert_eq!(first.state, second.state);
+        assert_eq!(first.lease_renewal_deadline, second.lease_renewal_deadline);
     }
 
     #[tokio::test]
