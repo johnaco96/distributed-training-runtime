@@ -717,6 +717,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "runtime-bench"
+version = "0.1.0"
+
+[[package]]
+name = "runtime-checkpoint"
+version = "0.1.0"
+
+[[package]]
+name = "runtime-client"
+version = "0.1.0"
+
+[[package]]
 name = "runtime-coordinator"
 version = "0.1.0"
 dependencies = [
@@ -728,6 +740,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-core"
+version = "0.1.0"
+
+[[package]]
+name = "runtime-dataset"
+version = "0.1.0"
+
+[[package]]
 name = "runtime-proto"
 version = "0.1.0"
 dependencies = [
@@ -736,6 +756,10 @@ dependencies = [
  "tonic",
  "tonic-build",
 ]
+
+[[package]]
+name = "runtime-storage"
+version = "0.1.0"
 
 [[package]]
 name = "rustix"
