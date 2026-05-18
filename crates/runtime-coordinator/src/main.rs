@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let addr: SocketAddr = "127.0.0.1:50051".parse()?;
-    let state = Arc::new(CoordinatorState);
+    let state = Arc::new(CoordinatorState::default());
     let service = CoordinatorServiceImpl::new(state);
 
     info!(%addr, "starting runtime-coordinator gRPC server");
