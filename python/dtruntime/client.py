@@ -59,6 +59,53 @@ class RuntimeClient:
         )
         return self._stub.RegisterWorker(request)
 
+    def register_dataset(
+        self,
+        run_id: str,
+        name: str,
+        uri: str,
+        format: str,
+        shards: Optional[list[dict[str, Any]]] = None,
+        dataset_id: str = "",
+        dataset_version: str = "",
+        labels: Optional[dict[str, str]] = None,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.RegisterDatasetResponse":
+        """Register dataset metadata with the coordinator and return its response."""
+        shard_metadata = [
+            self._shard_metadata_from_dict(shard, dataset_id) for shard in shards or []
+        ]
+        request = self._runtime_pb2.RegisterDatasetRequest(
+            idempotency_key=idempotency_key,
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            dataset=self._runtime_pb2.DatasetMetadata(
+                dataset_id=self._runtime_pb2.DatasetId(value=dataset_id),
+                name=name,
+                dataset_uri=uri,
+                format=format,
+                shard_count=len(shard_metadata),
+                dataset_version=dataset_version,
+                labels=labels or {},
+            ),
+            shards=shard_metadata,
+        )
+        return self._stub.RegisterDataset(request)
+
+    def _shard_metadata_from_dict(
+        self, shard: dict[str, Any], dataset_id: str
+    ) -> "runtime_pb2.ShardMetadata":
+        """Convert a high-level shard dictionary into generated shard metadata."""
+        return self._runtime_pb2.ShardMetadata(
+            shard_id=self._runtime_pb2.ShardId(value=shard.get("shard_id", "")),
+            dataset_id=self._runtime_pb2.DatasetId(value=dataset_id),
+            shard_uri=shard.get("shard_uri", shard.get("uri", "")),
+            byte_range_start=shard.get("byte_range_start", 0),
+            byte_range_end=shard.get("byte_range_end", 0),
+            size_bytes=shard.get("size_bytes", 0),
+            checksum=shard.get("checksum", ""),
+            checksum_algorithm=shard.get("checksum_algorithm", ""),
+        )
+
     def heartbeat(
         self,
         run_id: str,
