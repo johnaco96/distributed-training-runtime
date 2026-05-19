@@ -129,6 +129,9 @@ IDs and ports vary by run.
 
 ## Current MVP limitations
 
+
+> Note: this Phase 10 local demo uses the normal in-memory coordinator path unless you explicitly run coordinator with `--metadata-db <path>`. The Phase 11 metadata DB mode is primarily for restart/recovery validation.
+
 - checkpoint artifact bytes are written locally by the Python demo, not uploaded through a coordinator data plane.
 - coordinator can persist metadata when started with `--metadata-db <path>`; without it, metadata is in-memory only.
 - worker death is simulated at demo level.

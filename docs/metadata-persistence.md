@@ -33,3 +33,33 @@ If `--metadata-db` is omitted, coordinator stays in-memory only.
 - This is not coordinator replication or HA.
 - This is not S3/MinIO object storage.
 - Phase 12 covers object storage and is out of scope for this task.
+
+
+## Coordinator CLI help
+
+```bash
+cargo run -p runtime-coordinator -- --help
+```
+
+The coordinator supports:
+- `--addr <ADDR>` to override bind address
+- `--metadata-db <PATH>` to enable SQLite metadata persistence
+- `--help` / `-h` to print usage
+
+When `--metadata-db` is omitted, coordinator metadata remains in-memory only.
+
+## Manual restart validation (optional)
+
+Terminal 1:
+
+```bash
+cargo run -p runtime-coordinator -- --addr 127.0.0.1:50051 --metadata-db .dtruntime-demo/coordinator.db
+```
+
+Then run a client/demo flow that commits a checkpoint, stop the coordinator, and restart with the same command:
+
+```bash
+cargo run -p runtime-coordinator -- --addr 127.0.0.1:50051 --metadata-db .dtruntime-demo/coordinator.db
+```
+
+After restart, verify `GetLatestCheckpoint` can restore the latest committed checkpoint metadata.
