@@ -108,7 +108,7 @@ pub struct CheckpointArtifactUpload {
 }
 
 pub fn upload_checkpoint_artifacts_concurrently(
-    storage: &impl StorageBackend,
+    storage: &(impl StorageBackend + Sync),
     uploads: Vec<CheckpointArtifactUpload>,
     policy: &StorageOperationPolicy,
 ) -> Result<Vec<ArtifactRecord>, CheckpointError> {
