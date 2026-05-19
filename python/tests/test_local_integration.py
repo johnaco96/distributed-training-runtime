@@ -116,6 +116,109 @@ def test_rust_coordinator_and_python_sdk_communicate_over_grpc() -> None:
         _stop_process(process)
 
 
+
+def test_checkpoint_rpc_flow_over_grpc() -> None:
+    if os.environ.get("DTRUNTIME_RUN_LOCAL_INTEGRATION") != "1":
+        pytest.skip("set DTRUNTIME_RUN_LOCAL_INTEGRATION=1 to run local gRPC integration test")
+
+    grpc = pytest.importorskip("grpc", reason="grpcio is required for local integration test")
+    pytest.importorskip(
+        "google.protobuf", reason="protobuf is required for local integration test"
+    )
+    from dtruntime import connect
+    from dtruntime.generated import runtime_pb2
+
+    repo_root = Path(__file__).resolve().parents[2]
+    port = _free_tcp_port()
+    address = f"127.0.0.1:{port}"
+    process = subprocess.Popen(
+        ["cargo", "run", "-p", "runtime-coordinator", "--", "--addr", address],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    client = None
+    try:
+        _wait_for_grpc_server(grpc, address, process)
+        client = connect(address)
+
+        suffix = uuid.uuid4().hex
+        run_response = client.stub.RegisterRun(
+            runtime_pb2.RegisterRunRequest(
+                idempotency_key=f"register-run-checkpoint-{suffix}",
+                run_name=f"checkpoint-local-integration-{suffix}",
+                assignment_policy=runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
+                storage_backend_kind=runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
+                world_size=1,
+                run_version="integration-test",
+            )
+        )
+        run_id = run_response.run_id.value
+        assert run_id
+
+        worker_id = f"worker-{suffix}"
+        worker_response = client.register_worker(
+            run_id=run_id,
+            worker_id=worker_id,
+            rank=0,
+            host="localhost",
+            idempotency_key=f"register-worker-checkpoint-{suffix}",
+        )
+        assert worker_response.worker_id.value == worker_id
+
+        checkpoint_id = "checkpoint-e2e-1"
+        begin_response = client.begin_checkpoint(
+            run_id=run_id,
+            worker_id=worker_id,
+            checkpoint_id=checkpoint_id,
+            step=1,
+            idempotency_key=f"begin-checkpoint-{suffix}",
+        )
+        assert begin_response.checkpoint_id.value == checkpoint_id
+        assert begin_response.state == runtime_pb2.CHECKPOINT_STATE_INITIATED
+
+        artifact_name = "worker-0-model.bin"
+        artifact_uri = "file:///tmp/worker-0-model.bin"
+        report_response = client.report_checkpoint_artifact(
+            run_id=run_id,
+            worker_id=worker_id,
+            checkpoint_id=checkpoint_id,
+            artifact_name=artifact_name,
+            artifact_uri=artifact_uri,
+            size_bytes=1234,
+            checksum="abc123",
+            checksum_algorithm="sha256",
+            idempotency_key=f"checkpoint-artifact-{suffix}",
+        )
+        assert report_response.accepted
+
+        commit_response = client.commit_checkpoint(
+            run_id=run_id,
+            checkpoint_id=checkpoint_id,
+            idempotency_key=f"commit-checkpoint-{suffix}",
+        )
+        assert commit_response.state == runtime_pb2.CHECKPOINT_STATE_COMMITTED
+
+        latest_response = client.restore_latest(run_id=run_id)
+        manifest = latest_response.manifest
+        assert manifest.run_id.value == run_id
+        assert manifest.checkpoint_id.value == checkpoint_id
+        assert manifest.state == runtime_pb2.CHECKPOINT_STATE_COMMITTED
+        assert manifest.artifacts
+
+        artifact = manifest.artifacts[0]
+        assert artifact.artifact_name == artifact_name
+        assert artifact.artifact_uri == artifact_uri
+        assert artifact.size_bytes == 1234
+        assert artifact.checksum == "abc123"
+        assert artifact.checksum_algorithm == "sha256"
+    finally:
+        if client is not None:
+            client.close()
+        _stop_process(process)
+
 def _free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
