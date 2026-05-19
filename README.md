@@ -120,7 +120,9 @@ Next planned step: **Phase 15 observability**.
 
 - [x] Phase 14 complete.
 - [x] Phase 15A structured logging and in-process metrics foundation complete.
-- [ ] Wire foundation metrics through additional coordinator/storage/checkpoint execution paths.
+- [x] Phase 15B wire in-process metrics through coordinator worker/shard/checkpoint execution paths.
 - [ ] Add optional Prometheus/Grafana integration later.
+
+Next planned step: **Phase 16 scaling tests**.
 
 See `docs/observability.md` for current scope and usage.
