@@ -134,6 +134,8 @@ IDs and ports vary by run.
 
 - checkpoint artifact bytes are written locally by the Python demo, not uploaded through a coordinator data plane.
 - coordinator can persist metadata when started with `--metadata-db <path>`; without it, metadata is in-memory only.
+- S3-compatible object storage backend foundation is added in Phase 12A, but
+  full demo wiring to MinIO/S3 checkpoint artifact uploads is a later phase.
 - worker death is simulated at demo level.
 - deterministic stale/failed transitions are covered by Rust tests.
 - coordinator process restart recovery belongs to Phase 11, not Phase 10.

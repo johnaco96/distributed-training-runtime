@@ -11,6 +11,14 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+pub mod object_key;
+#[cfg(feature = "s3")]
+pub mod s3;
+
+pub use object_key::storage_key_to_object_key;
+#[cfg(feature = "s3")]
+pub use s3::{S3Storage, S3StorageConfig};
+
 /// Logical storage key using slash-separated segments.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct StorageKey(String);
@@ -337,5 +345,11 @@ mod tests {
         assert_eq!(storage.get(&safe).expect("safe get"), b"ok");
 
         fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn traversal_rejected_before_object_key_conversion() {
+        let key = StorageKey::new("runs/../bad");
+        assert!(key.is_err());
     }
 }
