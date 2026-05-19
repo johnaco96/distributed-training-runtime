@@ -201,6 +201,8 @@ When adding S3-compatible backend:
 - Consider conditional writes (etag/version) for pointer races.
 - Validate checksum/size with object metadata where available.
 - Background garbage collection and lifecycle rules become more important.
+- Phase 12A adds only the S3-compatible storage foundation; full coordinator
+  upload/restore artifact wiring is expected in Phase 12B.
 
 ## 18. Explicit MVP scope
 
