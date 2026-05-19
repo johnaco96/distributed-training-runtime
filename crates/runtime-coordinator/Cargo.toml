@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 runtime-checkpoint = { path = "../runtime-checkpoint" }
 runtime-proto = { path = "../runtime-proto" }
+prost-types = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tonic = { version = "0.12", default-features = false, features = ["transport"] }
 tracing = "0.1"
