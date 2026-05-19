@@ -2,15 +2,16 @@
 
 use runtime_checkpoint::{
     upload_checkpoint_artifacts_concurrently, CheckpointArtifactUpload, CheckpointId,
-    CheckpointRecord, CheckpointStore, ChecksumAlgorithm, RunId, WorkerId,
+    CheckpointRecord, CheckpointStore, ChecksumAlgorithm, RunId as CheckpointRunId,
+    WorkerId as CheckpointWorkerId,
 };
 use runtime_storage::{LocalStorage, StorageBackend, StorageKey, StorageOperationPolicy};
 use serde::{Deserialize, Serialize};
 
 use runtime_proto::runtime::v1::coordinator_service_client::CoordinatorServiceClient;
 use runtime_proto::runtime::v1::{
-    AssignmentPolicy, HeartbeatRequest, RegisterRunRequest, RegisterWorkerRequest, RunId,
-    StorageBackendKind, WorkerId,
+    AssignmentPolicy, HeartbeatRequest, RegisterRunRequest, RegisterWorkerRequest,
+    RunId as ProtoRunId, StorageBackendKind, WorkerId as ProtoWorkerId,
 };
 use std::fs;
 use std::net::TcpStream;
@@ -225,7 +226,7 @@ pub fn run_checkpoint_write(
         let payload = vec![9_u8; payload_bytes];
         let uploads: Vec<CheckpointArtifactUpload> = (0..artifacts)
             .map(|i| CheckpointArtifactUpload {
-                worker_id: WorkerId("worker-0".into()),
+                worker_id: CheckpointWorkerId("worker-0".into()),
                 artifact_name: format!("artifact-{i}.bin"),
                 storage_key: runtime_storage::checkpoint_worker_artifact(
                     "bench-run",
@@ -246,7 +247,7 @@ pub fn run_checkpoint_write(
             .map_err(|e| e.to_string())?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let mut ckpt = CheckpointRecord::new(
-            RunId("bench-run".into()),
+            CheckpointRunId("bench-run".into()),
             CheckpointId("ckpt-1".into()),
             1,
             1,
@@ -289,7 +290,7 @@ pub fn run_checkpoint_restore(
     keep_data: bool,
 ) -> Result<BenchmarkSummary, String> {
     with_storage_root(root, keep_data, |root| {
-        let storage = LocalStorage::new(root.to_path_buf()).map_err(|e| e.to_string())?;
+        let _storage = LocalStorage::new(root.to_path_buf()).map_err(|e| e.to_string())?;
         let _ = run_checkpoint_write(
             artifacts,
             payload_bytes,
@@ -303,7 +304,7 @@ pub fn run_checkpoint_restore(
         let mut elapsed_total_ms = 0.0;
         for _ in 0..iterations {
             let t0 = Instant::now();
-            let loaded = store.load_latest_manifest(&RunId("bench-run".into()));
+            let loaded = store.load_latest_manifest(&CheckpointRunId("bench-run".into()));
             let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
             elapsed_total_ms += elapsed_ms;
             samples.push(BenchmarkSample {
@@ -474,7 +475,7 @@ async fn run_worker_rpc_async(
         .as_ref()
         .ok()
         .and_then(|r| r.get_ref().run_id.clone())
-        .unwrap_or(RunId {
+        .unwrap_or(ProtoRunId {
             value: "missing-run".into(),
         });
     samples.push(BenchmarkSample {
@@ -486,7 +487,7 @@ async fn run_worker_rpc_async(
 
     let mut worker_ids = Vec::with_capacity(workers);
     for i in 0..workers {
-        let worker_id = WorkerId {
+        let worker_id = ProtoWorkerId {
             value: format!("worker-{i}"),
         };
         let t = Instant::now();
