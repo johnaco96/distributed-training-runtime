@@ -122,6 +122,24 @@ class RuntimeClient:
         )
         return self._stub.GetShardAssignment(request)
 
+    def begin_checkpoint(
+        self,
+        run_id: str,
+        worker_id: str,
+        step: int,
+        checkpoint_id: str = "",
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.BeginCheckpointResponse":
+        """Begin a checkpoint with the coordinator and return its response."""
+        request = self._runtime_pb2.BeginCheckpointRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
+            step=step,
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.BeginCheckpoint(request)
+
     def heartbeat(
         self,
         run_id: str,
