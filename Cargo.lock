@@ -737,6 +737,7 @@ version = "0.1.0"
 name = "runtime-coordinator"
 version = "0.1.0"
 dependencies = [
+ "prost-types",
  "runtime-checkpoint",
  "runtime-proto",
  "tokio",
