@@ -113,16 +113,22 @@ CREATE TABLE IF NOT EXISTS latest_checkpoints (
         run_id: &str,
     ) -> rusqlite::Result<Vec<(String, u32, u32, i32)>> {
         let conn = self.conn.lock().expect("sqlite");
-        let mut stmt = conn.prepare("SELECT worker_id, rank, world_size, status FROM workers WHERE run_id=?1 ORDER BY worker_id")?;
-        stmt.query_map(params![run_id], |r| {
-            Ok((
-                r.get(0)?,
-                r.get::<_, i64>(1)? as u32,
-                r.get::<_, i64>(2)? as u32,
-                r.get(3)?,
-            ))
-        })?
-        .collect()
+        let mut stmt = conn.prepare(
+            "SELECT worker_id, rank, world_size, status FROM workers WHERE run_id=?1 ORDER BY worker_id",
+        )?;
+
+        let workers = stmt
+            .query_map(params![run_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, i64>(1)? as u32,
+                    r.get::<_, i64>(2)? as u32,
+                    r.get::<_, i32>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(workers)
     }
     pub fn save_dataset(&self, d: &DatasetRecord) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite");
