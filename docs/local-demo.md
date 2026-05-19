@@ -130,8 +130,7 @@ IDs and ports vary by run.
 ## Current MVP limitations
 
 - checkpoint artifact bytes are written locally by the Python demo, not uploaded through a coordinator data plane.
-- coordinator checkpoint metadata is currently in-memory.
-- local storage-backed checkpoint library exists, but coordinator persistence is not wired into coordinator runtime yet.
+- coordinator can persist metadata when started with `--metadata-db <path>`; without it, metadata is in-memory only.
 - worker death is simulated at demo level.
 - deterministic stale/failed transitions are covered by Rust tests.
 - coordinator process restart recovery belongs to Phase 11, not Phase 10.

@@ -1299,7 +1299,10 @@ fn dataset_id_from_metadata(dataset: &DatasetMetadata) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime_proto::runtime::v1::{AssignmentPolicy, StorageBackendKind};
+    use runtime_proto::runtime::v1::{
+        AssignmentPolicy, DatasetMetadata, ShardMetadata, StorageBackendKind,
+    };
+    use tempfile::tempdir;
 
     fn register_request(idempotency_key: &str) -> RegisterRunRequest {
         RegisterRunRequest {
@@ -1737,6 +1740,120 @@ mod tests {
             first.checkpoint.checkpoint_id
         );
         assert_eq!(second.checkpoint.step, first.checkpoint.step);
+    }
+
+    #[test]
+    fn committed_checkpoint_survives_state_recreation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("coordinator.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+        let state = CoordinatorState::with_metadata_store(store);
+
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_0 = state
+            .register_worker(worker_request(run_id.clone(), "worker-0"))
+            .unwrap()
+            .worker_id;
+        let worker_1 = state
+            .register_worker(RegisterWorkerRequest {
+                worker_id: Some(WorkerId {
+                    value: "worker-1".to_string(),
+                }),
+                rank: 1,
+                ..worker_request(run_id.clone(), "worker-1")
+            })
+            .unwrap()
+            .worker_id;
+
+        state
+            .register_dataset(RegisterDatasetRequest {
+                idempotency_key: "dataset-key".to_string(),
+                run_id: Some(run_id.clone()),
+                dataset: Some(DatasetMetadata {
+                    dataset_id: Some(DatasetId {
+                        value: "dataset-1".to_string(),
+                    }),
+                    name: "training".to_string(),
+                    shard_count: 2,
+                    ..DatasetMetadata::default()
+                }),
+                shards: vec![
+                    ShardMetadata {
+                        shard_id: Some(ShardId {
+                            value: "shard-0".to_string(),
+                        }),
+                        shard_uri: "file:///dataset/0".to_string(),
+                        size_bytes: 100,
+                        ..ShardMetadata::default()
+                    },
+                    ShardMetadata {
+                        shard_id: Some(ShardId {
+                            value: "shard-1".to_string(),
+                        }),
+                        shard_uri: "file:///dataset/1".to_string(),
+                        size_bytes: 200,
+                        ..ShardMetadata::default()
+                    },
+                ],
+            })
+            .expect("dataset should register");
+
+        state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_0.value.clone(),
+                "checkpoint-1".to_string(),
+                10,
+                "begin".to_string(),
+            )
+            .unwrap();
+        state
+            .report_checkpoint_artifact(
+                run_id.value.clone(),
+                worker_0.value.clone(),
+                "checkpoint-1".to_string(),
+                "model.bin".to_string(),
+                "file:///ckpt/worker-0-model.bin".to_string(),
+                111,
+                "sum0".to_string(),
+                "sha256".to_string(),
+                "art-0".to_string(),
+            )
+            .unwrap();
+        state
+            .report_checkpoint_artifact(
+                run_id.value.clone(),
+                worker_1.value.clone(),
+                "checkpoint-1".to_string(),
+                "model.bin".to_string(),
+                "file:///ckpt/worker-1-model.bin".to_string(),
+                222,
+                "sum1".to_string(),
+                "sha256".to_string(),
+                "art-1".to_string(),
+            )
+            .unwrap();
+        state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "checkpoint-1".to_string(),
+                "commit".to_string(),
+            )
+            .unwrap();
+
+        drop(state);
+
+        let reopened_store = SqliteMetadataStore::open(&path).unwrap();
+        reopened_store.init_schema().unwrap();
+        let recreated = CoordinatorState::with_metadata_store(reopened_store);
+
+        let latest = recreated
+            .get_latest_checkpoint(run_id.value.clone())
+            .unwrap();
+        assert_eq!(latest.checkpoint.checkpoint_id.0, "checkpoint-1");
+        assert_eq!(latest.checkpoint.state, DomainCheckpointState::Committed);
+        assert_eq!(latest.checkpoint.artifacts.len(), 2);
     }
 
     #[test]

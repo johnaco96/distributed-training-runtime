@@ -272,6 +272,181 @@ mod tests {
     }
 
     #[test]
+    fn dataset_metadata_survives_persistence_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+
+        let dataset = DatasetRecord {
+            run_id: "run-1".to_string(),
+            dataset_id: "dataset-1".to_string(),
+            name: "training-set".to_string(),
+            dataset_uri: "file:///datasets/training".to_string(),
+            format: "parquet".to_string(),
+            shard_count: 2,
+            dataset_version: "v1".to_string(),
+            labels: std::collections::HashMap::new(),
+            registered_at: std::time::SystemTime::now(),
+            shards: vec![
+                ShardRecord {
+                    shard_id: "shard-0".to_string(),
+                    dataset_id: "dataset-1".to_string(),
+                    shard_uri: "file:///datasets/training/0.parquet".to_string(),
+                    byte_range_start: 0,
+                    byte_range_end: 10,
+                    size_bytes: 100,
+                    checksum: "sum0".to_string(),
+                    checksum_algorithm: "sha256".to_string(),
+                },
+                ShardRecord {
+                    shard_id: "shard-1".to_string(),
+                    dataset_id: "dataset-1".to_string(),
+                    shard_uri: "file:///datasets/training/1.parquet".to_string(),
+                    byte_range_start: 11,
+                    byte_range_end: 22,
+                    size_bytes: 200,
+                    checksum: "sum1".to_string(),
+                    checksum_algorithm: "sha256".to_string(),
+                },
+            ],
+        };
+        store.save_dataset(&dataset).unwrap();
+
+        let reopened = SqliteMetadataStore::open(&path).unwrap();
+        let (name, shards) = reopened
+            .load_dataset("run-1", "dataset-1")
+            .unwrap()
+            .expect("dataset should load");
+
+        assert_eq!(name, "training-set");
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].shard_id, "shard-0");
+        assert_eq!(shards[0].shard_uri, "file:///datasets/training/0.parquet");
+        assert_eq!(shards[0].size_bytes, 100);
+        assert_eq!(shards[1].shard_id, "shard-1");
+        assert_eq!(shards[1].shard_uri, "file:///datasets/training/1.parquet");
+        assert_eq!(shards[1].size_bytes, 200);
+    }
+
+    #[test]
+    fn committed_checkpoint_survives_persistence_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+
+        let checkpoint = CoordinatorCheckpointRecord {
+            checkpoint: CheckpointRecord::new(
+                DomainRunId("run-1".to_string()),
+                DomainCheckpointId("checkpoint-a".to_string()),
+                42,
+                1000,
+            ),
+            initiated_by_worker_id: "worker-0".to_string(),
+            committed_at_millis: None,
+        };
+        store
+            .save_checkpoint("run-1", "begin-a", &checkpoint)
+            .unwrap();
+
+        let artifact_0 = ArtifactRecord {
+            worker_id: DomainWorkerId("worker-0".to_string()),
+            artifact_name: "model.bin".to_string(),
+            storage_key: "file:///ckpt/a/worker-0-model.bin".to_string(),
+            size_bytes: 111,
+            checksum: "abc".to_string(),
+            checksum_algorithm: "sha256".to_string(),
+        };
+        let artifact_1 = ArtifactRecord {
+            worker_id: DomainWorkerId("worker-1".to_string()),
+            artifact_name: "model.bin".to_string(),
+            storage_key: "file:///ckpt/a/worker-1-model.bin".to_string(),
+            size_bytes: 222,
+            checksum: "def".to_string(),
+            checksum_algorithm: "sha256".to_string(),
+        };
+        store
+            .save_checkpoint_artifact("run-1", "checkpoint-a", &artifact_0)
+            .unwrap();
+        store
+            .save_checkpoint_artifact("run-1", "checkpoint-a", &artifact_1)
+            .unwrap();
+        store
+            .mark_checkpoint_committed("run-1", "checkpoint-a", 2000)
+            .unwrap();
+
+        let reopened = SqliteMetadataStore::open(&path).unwrap();
+        let latest = reopened
+            .load_latest_checkpoint("run-1")
+            .unwrap()
+            .expect("latest committed checkpoint should load");
+
+        assert_eq!(latest.checkpoint.checkpoint_id.0, "checkpoint-a");
+        assert_eq!(latest.checkpoint.state, DomainCheckpointState::Committed);
+        assert_eq!(latest.checkpoint.artifacts.len(), 2);
+        assert_eq!(latest.checkpoint.artifacts[0], artifact_0);
+        assert_eq!(latest.checkpoint.artifacts[1], artifact_1);
+    }
+
+    #[test]
+    fn newer_partial_checkpoint_does_not_replace_committed_after_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+
+        let committed = CoordinatorCheckpointRecord {
+            checkpoint: CheckpointRecord::new(
+                DomainRunId("run-1".to_string()),
+                DomainCheckpointId("checkpoint-a".to_string()),
+                1,
+                100,
+            ),
+            initiated_by_worker_id: "worker-0".to_string(),
+            committed_at_millis: None,
+        };
+        store
+            .save_checkpoint("run-1", "idem-a", &committed)
+            .unwrap();
+        store
+            .mark_checkpoint_committed("run-1", "checkpoint-a", 150)
+            .unwrap();
+
+        let partial = CoordinatorCheckpointRecord {
+            checkpoint: CheckpointRecord::new(
+                DomainRunId("run-1".to_string()),
+                DomainCheckpointId("checkpoint-b".to_string()),
+                2,
+                200,
+            ),
+            initiated_by_worker_id: "worker-1".to_string(),
+            committed_at_millis: None,
+        };
+        store.save_checkpoint("run-1", "idem-b", &partial).unwrap();
+        store
+            .save_checkpoint_artifact(
+                "run-1",
+                "checkpoint-b",
+                &ArtifactRecord {
+                    worker_id: DomainWorkerId("worker-1".to_string()),
+                    artifact_name: "model.bin".to_string(),
+                    storage_key: "file:///ckpt/b/worker-1-model.bin".to_string(),
+                    size_bytes: 333,
+                    checksum: "ghi".to_string(),
+                    checksum_algorithm: "sha256".to_string(),
+                },
+            )
+            .unwrap();
+
+        let reopened = SqliteMetadataStore::open(&path).unwrap();
+        let latest = reopened
+            .load_latest_checkpoint("run-1")
+            .unwrap()
+            .expect("committed checkpoint should remain latest");
+        assert_eq!(latest.checkpoint.checkpoint_id.0, "checkpoint-a");
+    }
+    #[test]
     fn worker_metadata_survives_persistence_reload() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("meta.db");
