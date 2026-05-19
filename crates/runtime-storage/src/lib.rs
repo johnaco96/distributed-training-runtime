@@ -10,6 +10,8 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 pub mod object_key;
@@ -224,6 +226,89 @@ pub trait StorageBackend {
     fn exists(&self, key: &StorageKey) -> Result<bool, StorageError>;
     fn list_prefix(&self, prefix: &StorageKey) -> Result<Vec<StorageKey>, StorageError>;
     fn delete(&self, key: &StorageKey) -> Result<(), StorageError>;
+}
+
+pub fn put_many<B>(
+    backend: &B,
+    items: Vec<(StorageKey, Vec<u8>)>,
+    policy: StorageOperationPolicy,
+) -> Result<Vec<(StorageKey, Result<(), StorageError>)>, StorageError>
+where
+    B: StorageBackend + Sync,
+{
+    policy.validate()?;
+    let shared = Arc::new(Mutex::new(
+        items
+            .into_iter()
+            .map(|(key, bytes)| (key, Arc::new(bytes)))
+            .collect::<Vec<_>>(),
+    ));
+    let out = Arc::new(Mutex::new(Vec::new()));
+    thread::scope(|scope| {
+        for _ in 0..policy.max_concurrent_operations {
+            let shared = Arc::clone(&shared);
+            let out = Arc::clone(&out);
+            scope.spawn(move || loop {
+                let item = shared.lock().expect("work lock").pop();
+                let Some((key, bytes)) = item else { break };
+                let result = backend.put(&key, bytes.as_slice());
+                out.lock().expect("result lock").push((key, result));
+            });
+        }
+    });
+    Ok(out.lock().expect("result lock").drain(..).collect())
+}
+
+pub fn get_many<B>(
+    backend: &B,
+    keys: Vec<StorageKey>,
+    policy: StorageOperationPolicy,
+) -> Result<Vec<(StorageKey, Result<Vec<u8>, StorageError>)>, StorageError>
+where
+    B: StorageBackend + Sync,
+{
+    policy.validate()?;
+    let shared = Arc::new(Mutex::new(keys));
+    let out = Arc::new(Mutex::new(Vec::new()));
+    thread::scope(|scope| {
+        for _ in 0..policy.max_concurrent_operations {
+            let shared = Arc::clone(&shared);
+            let out = Arc::clone(&out);
+            scope.spawn(move || loop {
+                let item = shared.lock().expect("work lock").pop();
+                let Some(key) = item else { break };
+                let result = backend.get(&key);
+                out.lock().expect("result lock").push((key, result));
+            });
+        }
+    });
+    Ok(out.lock().expect("result lock").drain(..).collect())
+}
+
+pub fn exists_many<B>(
+    backend: &B,
+    keys: Vec<StorageKey>,
+    policy: StorageOperationPolicy,
+) -> Result<Vec<(StorageKey, Result<bool, StorageError>)>, StorageError>
+where
+    B: StorageBackend + Sync,
+{
+    policy.validate()?;
+    let shared = Arc::new(Mutex::new(keys));
+    let out = Arc::new(Mutex::new(Vec::new()));
+    thread::scope(|scope| {
+        for _ in 0..policy.max_concurrent_operations {
+            let shared = Arc::clone(&shared);
+            let out = Arc::clone(&out);
+            scope.spawn(move || loop {
+                let item = shared.lock().expect("work lock").pop();
+                let Some(key) = item else { break };
+                let result = backend.exists(&key);
+                out.lock().expect("result lock").push((key, result));
+            });
+        }
+    });
+    Ok(out.lock().expect("result lock").drain(..).collect())
 }
 
 #[derive(Debug, Clone)]
@@ -570,5 +655,70 @@ mod tests {
         .await
         .expect_err("should timeout");
         assert!(matches!(err, StorageError::Timeout { .. }));
+    }
+
+    #[test]
+    fn batch_helpers_put_get_exists_roundtrip() {
+        let dir = test_dir("batch-roundtrip");
+        let storage = LocalStorage::new(&dir).expect("storage");
+        let policy = StorageOperationPolicy {
+            max_concurrent_operations: 2,
+            ..Default::default()
+        };
+        let items = vec![
+            (StorageKey::new("runs/r1/a.bin").unwrap(), b"a".to_vec()),
+            (StorageKey::new("runs/r1/b.bin").unwrap(), b"bb".to_vec()),
+        ];
+        let put_results = put_many(&storage, items.clone(), policy).expect("put_many");
+        assert!(put_results.iter().all(|(_, r)| r.is_ok()));
+
+        let keys = items.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+        let mut get_results = get_many(&storage, keys.clone(), policy).expect("get_many");
+        get_results.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(get_results[0].1.as_ref().unwrap(), b"a");
+        assert_eq!(get_results[1].1.as_ref().unwrap(), b"bb");
+
+        let mut exists_results = exists_many(&storage, keys, policy).expect("exists_many");
+        exists_results.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(exists_results.iter().all(|(_, r)| matches!(r, Ok(true))));
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn batch_helpers_report_per_item_failures() {
+        let dir = test_dir("batch-failures");
+        let storage = LocalStorage::new(&dir).expect("storage");
+        let policy = StorageOperationPolicy::default();
+        let keys = vec![
+            StorageKey::new("runs/r1/missing.bin").unwrap(),
+            StorageKey::new("runs/r1/existing.bin").unwrap(),
+        ];
+        storage.put(&keys[1], b"ok").expect("seed");
+        let results = get_many(&storage, keys, policy).expect("get_many");
+        assert!(results
+            .iter()
+            .any(|(_, r)| matches!(r, Err(StorageError::NotFound(_)))));
+        assert!(results
+            .iter()
+            .any(|(_, r)| matches!(r, Ok(bytes) if bytes == b"ok")));
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn batch_helpers_reject_zero_concurrency_policy() {
+        let dir = test_dir("batch-invalid-policy");
+        let storage = LocalStorage::new(&dir).expect("storage");
+        let bad_policy = StorageOperationPolicy {
+            max_concurrent_operations: 0,
+            ..Default::default()
+        };
+        let err = exists_many(
+            &storage,
+            vec![StorageKey::new("runs/r1/any.bin").unwrap()],
+            bad_policy,
+        )
+        .expect_err("invalid policy");
+        assert!(matches!(err, StorageError::InvalidKey(_)));
+        fs::remove_dir_all(dir).expect("cleanup");
     }
 }
