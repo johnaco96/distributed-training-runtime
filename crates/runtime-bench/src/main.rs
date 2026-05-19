@@ -167,6 +167,7 @@ fn main() -> Result<(), String> {
             start_coordinator,
             out_csv,
             out_json,
+            simulate_large,
         } => {
             let default_workers = if simulate_large {
                 DEFAULT_SIMULATED_SCALING_WORKERS
