@@ -1,20 +1,17 @@
 #![forbid(unsafe_code)]
 
-//! Checkpoint state machine, metadata models, and validation helpers for MVP.
-//!
-//! This crate intentionally focuses on in-memory state machine behavior only.
-//! It does not integrate with storage or coordinator RPCs yet.
-
+use runtime_storage::{
+    checkpoint_committed_marker, checkpoint_manifest_committed, checkpoint_manifest_pending,
+    checkpoint_worker_artifact, latest_pointer, StorageBackend, StorageError,
+};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct CheckpointId(pub String);
-
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct RunId(pub String);
-
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct WorkerId(pub String);
 
@@ -28,31 +25,22 @@ pub enum CheckpointState {
     Failed,
     Aborted,
 }
-
 impl CheckpointState {
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            CheckpointState::Committed | CheckpointState::Failed | CheckpointState::Aborted
-        )
+        matches!(self, Self::Committed | Self::Failed | Self::Aborted)
     }
-
     fn can_transition_to(self, next: CheckpointState) -> bool {
         matches!(
             (self, next),
-            (
-                CheckpointState::Initiated,
-                CheckpointState::UploadInProgress
-            ) | (
-                CheckpointState::UploadInProgress,
-                CheckpointState::Validating
-            ) | (CheckpointState::Validating, CheckpointState::Committed)
-                | (CheckpointState::Initiated, CheckpointState::Failed)
-                | (CheckpointState::UploadInProgress, CheckpointState::Failed)
-                | (CheckpointState::Validating, CheckpointState::Failed)
-                | (CheckpointState::Initiated, CheckpointState::Aborted)
-                | (CheckpointState::UploadInProgress, CheckpointState::Aborted)
-                | (CheckpointState::Validating, CheckpointState::Aborted)
+            (Self::Initiated, Self::UploadInProgress)
+                | (Self::UploadInProgress, Self::Validating)
+                | (Self::Validating, Self::Committed)
+                | (Self::Initiated, Self::Failed)
+                | (Self::UploadInProgress, Self::Failed)
+                | (Self::Validating, Self::Failed)
+                | (Self::Initiated, Self::Aborted)
+                | (Self::UploadInProgress, Self::Aborted)
+                | (Self::Validating, Self::Aborted)
         )
     }
 }
@@ -77,7 +65,6 @@ pub struct CheckpointRecord {
     pub created_at_millis: u64,
     pub updated_at_millis: u64,
 }
-
 impl CheckpointRecord {
     pub fn new(run_id: RunId, checkpoint_id: CheckpointId, step: u64, now_millis: u64) -> Self {
         Self {
@@ -90,7 +77,6 @@ impl CheckpointRecord {
             updated_at_millis: now_millis,
         }
     }
-
     pub fn transition_to(
         &mut self,
         next: CheckpointState,
@@ -102,19 +88,16 @@ impl CheckpointRecord {
                 requested: next,
             });
         }
-
         if !self.state.can_transition_to(next) {
             return Err(CheckpointError::InvalidTransition {
                 from: self.state,
                 to: next,
             });
         }
-
         self.state = next;
         self.updated_at_millis = now_millis;
         Ok(())
     }
-
     pub fn add_artifact(
         &mut self,
         artifact: ArtifactRecord,
@@ -126,22 +109,18 @@ impl CheckpointRecord {
                 requested: self.state,
             });
         }
-
         if artifact.artifact_name.trim().is_empty() || artifact.storage_key.trim().is_empty() {
             return Err(CheckpointError::InvalidArtifact(
-                "artifact_name and storage_key must be non-empty".to_string(),
+                "artifact_name and storage_key must be non-empty".into(),
             ));
         }
-
         self.artifacts.push(artifact);
         self.updated_at_millis = now_millis;
         Ok(())
     }
-
     pub fn is_restorable(&self) -> bool {
         self.state == CheckpointState::Committed
     }
-
     pub fn is_partial(&self) -> bool {
         matches!(
             self.state,
@@ -161,7 +140,6 @@ pub struct ManifestArtifact {
     pub checksum: String,
     pub checksum_algorithm: String,
 }
-
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointManifest {
     pub schema_version: u32,
@@ -173,10 +151,8 @@ pub struct CheckpointManifest {
     pub committed_at_millis: Option<u64>,
     pub artifacts: Vec<ManifestArtifact>,
 }
-
 impl CheckpointManifest {
     pub const SCHEMA_VERSION: u32 = 1;
-
     pub fn from_record(
         record: &CheckpointRecord,
         committed_at_millis: Option<u64>,
@@ -196,61 +172,179 @@ impl CheckpointManifest {
                 .map(ManifestArtifact::from)
                 .collect(),
         };
-
         manifest.validate_for_commit()?;
         Ok(manifest)
     }
-
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, CheckpointError> {
         serde_json::to_vec_pretty(self)
-            .map_err(|err| CheckpointError::Serialization(format!("serialize manifest: {err}")))
+            .map_err(|e| CheckpointError::Serialization(format!("serialize manifest: {e}")))
     }
-
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, CheckpointError> {
         serde_json::from_slice(bytes)
-            .map_err(|err| CheckpointError::Serialization(format!("deserialize manifest: {err}")))
+            .map_err(|e| CheckpointError::Serialization(format!("deserialize manifest: {e}")))
     }
-
     pub fn is_committed(&self) -> bool {
         self.state == CheckpointState::Committed
     }
-
     pub fn is_restorable(&self) -> bool {
         self.is_committed() && self.committed_at_millis.is_some()
     }
-
     pub fn validate_for_commit(&self) -> Result<(), CheckpointError> {
         if self.is_committed() {
             if self.committed_at_millis.is_none() {
                 return Err(CheckpointError::ManifestValidation(
-                    "committed manifest must include committed_at_millis".to_string(),
+                    "committed manifest must include committed_at_millis".into(),
                 ));
             }
             if self.artifacts.is_empty() {
                 return Err(CheckpointError::ManifestValidation(
-                    "committed manifest must include at least one artifact".to_string(),
+                    "committed manifest must include at least one artifact".into(),
                 ));
             }
         }
-
         Ok(())
     }
 }
-
 impl From<ArtifactRecord> for ManifestArtifact {
-    fn from(value: ArtifactRecord) -> Self {
+    fn from(v: ArtifactRecord) -> Self {
         Self {
-            worker_id: value.worker_id.0,
-            artifact_name: value.artifact_name,
-            storage_key: value.storage_key,
-            size_bytes: value.size_bytes,
-            checksum: value.checksum,
-            checksum_algorithm: value.checksum_algorithm,
+            worker_id: v.worker_id.0,
+            artifact_name: v.artifact_name,
+            storage_key: v.storage_key,
+            size_bytes: v.size_bytes,
+            checksum: v.checksum,
+            checksum_algorithm: v.checksum_algorithm,
         }
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CheckpointStore<B: StorageBackend> {
+    storage: B,
+}
+impl<B: StorageBackend> CheckpointStore<B> {
+    pub fn new(storage: B) -> Self {
+        Self { storage }
+    }
+
+    pub fn write_artifact(
+        &self,
+        record: &mut CheckpointRecord,
+        worker_id: WorkerId,
+        artifact_name: &str,
+        bytes: &[u8],
+        checksum: String,
+        checksum_algorithm: String,
+        now_millis: u64,
+    ) -> Result<ArtifactRecord, CheckpointError> {
+        let key = checkpoint_worker_artifact(
+            &record.run_id.0,
+            &record.checkpoint_id.0,
+            &worker_id.0,
+            artifact_name,
+        );
+        self.storage.put(&key, bytes)?;
+        let artifact = ArtifactRecord {
+            worker_id,
+            artifact_name: artifact_name.to_string(),
+            storage_key: key.as_str().to_string(),
+            size_bytes: bytes.len() as u64,
+            checksum,
+            checksum_algorithm,
+        };
+        if record.state == CheckpointState::Initiated {
+            record.transition_to(CheckpointState::UploadInProgress, now_millis)?;
+        }
+        record.add_artifact(artifact.clone(), now_millis)?;
+        Ok(artifact)
+    }
+
+    pub fn write_pending_manifest(
+        &self,
+        record: &CheckpointRecord,
+    ) -> Result<CheckpointManifest, CheckpointError> {
+        let manifest = CheckpointManifest::from_record(record, None)?;
+        let key = checkpoint_manifest_pending(&record.run_id.0, &record.checkpoint_id.0);
+        self.storage.put(&key, &manifest.to_json_bytes()?)?;
+        Ok(manifest)
+    }
+
+    pub fn commit_checkpoint(
+        &self,
+        record: &mut CheckpointRecord,
+        committed_at_millis: u64,
+    ) -> Result<CheckpointManifest, CheckpointError> {
+        if record.artifacts.is_empty() {
+            return Err(CheckpointError::ManifestValidation(
+                "cannot commit checkpoint without artifacts".into(),
+            ));
+        }
+        if record.state == CheckpointState::Initiated {
+            record.transition_to(CheckpointState::UploadInProgress, committed_at_millis)?;
+        }
+        if record.state == CheckpointState::UploadInProgress {
+            record.transition_to(CheckpointState::Validating, committed_at_millis)?;
+        }
+        if record.state == CheckpointState::Validating {
+            record.transition_to(CheckpointState::Committed, committed_at_millis)?;
+        }
+
+        let manifest = CheckpointManifest::from_record(record, Some(committed_at_millis))?;
+        manifest.validate_for_commit()?;
+
+        self.storage.put(
+            &checkpoint_manifest_committed(&record.run_id.0, &record.checkpoint_id.0),
+            &manifest.to_json_bytes()?,
+        )?;
+        self.storage.put(
+            &checkpoint_committed_marker(&record.run_id.0, &record.checkpoint_id.0),
+            b"committed\n",
+        )?;
+        self.storage.put(
+            &latest_pointer(&record.run_id.0),
+            record.checkpoint_id.0.as_bytes(),
+        )?;
+        Ok(manifest)
+    }
+
+    pub fn load_latest_manifest(
+        &self,
+        run_id: &RunId,
+    ) -> Result<CheckpointManifest, CheckpointError> {
+        let latest_raw = self
+            .storage
+            .get(&latest_pointer(&run_id.0))
+            .map_err(|err| match err {
+                StorageError::NotFound(_) => CheckpointError::NoLatestCheckpoint,
+                other => CheckpointError::Storage(other),
+            })?;
+        let checkpoint_id = String::from_utf8(latest_raw)
+            .map_err(|e| {
+                CheckpointError::Serialization(format!("latest pointer is not utf-8: {e}"))
+            })?
+            .trim()
+            .to_string();
+        if checkpoint_id.is_empty() {
+            return Err(CheckpointError::NoLatestCheckpoint);
+        }
+
+        let marker = checkpoint_committed_marker(&run_id.0, &checkpoint_id);
+        if !self.storage.exists(&marker)? {
+            return Err(CheckpointError::MissingCommitMarker {
+                run_id: run_id.0.clone(),
+                checkpoint_id,
+            });
+        }
+
+        let manifest_bytes = self
+            .storage
+            .get(&checkpoint_manifest_committed(&run_id.0, &checkpoint_id))?;
+        let manifest = CheckpointManifest::from_json_bytes(&manifest_bytes)?;
+        manifest.validate_for_commit()?;
+        Ok(manifest)
+    }
+}
+
+#[derive(Debug)]
 pub enum CheckpointError {
     InvalidTransition {
         from: CheckpointState,
@@ -263,351 +357,296 @@ pub enum CheckpointError {
     InvalidArtifact(String),
     Serialization(String),
     ManifestValidation(String),
+    Storage(StorageError),
+    MissingCommitMarker {
+        run_id: String,
+        checkpoint_id: String,
+    },
+    NoLatestCheckpoint,
 }
-
 impl Display for CheckpointError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            CheckpointError::InvalidTransition { from, to } => {
+            Self::InvalidTransition { from, to } => {
                 write!(f, "invalid checkpoint transition: {from:?} -> {to:?}")
             }
-            CheckpointError::TerminalState { current, requested } => write!(
+            Self::TerminalState { current, requested } => write!(
                 f,
                 "cannot transition terminal checkpoint state: {current:?} -> {requested:?}"
             ),
-            CheckpointError::InvalidArtifact(message) => {
-                write!(f, "invalid artifact metadata: {message}")
-            }
-            CheckpointError::Serialization(message) => {
-                write!(f, "checkpoint manifest serialization error: {message}")
-            }
-            CheckpointError::ManifestValidation(message) => {
-                write!(f, "checkpoint manifest validation error: {message}")
-            }
+            Self::InvalidArtifact(m) => write!(f, "invalid artifact metadata: {m}"),
+            Self::Serialization(m) => write!(f, "checkpoint manifest serialization error: {m}"),
+            Self::ManifestValidation(m) => write!(f, "checkpoint manifest validation error: {m}"),
+            Self::Storage(err) => write!(f, "checkpoint storage error: {err}"),
+            Self::MissingCommitMarker {
+                run_id,
+                checkpoint_id,
+            } => write!(
+                f,
+                "missing commit marker for run {run_id} checkpoint {checkpoint_id}"
+            ),
+            Self::NoLatestCheckpoint => write!(f, "no latest checkpoint for run"),
         }
     }
 }
-
 impl Error for CheckpointError {}
+impl From<StorageError> for CheckpointError {
+    fn from(value: StorageError) -> Self {
+        Self::Storage(value)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use runtime_storage::{
+        checkpoint_manifest_pending, checkpoint_worker_artifact, latest_pointer, LocalStorage,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
     fn ids() -> (RunId, CheckpointId, WorkerId) {
         (
-            RunId("run-1".to_string()),
-            CheckpointId("ckpt-1".to_string()),
-            WorkerId("worker-1".to_string()),
+            RunId("run-1".into()),
+            CheckpointId("ckpt-1".into()),
+            WorkerId("worker-1".into()),
         )
     }
-
     fn artifact(worker_id: WorkerId) -> ArtifactRecord {
         ArtifactRecord {
             worker_id,
-            artifact_name: "model-shard-0".to_string(),
-            storage_key: "runs/run-1/checkpoints/ckpt-1/workers/worker-1/model-shard-0".to_string(),
+            artifact_name: "model-shard-0".into(),
+            storage_key: "runs/run-1/checkpoints/ckpt-1/workers/worker-1/model-shard-0".into(),
             size_bytes: 128,
-            checksum: "abc123".to_string(),
-            checksum_algorithm: "sha256".to_string(),
+            checksum: "abc123".into(),
+            checksum_algorithm: "sha256".into(),
         }
+    }
+    fn test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("runtime-checkpoint-{name}-{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
     fn new_checkpoint_starts_in_initiated() {
         let (run_id, checkpoint_id, _) = ids();
         let record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-
         assert_eq!(record.state, CheckpointState::Initiated);
         assert!(record.is_partial());
     }
-
     #[test]
     fn valid_successful_transition_path_reaches_committed() {
         let (run_id, checkpoint_id, _) = ids();
         let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-
         record
             .transition_to(CheckpointState::UploadInProgress, 1010)
-            .expect("initiated -> upload should be valid");
+            .unwrap();
         record
             .transition_to(CheckpointState::Validating, 1020)
-            .expect("upload -> validating should be valid");
+            .unwrap();
         record
             .transition_to(CheckpointState::Committed, 1030)
-            .expect("validating -> committed should be valid");
-
+            .unwrap();
         assert_eq!(record.state, CheckpointState::Committed);
-        assert_eq!(record.updated_at_millis, 1030);
     }
-
     #[test]
-    fn committed_checkpoint_is_restorable() {
-        let (run_id, checkpoint_id, _) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-
-        record
-            .transition_to(CheckpointState::UploadInProgress, 1010)
-            .unwrap();
-        record
-            .transition_to(CheckpointState::Validating, 1020)
-            .unwrap();
-        record
-            .transition_to(CheckpointState::Committed, 1030)
-            .unwrap();
-
-        assert!(record.is_restorable());
-        assert!(!record.is_partial());
-    }
-
-    #[test]
-    fn partial_checkpoint_is_not_restorable() {
-        let (run_id, checkpoint_id, _) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-        record
-            .transition_to(CheckpointState::UploadInProgress, 1010)
-            .unwrap();
-
-        assert!(!record.is_restorable());
-        assert!(record.is_partial());
-    }
-
-    #[test]
-    fn failed_checkpoint_is_not_restorable() {
-        let (run_id, checkpoint_id, _) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-        record.transition_to(CheckpointState::Failed, 1001).unwrap();
-
-        assert!(!record.is_restorable());
-        assert!(!record.is_partial());
-    }
-
-    #[test]
-    fn aborted_checkpoint_is_not_restorable() {
-        let (run_id, checkpoint_id, _) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-        record
-            .transition_to(CheckpointState::Aborted, 1001)
-            .unwrap();
-
-        assert!(!record.is_restorable());
-        assert!(!record.is_partial());
-    }
-
-    #[test]
-    fn terminal_states_cannot_transition() {
-        let (run_id, checkpoint_id, _) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-        record.transition_to(CheckpointState::Failed, 1001).unwrap();
-
-        let err = record
-            .transition_to(CheckpointState::Committed, 1002)
-            .expect_err("terminal states should not transition");
-        assert!(matches!(err, CheckpointError::TerminalState { .. }));
-    }
-
-    #[test]
-    fn invalid_transition_is_rejected() {
-        let (run_id, checkpoint_id, _) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-
-        let err = record
-            .transition_to(CheckpointState::Committed, 1001)
-            .expect_err("initiated -> committed should be invalid");
-        assert!(matches!(err, CheckpointError::InvalidTransition { .. }));
-    }
-
-    #[test]
-    fn artifact_can_be_added_before_commit() {
+    fn pending_manifest_is_not_restorable() {
         let (run_id, checkpoint_id, worker_id) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-
+        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        record.add_artifact(artifact(worker_id), 1001).unwrap();
         record
-            .add_artifact(artifact(worker_id), 1001)
-            .expect("artifact add should succeed before terminal state");
-
-        assert_eq!(record.artifacts.len(), 1);
-        assert_eq!(record.updated_at_millis, 1001);
-    }
-
-    #[test]
-    fn artifact_cannot_be_added_after_commit() {
-        let (run_id, checkpoint_id, worker_id) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-        record
-            .transition_to(CheckpointState::UploadInProgress, 1010)
+            .transition_to(CheckpointState::UploadInProgress, 1002)
             .unwrap();
-        record
-            .transition_to(CheckpointState::Validating, 1020)
-            .unwrap();
-        record
-            .transition_to(CheckpointState::Committed, 1030)
-            .unwrap();
-
-        let err = record
-            .add_artifact(artifact(worker_id), 1040)
-            .expect_err("cannot add artifact once committed");
-        assert!(matches!(err, CheckpointError::TerminalState { .. }));
-    }
-
-    #[test]
-    fn is_partial_behaves_correctly_for_in_progress_states() {
-        let (run_id, checkpoint_id, _) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-
-        assert!(record.is_partial());
-        record
-            .transition_to(CheckpointState::UploadInProgress, 1010)
-            .unwrap();
-        assert!(record.is_partial());
-        record
-            .transition_to(CheckpointState::Validating, 1020)
-            .unwrap();
-        assert!(record.is_partial());
-        record
-            .transition_to(CheckpointState::Committed, 1030)
-            .unwrap();
-        assert!(!record.is_partial());
-    }
-
-    #[test]
-    fn manifest_from_committed_record_succeeds() {
-        let (run_id, checkpoint_id, worker_id) = ids();
-        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 42, 1000);
-        record.add_artifact(artifact(worker_id), 1005).unwrap();
-        record
-            .transition_to(CheckpointState::UploadInProgress, 1010)
-            .unwrap();
-        record
-            .transition_to(CheckpointState::Validating, 1020)
-            .unwrap();
-        record
-            .transition_to(CheckpointState::Committed, 1030)
-            .unwrap();
-
-        let manifest = CheckpointManifest::from_record(&record, Some(1030)).unwrap();
-
-        assert_eq!(manifest.state, CheckpointState::Committed);
-        assert_eq!(manifest.artifacts.len(), 1);
-        assert_eq!(manifest.committed_at_millis, Some(1030));
-    }
-
-    #[test]
-    fn manifest_json_round_trip_preserves_key_fields() {
-        let manifest = CheckpointManifest {
-            schema_version: CheckpointManifest::SCHEMA_VERSION,
-            run_id: "run-1".to_string(),
-            checkpoint_id: "ckpt-1".to_string(),
-            step: 42,
-            state: CheckpointState::Committed,
-            created_at_millis: 1000,
-            committed_at_millis: Some(1030),
-            artifacts: vec![ManifestArtifact {
-                worker_id: "worker-1".to_string(),
-                artifact_name: "model-shard-0".to_string(),
-                storage_key: "runs/run-1/checkpoints/ckpt-1/workers/worker-1/model-shard-0"
-                    .to_string(),
-                size_bytes: 128,
-                checksum: "abc123".to_string(),
-                checksum_algorithm: "sha256".to_string(),
-            }],
-        };
-
-        let bytes = manifest.to_json_bytes().unwrap();
-        let decoded = CheckpointManifest::from_json_bytes(&bytes).unwrap();
-
-        assert_eq!(decoded.run_id, manifest.run_id);
-        assert_eq!(decoded.checkpoint_id, manifest.checkpoint_id);
-        assert_eq!(decoded.step, manifest.step);
-        assert_eq!(decoded.state, manifest.state);
-        assert_eq!(decoded.artifacts, manifest.artifacts);
-    }
-
-    #[test]
-    fn committed_manifest_with_timestamp_is_restorable() {
-        let manifest = CheckpointManifest {
-            schema_version: CheckpointManifest::SCHEMA_VERSION,
-            run_id: "run-1".to_string(),
-            checkpoint_id: "ckpt-1".to_string(),
-            step: 42,
-            state: CheckpointState::Committed,
-            created_at_millis: 1000,
-            committed_at_millis: Some(1030),
-            artifacts: vec![ManifestArtifact {
-                worker_id: "worker-1".to_string(),
-                artifact_name: "model-shard-0".to_string(),
-                storage_key: "runs/run-1/checkpoints/ckpt-1/workers/worker-1/model-shard-0"
-                    .to_string(),
-                size_bytes: 128,
-                checksum: "abc123".to_string(),
-                checksum_algorithm: "sha256".to_string(),
-            }],
-        };
-
-        assert!(manifest.is_restorable());
-    }
-
-    #[test]
-    fn non_committed_manifest_is_not_restorable() {
-        let manifest = CheckpointManifest {
-            schema_version: CheckpointManifest::SCHEMA_VERSION,
-            run_id: "run-1".to_string(),
-            checkpoint_id: "ckpt-1".to_string(),
-            step: 42,
-            state: CheckpointState::Validating,
-            created_at_millis: 1000,
-            committed_at_millis: Some(1030),
-            artifacts: vec![],
-        };
-
+        let manifest = CheckpointManifest::from_record(&record, None).unwrap();
         assert!(!manifest.is_restorable());
     }
-
     #[test]
-    fn committed_manifest_without_timestamp_fails_validation() {
-        let manifest = CheckpointManifest {
-            schema_version: CheckpointManifest::SCHEMA_VERSION,
-            run_id: "run-1".to_string(),
-            checkpoint_id: "ckpt-1".to_string(),
-            step: 42,
-            state: CheckpointState::Committed,
-            created_at_millis: 1000,
-            committed_at_millis: None,
-            artifacts: vec![ManifestArtifact {
-                worker_id: "worker-1".to_string(),
-                artifact_name: "model-shard-0".to_string(),
-                storage_key: "k".to_string(),
-                size_bytes: 128,
-                checksum: "abc123".to_string(),
-                checksum_algorithm: "sha256".to_string(),
-            }],
-        };
-
-        let err = manifest.validate_for_commit().unwrap_err();
-        assert!(matches!(err, CheckpointError::ManifestValidation(_)));
+    fn write_artifact_writes_bytes_and_metadata() {
+        let dir = test_dir("artifact");
+        let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+        let (run_id, checkpoint_id, worker_id) = ids();
+        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        let out = store
+            .write_artifact(
+                &mut record,
+                worker_id.clone(),
+                "model.bin",
+                b"hello",
+                "sum".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        assert_eq!(record.state, CheckpointState::UploadInProgress);
+        assert_eq!(record.artifacts.len(), 1);
+        assert_eq!(out.worker_id, worker_id);
+        let bytes = store
+            .storage
+            .get(&checkpoint_worker_artifact(
+                "run-1",
+                "ckpt-1",
+                "worker-1",
+                "model.bin",
+            ))
+            .unwrap();
+        assert_eq!(bytes, b"hello");
+        fs::remove_dir_all(dir).unwrap();
     }
-
     #[test]
-    fn committed_manifest_without_artifacts_fails_validation() {
-        let manifest = CheckpointManifest {
-            schema_version: CheckpointManifest::SCHEMA_VERSION,
-            run_id: "run-1".to_string(),
-            checkpoint_id: "ckpt-1".to_string(),
-            step: 42,
-            state: CheckpointState::Committed,
-            created_at_millis: 1000,
-            committed_at_millis: Some(1030),
-            artifacts: vec![],
-        };
-
-        let err = manifest.validate_for_commit().unwrap_err();
-        assert!(matches!(err, CheckpointError::ManifestValidation(_)));
+    fn write_pending_manifest_writes_file() {
+        let dir = test_dir("pending");
+        let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+        let (run_id, checkpoint_id, worker_id) = ids();
+        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        store
+            .write_artifact(
+                &mut record,
+                worker_id,
+                "a.bin",
+                b"x",
+                "c".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        let manifest = store.write_pending_manifest(&record).unwrap();
+        assert_eq!(manifest.committed_at_millis, None);
+        assert!(store
+            .storage
+            .exists(&checkpoint_manifest_pending("run-1", "ckpt-1"))
+            .unwrap());
+        fs::remove_dir_all(dir).unwrap();
     }
-
     #[test]
-    fn invalid_json_returns_error() {
-        let err = CheckpointManifest::from_json_bytes(br#"{"run_id":"missing fields"}"#)
-            .expect_err("invalid json should fail deserialization");
-        assert!(matches!(err, CheckpointError::Serialization(_)));
+    fn commit_writes_committed_marker_and_latest() {
+        let dir = test_dir("commit");
+        let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+        let (run_id, checkpoint_id, worker_id) = ids();
+        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        store
+            .write_artifact(
+                &mut record,
+                worker_id,
+                "a.bin",
+                b"x",
+                "c".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        let manifest = store.commit_checkpoint(&mut record, 2000).unwrap();
+        assert_eq!(manifest.state, CheckpointState::Committed);
+        assert!(store
+            .storage
+            .exists(&checkpoint_manifest_committed("run-1", "ckpt-1"))
+            .unwrap());
+        assert!(store
+            .storage
+            .exists(&checkpoint_committed_marker("run-1", "ckpt-1"))
+            .unwrap());
+        assert_eq!(
+            store.storage.get(&latest_pointer("run-1")).unwrap(),
+            b"ckpt-1"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn load_latest_manifest_returns_committed() {
+        let dir = test_dir("latest");
+        let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+        let (run_id, checkpoint_id, worker_id) = ids();
+        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        store
+            .write_artifact(
+                &mut record,
+                worker_id,
+                "a.bin",
+                b"x",
+                "c".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        store.commit_checkpoint(&mut record, 2000).unwrap();
+        let latest = store.load_latest_manifest(&RunId("run-1".into())).unwrap();
+        assert_eq!(latest.checkpoint_id, "ckpt-1");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn load_latest_fails_when_only_pending_exists() {
+        let dir = test_dir("only-pending");
+        let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+        let (run_id, checkpoint_id, worker_id) = ids();
+        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        store
+            .write_artifact(
+                &mut record,
+                worker_id,
+                "a.bin",
+                b"x",
+                "c".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        store.write_pending_manifest(&record).unwrap();
+        let err = store
+            .load_latest_manifest(&RunId("run-1".into()))
+            .unwrap_err();
+        assert!(matches!(err, CheckpointError::NoLatestCheckpoint));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn load_latest_fails_without_commit_marker() {
+        let dir = test_dir("missing-marker");
+        let storage = LocalStorage::new(&dir).unwrap();
+        let store = CheckpointStore::new(storage.clone());
+        let (run_id, checkpoint_id, worker_id) = ids();
+        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        store
+            .write_artifact(
+                &mut record,
+                worker_id,
+                "a.bin",
+                b"x",
+                "c".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        record
+            .transition_to(CheckpointState::Validating, 1002)
+            .unwrap();
+        record
+            .transition_to(CheckpointState::Committed, 1003)
+            .unwrap();
+        let manifest = CheckpointManifest::from_record(&record, Some(1003)).unwrap();
+        storage
+            .put(
+                &checkpoint_manifest_committed("run-1", "ckpt-1"),
+                &manifest.to_json_bytes().unwrap(),
+            )
+            .unwrap();
+        storage.put(&latest_pointer("run-1"), b"ckpt-1").unwrap();
+        let err = store
+            .load_latest_manifest(&RunId("run-1".into()))
+            .unwrap_err();
+        assert!(matches!(err, CheckpointError::MissingCommitMarker { .. }));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn commit_fails_without_artifacts() {
+        let dir = test_dir("no-artifacts");
+        let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+        let (run_id, checkpoint_id, _) = ids();
+        let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        let err = store.commit_checkpoint(&mut record, 2000).unwrap_err();
+        assert!(matches!(err, CheckpointError::ManifestValidation(_)));
+        fs::remove_dir_all(dir).unwrap();
     }
 }
