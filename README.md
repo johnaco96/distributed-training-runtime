@@ -132,8 +132,9 @@ See `docs/observability.md` for current scope and usage.
 
 - [x] Phase 16A local scaling benchmark command complete (`runtime-bench scaling-workers` for `1,2,4,8,16`).
 - [x] Phase 16B simulated larger worker-count mode implemented (`--simulate-large`, default `32,64,128`, local logical-worker simulation).
+- [x] Phase 16C runbook/result-format documentation complete (`docs/scaling-tests.md`).
 - Local coordinator benchmark scope only; no multi-machine/distributed production claims.
-
+- Phase 16 remains pending full local validation after pull until all requested validation commands pass in a local environment.
 
 - [ ] Phase 16 full completion pending fresh local validation after latest pull.
 - Next planned step after Phase 16 validation: **Phase 17 hardening**.

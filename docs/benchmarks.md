@@ -9,6 +9,8 @@ Phase 14A adds a **local-only** benchmark harness via `runtime-bench`.
 - Local coordinator RPC overhead benchmark for run/worker registration and worker heartbeats.
 
 ## Commands
+For Phase 16 scaling run instructions, interpretation guidance, and reporting template, see `docs/scaling-tests.md`.
+
 - `cargo run -p runtime-bench -- scaling-workers`
 - `cargo run -p runtime-bench -- scaling-workers --workers-list 1,2,4,8,16 --heartbeats 10`
 - `cargo run -p runtime-bench -- scaling-workers --simulate-large`
