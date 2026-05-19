@@ -205,6 +205,13 @@ pub enum ReportCheckpointArtifactError {
     InvalidInput(&'static str),
     InvalidState,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitCheckpointError {
+    RunNotFound,
+    CheckpointNotFound,
+    InvalidInput(&'static str),
+    InvalidState,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GetShardAssignmentsError {
@@ -404,6 +411,71 @@ impl CoordinatorState {
             inner
                 .checkpoint_artifact_idempotency_keys
                 .insert(scoped_idempotency_key, checkpoint_id);
+        }
+        Ok(response)
+    }
+
+    pub fn commit_checkpoint(
+        &self,
+        run_id: String,
+        checkpoint_id: String,
+        _idempotency_key: String,
+    ) -> Result<CoordinatorCheckpointRecord, CommitCheckpointError> {
+        if run_id.trim().is_empty() {
+            return Err(CommitCheckpointError::InvalidInput(
+                "run_id must be non-empty",
+            ));
+        }
+        if checkpoint_id.trim().is_empty() {
+            return Err(CommitCheckpointError::InvalidInput(
+                "checkpoint_id must be non-empty",
+            ));
+        }
+
+        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
+        if !inner.runs.contains_key(&run_id) {
+            return Err(CommitCheckpointError::RunNotFound);
+        }
+        let record = inner
+            .checkpoints_by_run
+            .get_mut(&run_id)
+            .and_then(|records| records.get_mut(&checkpoint_id))
+            .ok_or(CommitCheckpointError::CheckpointNotFound)?;
+
+        if record.checkpoint.artifacts.is_empty() {
+            return Err(CommitCheckpointError::InvalidState);
+        }
+
+        if matches!(
+            record.checkpoint.state,
+            DomainCheckpointState::Failed | DomainCheckpointState::Aborted
+        ) {
+            return Err(CommitCheckpointError::InvalidState);
+        }
+
+        let now_millis = now_millis();
+        if record.checkpoint.state == DomainCheckpointState::UploadInProgress {
+            record
+                .checkpoint
+                .transition_to(DomainCheckpointState::Validating, now_millis)
+                .map_err(map_commit_checkpoint_error)?;
+        }
+        if record.checkpoint.state == DomainCheckpointState::Validating {
+            record
+                .checkpoint
+                .transition_to(DomainCheckpointState::Committed, now_millis)
+                .map_err(map_commit_checkpoint_error)?;
+        }
+        if record.checkpoint.state != DomainCheckpointState::Committed {
+            return Err(CommitCheckpointError::InvalidState);
+        }
+
+        let response = record.clone();
+        if let Some(run) = inner.runs.get_mut(&run_id) {
+            run.latest_checkpoint_id = Some(CheckpointId {
+                value: checkpoint_id,
+            });
+            run.latest_checkpoint_state = CheckpointState::Committed as i32;
         }
         Ok(response)
     }
@@ -1036,6 +1108,14 @@ fn map_checkpoint_error(error: CheckpointError) -> ReportCheckpointArtifactError
         _ => ReportCheckpointArtifactError::InvalidState,
     }
 }
+fn map_commit_checkpoint_error(error: CheckpointError) -> CommitCheckpointError {
+    match error {
+        CheckpointError::InvalidTransition { .. } | CheckpointError::TerminalState { .. } => {
+            CommitCheckpointError::InvalidState
+        }
+        _ => CommitCheckpointError::InvalidState,
+    }
+}
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -1579,5 +1659,103 @@ mod tests {
             )
             .unwrap();
         assert_eq!(repeated.checkpoint.artifacts.len(), 1);
+    }
+
+    #[test]
+    fn commit_checkpoint_requires_existing_run_and_checkpoint() {
+        let state = CoordinatorState::default();
+        let err = state
+            .commit_checkpoint("missing".to_string(), "ckpt-1".to_string(), String::new())
+            .expect_err("missing run should fail");
+        assert_eq!(err, CommitCheckpointError::RunNotFound);
+
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let err = state
+            .commit_checkpoint(run_id.value, "missing-ckpt".to_string(), String::new())
+            .expect_err("missing checkpoint should fail");
+        assert_eq!(err, CommitCheckpointError::CheckpointNotFound);
+    }
+
+    #[test]
+    fn commit_checkpoint_requires_artifacts() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .unwrap()
+            .worker_id;
+        state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_id.value,
+                "ckpt-1".to_string(),
+                1,
+                "checkpoint-key".to_string(),
+            )
+            .unwrap();
+
+        let err = state
+            .commit_checkpoint(run_id.value, "ckpt-1".to_string(), String::new())
+            .expect_err("checkpoint without artifacts should fail");
+        assert_eq!(err, CommitCheckpointError::InvalidState);
+    }
+
+    #[test]
+    fn commit_checkpoint_transitions_and_updates_latest() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .unwrap()
+            .worker_id;
+        state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                "ckpt-1".to_string(),
+                1,
+                "checkpoint-key".to_string(),
+            )
+            .unwrap();
+        state
+            .report_checkpoint_artifact(
+                run_id.value.clone(),
+                worker_id.value,
+                "ckpt-1".to_string(),
+                "model.bin".to_string(),
+                "s3://bucket/model.bin".to_string(),
+                10,
+                "sum".to_string(),
+                "sha256".to_string(),
+                "artifact-key".to_string(),
+            )
+            .unwrap();
+
+        let committed = state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "ckpt-1".to_string(),
+                "commit-1".to_string(),
+            )
+            .expect("commit should succeed");
+        assert_eq!(committed.checkpoint.state, DomainCheckpointState::Committed);
+        assert!(committed.checkpoint.committed_at_millis.is_some());
+
+        let run = state.get_run(&run_id).unwrap();
+        assert_eq!(
+            run.latest_checkpoint_id,
+            Some(CheckpointId {
+                value: "ckpt-1".to_string()
+            })
+        );
+        assert_eq!(
+            run.latest_checkpoint_state,
+            CheckpointState::Committed as i32
+        );
+
+        let repeated = state
+            .commit_checkpoint(run_id.value, "ckpt-1".to_string(), "commit-2".to_string())
+            .expect("repeated commit should be harmless");
+        assert_eq!(repeated.checkpoint.state, DomainCheckpointState::Committed);
     }
 }
