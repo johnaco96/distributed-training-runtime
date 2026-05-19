@@ -145,9 +145,12 @@ See `docs/observability.md` for current scope and usage.
 - [x] Phase 17A coordinator error handling consistency + compatibility/version notes documentation complete.
 - [x] Phase 17B retry/idempotency hardening documentation + tests complete.
 - [x] Phase 17C lease hardening complete (ownership/epoch/worker-state checks + lease docs).
-- [ ] Checkpoint cleanup pending.
+- [x] Phase 17D checkpoint cleanup helper/policy complete (explicit helper, no background scheduler/RPC).
 - [ ] Versioned protocol messages and negotiation pending.
 - Scope note: protocol compatibility guidance is documented; runtime negotiation is not implemented yet.
 
 
 See `docs/retry-idempotency.md` for current retry/idempotency guarantees and limitations.
+
+
+See `docs/checkpoint-cleanup.md` for cleanup policy and safety behavior.

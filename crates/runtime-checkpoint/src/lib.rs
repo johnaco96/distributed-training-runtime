@@ -362,6 +362,33 @@ impl From<ArtifactRecord> for ManifestArtifact {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CheckpointCleanupPolicy {
+    pub keep_latest: bool,
+    pub keep_last_n_committed: usize,
+    pub remove_pending: bool,
+    pub remove_orphan_artifacts: bool,
+}
+
+impl Default for CheckpointCleanupPolicy {
+    fn default() -> Self {
+        Self {
+            keep_latest: true,
+            keep_last_n_committed: 1,
+            remove_pending: true,
+            remove_orphan_artifacts: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct CheckpointCleanupReport {
+    pub deleted_keys: Vec<StorageKey>,
+    pub retained_keys: Vec<StorageKey>,
+    pub skipped_keys: Vec<StorageKey>,
+    pub errors: Vec<String>,
+}
+
 pub struct CheckpointStore<B: StorageBackend> {
     storage: B,
 }
@@ -464,6 +491,131 @@ impl<B: StorageBackend> CheckpointStore<B> {
             record.checkpoint_id.0.as_bytes(),
         )?;
         Ok(manifest)
+    }
+
+    pub fn cleanup_checkpoints(
+        &self,
+        run_id: &RunId,
+        policy: CheckpointCleanupPolicy,
+    ) -> Result<CheckpointCleanupReport, CheckpointError> {
+        let mut report = CheckpointCleanupReport::default();
+        let run_prefix = StorageKey::new(format!("runs/{}/checkpoints", run_id.0))
+            .map_err(CheckpointError::Storage)?;
+        let keys = self.storage.list_prefix(&run_prefix)?;
+        let latest_id = match self.storage.get(&latest_pointer(&run_id.0)) {
+            Ok(raw) => {
+                let candidate = String::from_utf8(raw)
+                    .map_err(|e| {
+                        CheckpointError::Serialization(format!("latest pointer is not utf-8: {e}"))
+                    })?
+                    .trim()
+                    .to_string();
+                if candidate.is_empty() {
+                    None
+                } else {
+                    let marker = checkpoint_committed_marker(&run_id.0, &candidate);
+                    if self.storage.exists(&marker)? {
+                        Some(candidate)
+                    } else {
+                        None
+                    }
+                }
+            }
+            Err(StorageError::NotFound(_)) => None,
+            Err(e) => return Err(CheckpointError::Storage(e)),
+        };
+
+        let mut checkpoints: std::collections::BTreeMap<String, Vec<StorageKey>> =
+            std::collections::BTreeMap::new();
+        for key in keys {
+            let parts: Vec<&str> = key.as_str().split('/').collect();
+            if parts.len() >= 4
+                && parts[0] == "runs"
+                && parts[1] == run_id.0
+                && parts[2] == "checkpoints"
+            {
+                checkpoints
+                    .entry(parts[3].to_string())
+                    .or_default()
+                    .push(key);
+            }
+        }
+
+        let latest_invalid = latest_id.is_none();
+        let mut committed_ids: Vec<String> = checkpoints
+            .iter()
+            .filter_map(|(id, ks)| {
+                let has_manifest = ks
+                    .iter()
+                    .any(|k| k.as_str().ends_with("/manifest.committed.json"));
+                let has_marker = ks.iter().any(|k| k.as_str().ends_with("/COMMITTED"));
+                if has_manifest && has_marker {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        committed_ids.sort();
+
+        let mut retained: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if policy.keep_latest {
+            if let Some(id) = &latest_id {
+                retained.insert(id.clone());
+            }
+        }
+        if !latest_invalid {
+            for id in committed_ids
+                .iter()
+                .rev()
+                .take(policy.keep_last_n_committed)
+            {
+                retained.insert(id.clone());
+            }
+        }
+
+        for (checkpoint_id, mut checkpoint_keys) in checkpoints {
+            checkpoint_keys.sort();
+            let has_pending = checkpoint_keys
+                .iter()
+                .any(|k| k.as_str().ends_with("/manifest.pending.json"));
+            let has_manifest = checkpoint_keys
+                .iter()
+                .any(|k| k.as_str().ends_with("/manifest.committed.json"));
+            let has_marker = checkpoint_keys
+                .iter()
+                .any(|k| k.as_str().ends_with("/COMMITTED"));
+            let is_committed = has_manifest && has_marker;
+            let should_delete = if is_committed {
+                if latest_invalid {
+                    false
+                } else {
+                    !retained.contains(&checkpoint_id)
+                }
+            } else {
+                policy.remove_pending && has_pending
+            };
+
+            if should_delete {
+                for key in checkpoint_keys {
+                    if !policy.remove_orphan_artifacts && key.as_str().contains("/workers/") {
+                        report.retained_keys.push(key);
+                        continue;
+                    }
+                    match self.storage.delete(&key) {
+                        Ok(()) => report.deleted_keys.push(key),
+                        Err(e) => report
+                            .errors
+                            .push(format!("delete {} failed: {e}", key.as_str())),
+                    }
+                }
+            } else if is_committed && latest_invalid {
+                report.skipped_keys.extend(checkpoint_keys);
+            } else {
+                report.retained_keys.extend(checkpoint_keys);
+            }
+        }
+        Ok(report)
     }
 
     pub fn load_latest_manifest(
@@ -1503,6 +1655,106 @@ mod tests {
         let committed = store.commit_checkpoint(&mut record, 2000).unwrap();
         assert_eq!(committed.artifacts.len(), 2);
     }
+
+    #[test]
+    fn cleanup_preserves_latest_and_removes_pending_when_enabled() {
+        let store = CheckpointStore::new(MemoryStorage::default());
+        let run = RunId("run-clean".into());
+        let mut c1 = CheckpointRecord::new(run.clone(), CheckpointId("ckpt-1".into()), 1, 1000);
+        let mut c2 = CheckpointRecord::new(run.clone(), CheckpointId("ckpt-2".into()), 2, 1001);
+        store
+            .write_artifact(
+                &mut c1,
+                WorkerId("w".into()),
+                "a",
+                b"1",
+                checksum_sha256(b"1"),
+                "sha256".into(),
+                1,
+            )
+            .unwrap();
+        store.commit_checkpoint(&mut c1, 2000).unwrap();
+        store
+            .write_artifact(
+                &mut c2,
+                WorkerId("w".into()),
+                "b",
+                b"2",
+                checksum_sha256(b"2"),
+                "sha256".into(),
+                2,
+            )
+            .unwrap();
+        store.write_pending_manifest(&c2).unwrap();
+        let report = store
+            .cleanup_checkpoints(&run, CheckpointCleanupPolicy::default())
+            .unwrap();
+        assert!(report
+            .deleted_keys
+            .iter()
+            .any(|k| k.as_str().contains("ckpt-2/manifest.pending.json")));
+        assert_eq!(
+            store.load_latest_manifest(&run).unwrap().checkpoint_id,
+            "ckpt-1"
+        );
+    }
+
+    #[test]
+    fn cleanup_keeps_pending_when_disabled() {
+        let store = CheckpointStore::new(MemoryStorage::default());
+        let run = RunId("run-keep-pending".into());
+        let mut c1 = CheckpointRecord::new(run.clone(), CheckpointId("ckpt-p".into()), 1, 1000);
+        store
+            .write_artifact(
+                &mut c1,
+                WorkerId("w".into()),
+                "a",
+                b"1",
+                checksum_sha256(b"1"),
+                "sha256".into(),
+                1,
+            )
+            .unwrap();
+        store.write_pending_manifest(&c1).unwrap();
+        let report = store
+            .cleanup_checkpoints(
+                &run,
+                CheckpointCleanupPolicy {
+                    remove_pending: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(report
+            .retained_keys
+            .iter()
+            .any(|k| k.as_str().contains("manifest.pending.json")));
+    }
+
+    #[test]
+    fn cleanup_skips_committed_when_latest_missing() {
+        let store = CheckpointStore::new(MemoryStorage::default());
+        let run = RunId("run-no-latest".into());
+        let mut c1 = CheckpointRecord::new(run.clone(), CheckpointId("ckpt-1".into()), 1, 1000);
+        store
+            .write_artifact(
+                &mut c1,
+                WorkerId("w".into()),
+                "a",
+                b"1",
+                checksum_sha256(b"1"),
+                "sha256".into(),
+                1,
+            )
+            .unwrap();
+        store.commit_checkpoint(&mut c1, 2000).unwrap();
+        store.storage.delete(&latest_pointer(&run.0)).unwrap();
+        let report = store
+            .cleanup_checkpoints(&run, CheckpointCleanupPolicy::default())
+            .unwrap();
+        assert!(!report.skipped_keys.is_empty());
+    }
+
     #[test]
     fn checksum_algorithm_parsing_and_canonical_name() {
         assert_eq!(
