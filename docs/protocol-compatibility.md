@@ -43,3 +43,4 @@ Those mechanisms are not part of Phase 17A and are not yet enforced at runtime.
 ## Related reliability notes
 
 For retry safety and idempotent replay behavior at current protocol shape, see `docs/retry-idempotency.md`.
+For shard lease ownership/epoch semantics and stale-worker behavior, see `docs/leases.md`.

@@ -247,6 +247,7 @@ pub enum RenewShardLeaseError {
     EmptyWorldSize,
     NotShardOwner,
     InvalidLeaseEpoch,
+    WorkerNotActive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,6 +259,7 @@ pub enum ReportShardProgressError {
     EmptyWorldSize,
     NotShardOwner,
     InvalidLeaseEpoch,
+    WorkerNotActive,
 }
 
 impl Default for CoordinatorState {
@@ -275,6 +277,13 @@ impl Default for CoordinatorState {
 }
 
 impl CoordinatorState {
+    fn ensure_worker_active_for_lease_actions(worker: &WorkerRecord) -> Result<(), WorkerState> {
+        if worker.state == WorkerState::Active as i32 {
+            return Ok(());
+        }
+        Err(WorkerState::try_from(worker.state).unwrap_or(WorkerState::Unspecified))
+    }
+
     pub fn with_metadata_store(metadata_store: SqliteMetadataStore) -> Self {
         Self {
             metadata_store: Some(metadata_store),
@@ -917,6 +926,8 @@ impl CoordinatorState {
         if shard_index % world_size != worker_rank {
             return Err(RenewShardLeaseError::NotShardOwner);
         }
+        Self::ensure_worker_active_for_lease_actions(worker)
+            .map_err(|_| RenewShardLeaseError::WorkerNotActive)?;
 
         if lease_epoch != 1 {
             return Err(RenewShardLeaseError::InvalidLeaseEpoch);
@@ -974,6 +985,8 @@ impl CoordinatorState {
         if shard_index % world_size != worker_rank {
             return Err(ReportShardProgressError::NotShardOwner);
         }
+        Self::ensure_worker_active_for_lease_actions(worker)
+            .map_err(|_| ReportShardProgressError::WorkerNotActive)?;
 
         if lease_epoch != 1 {
             return Err(ReportShardProgressError::InvalidLeaseEpoch);
@@ -1658,6 +1671,67 @@ mod tests {
         assert_eq!(heartbeat.state, WorkerState::Active as i32);
         assert_eq!(worker.state, WorkerState::Active as i32);
         assert_eq!(run.active_worker_count, 1);
+    }
+
+    #[test]
+    fn stale_worker_cannot_renew_shard_lease() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker should register")
+            .worker_id;
+        let dataset = state
+            .register_dataset(dataset_request(run_id.clone(), "dataset-key"))
+            .expect("dataset should register");
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+        let error = state
+            .renew_shard_lease(
+                &run_id,
+                &worker_id,
+                &ShardId {
+                    value: dataset.shard_ids[0].value.clone(),
+                },
+                1,
+            )
+            .expect_err("stale worker should not renew leases");
+        assert_eq!(error, RenewShardLeaseError::WorkerNotActive);
+    }
+
+    #[test]
+    fn failed_worker_cannot_report_shard_progress() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker should register")
+            .worker_id;
+        let dataset = state
+            .register_dataset(dataset_request(run_id.clone(), "dataset-key"))
+            .expect("dataset should register");
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+        assert!(state.set_worker_failure_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+        let dataset_id = dataset.dataset_id;
+        let shard_id = dataset.shard_ids[0].clone();
+        let error = state
+            .report_shard_progress(&run_id, &worker_id, &dataset_id, &shard_id, 1, 42, false)
+            .expect_err("failed worker should not report progress");
+        assert_eq!(error, ReportShardProgressError::WorkerNotActive);
     }
 
     #[test]
