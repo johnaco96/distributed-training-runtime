@@ -6,7 +6,8 @@ use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
 use runtime_checkpoint::{
-    CheckpointId as DomainCheckpointId, CheckpointRecord, RunId as DomainRunId,
+    ArtifactRecord, CheckpointError, CheckpointId as DomainCheckpointId, CheckpointRecord,
+    CheckpointState as DomainCheckpointState, RunId as DomainRunId, WorkerId as DomainWorkerId,
 };
 use runtime_proto::runtime::v1::{
     CheckpointId, CheckpointState, DatasetId, DatasetMetadata, RegisterDatasetRequest,
@@ -43,6 +44,7 @@ struct CoordinatorStateInner {
     shard_progress: HashMap<ShardProgressKey, ShardProgressRecord>,
     checkpoints_by_run: HashMap<String, HashMap<String, CoordinatorCheckpointRecord>>,
     checkpoint_idempotency_keys: HashMap<String, String>,
+    checkpoint_artifact_idempotency_keys: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -195,6 +197,14 @@ pub enum BeginCheckpointError {
     InvalidWorkerId,
     CheckpointConflict,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportCheckpointArtifactError {
+    RunNotFound,
+    WorkerNotFound,
+    CheckpointNotFound,
+    InvalidInput(&'static str),
+    InvalidState,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GetShardAssignmentsError {
@@ -314,6 +324,88 @@ impl CoordinatorState {
             .get(&run_id.value)
             .and_then(|records| records.get(checkpoint_id))
             .cloned()
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn report_checkpoint_artifact(
+        &self,
+        run_id: String,
+        worker_id: String,
+        checkpoint_id: String,
+        artifact_name: String,
+        artifact_uri: String,
+        size_bytes: u64,
+        checksum: String,
+        checksum_algorithm: String,
+        idempotency_key: String,
+    ) -> Result<CoordinatorCheckpointRecord, ReportCheckpointArtifactError> {
+        if artifact_name.trim().is_empty() {
+            return Err(ReportCheckpointArtifactError::InvalidInput(
+                "artifact_name must be non-empty",
+            ));
+        }
+        if artifact_uri.trim().is_empty() {
+            return Err(ReportCheckpointArtifactError::InvalidInput(
+                "artifact_uri must be non-empty",
+            ));
+        }
+        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
+        if !inner.runs.contains_key(&run_id) {
+            return Err(ReportCheckpointArtifactError::RunNotFound);
+        }
+        if !inner
+            .workers_by_run
+            .get(&run_id)
+            .is_some_and(|workers| workers.contains_key(&worker_id))
+        {
+            return Err(ReportCheckpointArtifactError::WorkerNotFound);
+        }
+        let scoped_idempotency_key =
+            checkpoint_artifact_idempotency_key(&run_id, &checkpoint_id, &idempotency_key);
+        if !idempotency_key.is_empty()
+            && inner
+                .checkpoint_artifact_idempotency_keys
+                .contains_key(&scoped_idempotency_key)
+        {
+            return inner
+                .checkpoints_by_run
+                .get(&run_id)
+                .and_then(|records| records.get(&checkpoint_id))
+                .cloned()
+                .ok_or(ReportCheckpointArtifactError::CheckpointNotFound);
+        }
+        let record = inner
+            .checkpoints_by_run
+            .get_mut(&run_id)
+            .and_then(|records| records.get_mut(&checkpoint_id))
+            .ok_or(ReportCheckpointArtifactError::CheckpointNotFound)?;
+        let now_millis = now_millis();
+        if record.checkpoint.state == DomainCheckpointState::Initiated {
+            record
+                .checkpoint
+                .transition_to(DomainCheckpointState::UploadInProgress, now_millis)
+                .map_err(map_checkpoint_error)?;
+        }
+        record
+            .checkpoint
+            .add_artifact(
+                ArtifactRecord {
+                    worker_id: DomainWorkerId(worker_id),
+                    artifact_name,
+                    storage_key: artifact_uri,
+                    size_bytes,
+                    checksum,
+                    checksum_algorithm,
+                },
+                now_millis,
+            )
+            .map_err(map_checkpoint_error)?;
+        let response = record.clone();
+        if !idempotency_key.is_empty() {
+            inner
+                .checkpoint_artifact_idempotency_keys
+                .insert(scoped_idempotency_key, checkpoint_id);
+        }
+        Ok(response)
     }
     pub fn register_run(&self, request: RegisterRunRequest) -> RegisteredRun {
         let mut inner = self.inner.write().expect("coordinator state lock poisoned");
@@ -923,6 +1015,27 @@ fn dataset_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
 fn checkpoint_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
     scoped_idempotency_key(run_id, idempotency_key)
 }
+fn checkpoint_artifact_idempotency_key(
+    run_id: &str,
+    checkpoint_id: &str,
+    idempotency_key: &str,
+) -> String {
+    if idempotency_key.is_empty() {
+        return String::new();
+    }
+    format!("{run_id}:{checkpoint_id}:{idempotency_key}")
+}
+fn map_checkpoint_error(error: CheckpointError) -> ReportCheckpointArtifactError {
+    match error {
+        CheckpointError::InvalidArtifact(_) => ReportCheckpointArtifactError::InvalidInput(
+            "artifact_name and artifact_uri must be non-empty",
+        ),
+        CheckpointError::TerminalState { .. } | CheckpointError::InvalidTransition { .. } => {
+            ReportCheckpointArtifactError::InvalidState
+        }
+        _ => ReportCheckpointArtifactError::InvalidState,
+    }
+}
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -1413,5 +1526,58 @@ mod tests {
 
         assert_ne!(first.run_id, second.run_id);
         assert_eq!(state.inner.read().unwrap().runs.len(), 2);
+    }
+
+    #[test]
+    fn report_checkpoint_artifact_updates_state_and_is_idempotent() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .unwrap()
+            .worker_id;
+        state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                "ckpt-1".to_string(),
+                1,
+                "checkpoint-key".to_string(),
+            )
+            .unwrap();
+
+        let reported = state
+            .report_checkpoint_artifact(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                "ckpt-1".to_string(),
+                "model.bin".to_string(),
+                "s3://bucket/model.bin".to_string(),
+                10,
+                "sum".to_string(),
+                "sha256".to_string(),
+                "artifact-key".to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            reported.checkpoint.state,
+            DomainCheckpointState::UploadInProgress
+        );
+        assert_eq!(reported.checkpoint.artifacts.len(), 1);
+
+        let repeated = state
+            .report_checkpoint_artifact(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                "ckpt-1".to_string(),
+                "model.bin".to_string(),
+                "s3://bucket/model.bin".to_string(),
+                10,
+                "sum".to_string(),
+                "sha256".to_string(),
+                "artifact-key".to_string(),
+            )
+            .unwrap();
+        assert_eq!(repeated.checkpoint.artifacts.len(), 1);
     }
 }

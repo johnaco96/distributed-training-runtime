@@ -8,7 +8,7 @@ use tonic::{Request, Response, Status};
 
 use crate::state::{
     BeginCheckpointError, CoordinatorState, GetShardAssignmentsError, RenewShardLeaseError,
-    ReportShardProgressError,
+    ReportCheckpointArtifactError, ReportShardProgressError,
 };
 
 #[derive(Clone, Debug)]
@@ -346,11 +346,57 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn report_checkpoint_artifact(
         &self,
-        _request: Request<ReportCheckpointArtifactRequest>,
+        request: Request<ReportCheckpointArtifactRequest>,
     ) -> Result<Response<ReportCheckpointArtifactResponse>, Status> {
-        Err(Status::unimplemented(
-            "ReportCheckpointArtifact is not implemented yet",
-        ))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let worker_id = request
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let checkpoint_id = request
+            .checkpoint_id
+            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?;
+        let artifact_report = request
+            .artifact_report
+            .ok_or_else(|| Status::invalid_argument("artifact_report is required"))?;
+
+        let checkpoint = self
+            .state
+            .report_checkpoint_artifact(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                checkpoint_id.value.clone(),
+                artifact_report.artifact_name,
+                artifact_report.artifact_uri,
+                artifact_report.size_bytes.max(0) as u64,
+                artifact_report.checksum,
+                artifact_report.checksum_algorithm,
+                request.idempotency_key,
+            )
+            .map_err(|error| match error {
+                ReportCheckpointArtifactError::RunNotFound => {
+                    Status::not_found(format!("run {} was not found", run_id.value))
+                }
+                ReportCheckpointArtifactError::WorkerNotFound => {
+                    Status::not_found(format!("worker {} was not found", worker_id.value))
+                }
+                ReportCheckpointArtifactError::CheckpointNotFound => {
+                    Status::not_found(format!("checkpoint {} was not found", checkpoint_id.value))
+                }
+                ReportCheckpointArtifactError::InvalidInput(message) => {
+                    Status::invalid_argument(message)
+                }
+                ReportCheckpointArtifactError::InvalidState => Status::failed_precondition(
+                    "checkpoint is in terminal state or cannot accept artifacts",
+                ),
+            })?;
+
+        Ok(Response::new(ReportCheckpointArtifactResponse {
+            accepted: true,
+            checkpoint_state: checkpoint_state_to_proto(checkpoint.checkpoint.state),
+        }))
     }
 
     async fn commit_checkpoint(
@@ -399,6 +445,19 @@ impl CoordinatorService for CoordinatorServiceImpl {
         };
 
         Ok(Response::new(response))
+    }
+}
+
+fn checkpoint_state_to_proto(state: runtime_checkpoint::CheckpointState) -> i32 {
+    match state {
+        runtime_checkpoint::CheckpointState::Initiated => CheckpointState::Initiated as i32,
+        runtime_checkpoint::CheckpointState::UploadInProgress => {
+            CheckpointState::UploadInProgress as i32
+        }
+        runtime_checkpoint::CheckpointState::Validating => CheckpointState::Validating as i32,
+        runtime_checkpoint::CheckpointState::Committed => CheckpointState::Committed as i32,
+        runtime_checkpoint::CheckpointState::Failed => CheckpointState::Failed as i32,
+        runtime_checkpoint::CheckpointState::Aborted => CheckpointState::Aborted as i32,
     }
 }
 
@@ -1369,6 +1428,123 @@ mod tests {
         assert_eq!(first.checkpoint_id, second.checkpoint_id);
         assert_eq!(first.state, CheckpointState::Initiated as i32);
         assert_eq!(first.checkpoint_id.unwrap().value, "checkpoint-1");
+    }
+
+    fn artifact_request(
+        run_id: RunId,
+        worker_id: WorkerId,
+        checkpoint_id: &str,
+        artifact_name: &str,
+        artifact_uri: &str,
+        idempotency_key: &str,
+    ) -> ReportCheckpointArtifactRequest {
+        ReportCheckpointArtifactRequest {
+            run_id: Some(run_id),
+            worker_id: Some(worker_id),
+            checkpoint_id: Some(CheckpointId {
+                value: checkpoint_id.to_string(),
+            }),
+            artifact_report: Some(ArtifactReport {
+                artifact_name: artifact_name.to_string(),
+                artifact_uri: artifact_uri.to_string(),
+                size_bytes: 10,
+                checksum: "sum".to_string(),
+                checksum_algorithm: "sha256".to_string(),
+                uploaded_at: None,
+            }),
+            idempotency_key: idempotency_key.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn report_checkpoint_artifact_succeeds_and_supports_idempotency() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+        service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_id.clone()),
+                checkpoint_id: Some(CheckpointId {
+                    value: "ckpt-1".to_string(),
+                }),
+                step: 1,
+                idempotency_key: "cp-key".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let first = service
+            .report_checkpoint_artifact(Request::new(artifact_request(
+                run_id.clone(),
+                worker_id.clone(),
+                "ckpt-1",
+                "a.bin",
+                "s3://bucket/a.bin",
+                "artifact-key",
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.accepted);
+        assert_eq!(
+            first.checkpoint_state,
+            CheckpointState::UploadInProgress as i32
+        );
+
+        let second = service
+            .report_checkpoint_artifact(Request::new(artifact_request(
+                run_id.clone(),
+                worker_id.clone(),
+                "ckpt-1",
+                "a.bin",
+                "s3://bucket/a.bin",
+                "artifact-key",
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(second.accepted);
+
+        let third = service
+            .report_checkpoint_artifact(Request::new(artifact_request(
+                run_id.clone(),
+                worker_id.clone(),
+                "ckpt-1",
+                "b.bin",
+                "s3://bucket/b.bin",
+                "artifact-key-2",
+            )))
+            .await
+            .unwrap();
+        assert!(third.get_ref().accepted);
+    }
+
+    #[tokio::test]
+    async fn report_checkpoint_artifact_unknown_entities_return_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let err = service
+            .report_checkpoint_artifact(Request::new(artifact_request(
+                RunId {
+                    value: "missing".to_string(),
+                },
+                WorkerId {
+                    value: "worker-1".to_string(),
+                },
+                "ckpt-1",
+                "a.bin",
+                "s3://bucket/a.bin",
+                "",
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
