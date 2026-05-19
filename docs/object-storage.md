@@ -85,6 +85,30 @@ Manual bucket creation flow (if bucket is not already present):
 
 Real AWS S3 validation is **not required** for Phase 12B.
 
+## Phase 13A reliability guardrails foundation
+
+Phase 13A introduces a reusable `StorageOperationPolicy` in `runtime-storage` for async-capable storage operations (currently used in the S3 backend path as a foundation for later phases).
+
+Default policy values:
+
+- `operation_timeout`: 30 seconds
+- `max_retries`: 3
+- `retry_initial_backoff`: 100 milliseconds
+- `retry_max_backoff`: 2 seconds
+- `max_concurrent_operations`: 16
+
+This adds timeout/retry/backpressure primitives:
+
+- timeout guardrail using `tokio::time::timeout` for async storage calls,
+- retry helper with capped exponential backoff for retryable storage failures,
+- concurrency limiter based on a semaphore to enforce max in-flight operations.
+
+Scope note:
+
+- This is a **foundation** for Phase 13. It does **not** claim full concurrent checkpoint upload completion, dataset prefetching completion, benchmark harness completion, or production S3 tuning completion.
+- MinIO/AWS paths can use these same policies in later Phase 13 work.
+- Normal unit/integration tests remain MinIO-optional and do not require AWS credentials.
+
 ## Limitations
 
 - Phase 12A provides storage backend primitives and key mapping.

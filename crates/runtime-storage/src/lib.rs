@@ -10,6 +10,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 pub mod object_key;
 #[cfg(feature = "s3")]
@@ -96,6 +97,10 @@ pub enum StorageError {
     Io(io::Error),
     InvalidKey(String),
     NotFound(StorageKey),
+    Timeout {
+        operation: &'static str,
+        timeout: Duration,
+    },
 }
 
 impl Display for StorageError {
@@ -104,6 +109,12 @@ impl Display for StorageError {
             StorageError::Io(err) => write!(f, "io error: {err}"),
             StorageError::InvalidKey(msg) => write!(f, "invalid key: {msg}"),
             StorageError::NotFound(key) => write!(f, "key not found: {key}"),
+            StorageError::Timeout { operation, timeout } => {
+                write!(
+                    f,
+                    "storage operation '{operation}' timed out after {timeout:?}"
+                )
+            }
         }
     }
 }
@@ -112,7 +123,9 @@ impl Error for StorageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             StorageError::Io(err) => Some(err),
-            StorageError::InvalidKey(_) | StorageError::NotFound(_) => None,
+            StorageError::InvalidKey(_)
+            | StorageError::NotFound(_)
+            | StorageError::Timeout { .. } => None,
         }
     }
 }
@@ -120,6 +133,88 @@ impl Error for StorageError {
 impl From<io::Error> for StorageError {
     fn from(value: io::Error) -> Self {
         StorageError::Io(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct StorageOperationPolicy {
+    pub operation_timeout: Duration,
+    pub max_retries: u32,
+    pub retry_initial_backoff: Duration,
+    pub retry_max_backoff: Duration,
+    pub max_concurrent_operations: usize,
+}
+
+impl Default for StorageOperationPolicy {
+    fn default() -> Self {
+        Self {
+            operation_timeout: Duration::from_secs(30),
+            max_retries: 3,
+            retry_initial_backoff: Duration::from_millis(100),
+            retry_max_backoff: Duration::from_secs(2),
+            max_concurrent_operations: 16,
+        }
+    }
+}
+
+impl StorageOperationPolicy {
+    pub fn validate(&self) -> Result<(), StorageError> {
+        if self.max_concurrent_operations == 0 {
+            return Err(StorageError::InvalidKey(
+                "max_concurrent_operations must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn is_retryable_storage_error(err: &StorageError) -> bool {
+    match err {
+        StorageError::InvalidKey(_) | StorageError::NotFound(_) => false,
+        StorageError::Io(_) | StorageError::Timeout { .. } => true,
+    }
+}
+
+pub fn retry_backoff_for_attempt(
+    policy: &StorageOperationPolicy,
+    retry_attempt_index: u32,
+) -> Duration {
+    let multiplier = 1_u32.checked_shl(retry_attempt_index.min(31)).unwrap_or(0);
+    let backoff = policy.retry_initial_backoff.saturating_mul(multiplier);
+    std::cmp::min(backoff, policy.retry_max_backoff)
+}
+
+#[cfg(feature = "s3")]
+pub async fn run_with_timeout_retry<F, Fut, T>(
+    policy: &StorageOperationPolicy,
+    operation_name: &'static str,
+    mut operation: F,
+) -> Result<T, StorageError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, StorageError>>,
+{
+    let mut attempt = 0_u32;
+    loop {
+        let call = tokio::time::timeout(policy.operation_timeout, operation()).await;
+        let result = match call {
+            Ok(result) => result,
+            Err(_) => Err(StorageError::Timeout {
+                operation: operation_name,
+                timeout: policy.operation_timeout,
+            }),
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if attempt >= policy.max_retries || !is_retryable_storage_error(&err) {
+                    return Err(err);
+                }
+                let delay = retry_backoff_for_attempt(policy, attempt);
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+        }
     }
 }
 
@@ -252,6 +347,8 @@ pub fn latest_pointer(run_id: &str) -> StorageKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_dir(name: &str) -> PathBuf {
@@ -351,5 +448,127 @@ mod tests {
     fn traversal_rejected_before_object_key_conversion() {
         let key = StorageKey::new("runs/../bad");
         assert!(key.is_err());
+    }
+
+    #[test]
+    fn default_policy_values_are_sane() {
+        let policy = StorageOperationPolicy::default();
+        assert_eq!(policy.operation_timeout, Duration::from_secs(30));
+        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.retry_initial_backoff, Duration::from_millis(100));
+        assert_eq!(policy.retry_max_backoff, Duration::from_secs(2));
+        assert_eq!(policy.max_concurrent_operations, 16);
+    }
+
+    #[test]
+    fn policy_rejects_zero_max_concurrency() {
+        let policy = StorageOperationPolicy {
+            max_concurrent_operations: 0,
+            ..Default::default()
+        };
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn backoff_is_capped() {
+        let p = StorageOperationPolicy::default();
+        assert_eq!(retry_backoff_for_attempt(&p, 0), Duration::from_millis(100));
+        assert_eq!(retry_backoff_for_attempt(&p, 1), Duration::from_millis(200));
+        assert_eq!(retry_backoff_for_attempt(&p, 8), Duration::from_secs(2));
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn retry_helper_succeeds_after_transient_failures() {
+        let policy = StorageOperationPolicy {
+            operation_timeout: Duration::from_millis(50),
+            max_retries: 3,
+            retry_initial_backoff: Duration::from_millis(1),
+            retry_max_backoff: Duration::from_millis(2),
+            max_concurrent_operations: 2,
+        };
+        let tries = Arc::new(AtomicUsize::new(0));
+        let value = run_with_timeout_retry(&policy, "retry-ok", {
+            let tries = tries.clone();
+            move || {
+                let tries = tries.clone();
+                async move {
+                    let n = tries.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(StorageError::Io(io::Error::other("transient")))
+                    } else {
+                        Ok(7usize)
+                    }
+                }
+            }
+        })
+        .await
+        .expect("eventually succeeds");
+        assert_eq!(value, 7);
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn retry_helper_stops_after_max_retries() {
+        let policy = StorageOperationPolicy {
+            max_retries: 2,
+            retry_initial_backoff: Duration::from_millis(1),
+            retry_max_backoff: Duration::from_millis(2),
+            ..Default::default()
+        };
+        let tries = Arc::new(AtomicUsize::new(0));
+        let err = run_with_timeout_retry(&policy, "retry-fail", {
+            let tries = tries.clone();
+            move || {
+                let tries = tries.clone();
+                async move {
+                    tries.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(StorageError::Io(io::Error::other("always fails")))
+                }
+            }
+        })
+        .await
+        .expect_err("should fail");
+        assert!(matches!(err, StorageError::Io(_)));
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn retry_helper_does_not_retry_invalid_key_errors() {
+        let policy = StorageOperationPolicy::default();
+        let tries = Arc::new(AtomicUsize::new(0));
+        let err = run_with_timeout_retry(&policy, "invalid-key", {
+            let tries = tries.clone();
+            move || {
+                let tries = tries.clone();
+                async move {
+                    tries.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(StorageError::InvalidKey("bad".into()))
+                }
+            }
+        })
+        .await
+        .expect_err("should fail");
+        assert!(matches!(err, StorageError::InvalidKey(_)));
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn timeout_helper_returns_timeout_error() {
+        let policy = StorageOperationPolicy {
+            operation_timeout: Duration::from_millis(10),
+            max_retries: 0,
+            ..Default::default()
+        };
+        let err = run_with_timeout_retry(&policy, "slow-op", || async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok::<(), StorageError>(())
+        })
+        .await
+        .expect_err("should timeout");
+        assert!(matches!(err, StorageError::Timeout { .. }));
     }
 }
