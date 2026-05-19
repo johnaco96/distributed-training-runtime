@@ -151,16 +151,22 @@ Rule: latest lookup must prefer latest **committed** checkpoint, never newest di
   - return terminal failure if previously failed/aborted.
 - MVP provides at-least-once style retry safety, not exactly-once semantics.
 
-## 13. Checksum and size validation
+## 13. Checksum and size validation (Phase 12.5A foundation)
 
-- Each artifact report should include:
+- Each artifact report includes:
   - artifact logical name,
   - storage path,
   - byte size,
-  - checksum (algorithm configurable; simple default acceptable for MVP).
-- Coordinator validates report completeness and consistency against manifest expectations.
-- Optional existence/stat checks can be performed before commit finalization.
-- Any mismatch prevents commit.
+  - checksum,
+  - checksum algorithm.
+- Phase 12.5A adds reusable backend-neutral integrity helpers:
+  - `ChecksumAlgorithm` parsing/normalization (currently supports `sha256`),
+  - canonical algorithm names (lowercase),
+  - canonical lowercase hex digests,
+  - digest compute/verify helpers,
+  - artifact integrity validation (existence/read success, size match, supported algorithm, digest match).
+- Unsupported algorithms are rejected clearly.
+- Phase 12.5B will enforce this validation in the commit path.
 
 ## 14. Partial checkpoint cleanup policy
 

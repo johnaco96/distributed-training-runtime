@@ -48,6 +48,12 @@ Next up:
 
 ### Phase 12.5 — Checkpoint Artifact Data Plane
 
+Phase 12.5A foundation status:
+
+- [x] Add reusable checksum algorithm abstraction (`sha256` currently supported).
+- [x] Add reusable backend-neutral artifact integrity validation helpers.
+- [ ] Enforce artifact validation in commit path (Phase 12.5B).
+
 - Wire real checkpoint artifact bytes into the checkpoint flow.
 - Support worker-side artifact upload to the configured storage backend.
 - Support LocalStorage and S3Storage/MinIO backends.
@@ -75,4 +81,3 @@ Next up:
 Phase 13 should optimize the **real artifact byte path introduced in Phase 12.5**, not only metadata reporting.
 
 Coordinator artifact-byte upload via control-plane RPC remains intentionally out of scope until Phase 12.5 is implemented.
-

@@ -2,9 +2,10 @@
 
 use runtime_storage::{
     checkpoint_committed_marker, checkpoint_manifest_committed, checkpoint_manifest_pending,
-    checkpoint_worker_artifact, latest_pointer, StorageBackend, StorageError,
+    checkpoint_worker_artifact, latest_pointer, StorageBackend, StorageError, StorageKey,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -14,6 +15,87 @@ pub struct CheckpointId(pub String);
 pub struct RunId(pub String);
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct WorkerId(pub String);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ChecksumAlgorithm {
+    Sha256,
+}
+
+impl ChecksumAlgorithm {
+    pub fn parse(raw: &str) -> Result<Self, ArtifactValidationError> {
+        let normalized = raw.trim().to_ascii_lowercase().replace('-', "");
+        match normalized.as_str() {
+            "sha256" => Ok(Self::Sha256),
+            _ => Err(ArtifactValidationError::UnsupportedChecksumAlgorithm(
+                raw.trim().to_string(),
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sha256 => "sha256",
+        }
+    }
+}
+
+pub fn compute_checksum(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> String {
+    match algorithm {
+        ChecksumAlgorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            format!("{:x}", hasher.finalize())
+        }
+    }
+}
+
+pub fn verify_checksum(
+    algorithm: ChecksumAlgorithm,
+    bytes: &[u8],
+    expected_digest: &str,
+) -> Result<(), ArtifactValidationError> {
+    let computed = compute_checksum(algorithm, bytes);
+    let expected = expected_digest.trim().to_ascii_lowercase();
+    if computed == expected {
+        Ok(())
+    } else {
+        Err(ArtifactValidationError::ChecksumMismatch {
+            algorithm: algorithm.as_str().to_string(),
+            expected,
+            actual: computed,
+        })
+    }
+}
+
+pub fn validate_artifact_integrity(
+    storage: &impl StorageBackend,
+    key: &StorageKey,
+    expected_size_bytes: u64,
+    checksum_algorithm: &str,
+    expected_checksum: &str,
+) -> Result<(), ArtifactValidationError> {
+    let bytes = storage.get(key).map_err(|err| match err {
+        StorageError::NotFound(_) => ArtifactValidationError::MissingArtifact {
+            key: key.as_str().to_string(),
+        },
+        other => ArtifactValidationError::StorageReadFailure {
+            key: key.as_str().to_string(),
+            source: other,
+        },
+    })?;
+
+    let actual_size_bytes = bytes.len() as u64;
+    if actual_size_bytes != expected_size_bytes {
+        return Err(ArtifactValidationError::SizeMismatch {
+            key: key.as_str().to_string(),
+            expected_size_bytes,
+            actual_size_bytes,
+        });
+    }
+
+    let algorithm = ChecksumAlgorithm::parse(checksum_algorithm)?;
+    verify_checksum(algorithm, &bytes, expected_checksum)
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -363,6 +445,65 @@ pub enum CheckpointError {
         checkpoint_id: String,
     },
     NoLatestCheckpoint,
+}
+
+#[derive(Debug)]
+pub enum ArtifactValidationError {
+    MissingArtifact {
+        key: String,
+    },
+    SizeMismatch {
+        key: String,
+        expected_size_bytes: u64,
+        actual_size_bytes: u64,
+    },
+    UnsupportedChecksumAlgorithm(String),
+    ChecksumMismatch {
+        algorithm: String,
+        expected: String,
+        actual: String,
+    },
+    StorageReadFailure {
+        key: String,
+        source: StorageError,
+    },
+}
+impl Display for ArtifactValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingArtifact { key } => write!(f, "artifact not found: {key}"),
+            Self::SizeMismatch {
+                key,
+                expected_size_bytes,
+                actual_size_bytes,
+            } => write!(
+                f,
+                "artifact size mismatch for {key}: expected {expected_size_bytes} bytes, got {actual_size_bytes}"
+            ),
+            Self::UnsupportedChecksumAlgorithm(algorithm) => {
+                write!(f, "unsupported checksum algorithm: {algorithm}")
+            }
+            Self::ChecksumMismatch {
+                algorithm,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "artifact checksum mismatch using {algorithm}: expected {expected}, got {actual}"
+            ),
+            Self::StorageReadFailure { key, source } => {
+                write!(f, "failed to read artifact {key}: {source}")
+            }
+        }
+    }
+}
+impl Error for ArtifactValidationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::StorageReadFailure { source, .. } => Some(source),
+            _ => None,
+        }
+    }
 }
 impl Display for CheckpointError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -881,5 +1022,80 @@ mod tests {
             .load_latest_manifest(&RunId("run-memory".into()))
             .unwrap();
         assert_eq!(latest.checkpoint_id, committed.checkpoint_id);
+    }
+
+    #[test]
+    fn checksum_algorithm_parsing_and_canonical_name() {
+        assert_eq!(
+            ChecksumAlgorithm::parse("sha256").unwrap(),
+            ChecksumAlgorithm::Sha256
+        );
+        assert_eq!(
+            ChecksumAlgorithm::parse("SHA256").unwrap(),
+            ChecksumAlgorithm::Sha256
+        );
+        assert_eq!(
+            ChecksumAlgorithm::parse("sha-256").unwrap(),
+            ChecksumAlgorithm::Sha256
+        );
+        assert_eq!(ChecksumAlgorithm::Sha256.as_str(), "sha256");
+        assert!(matches!(
+            ChecksumAlgorithm::parse("md5"),
+            Err(ArtifactValidationError::UnsupportedChecksumAlgorithm(_))
+        ));
+    }
+
+    #[test]
+    fn compute_and_verify_sha256_checksum() {
+        let bytes = b"hello world";
+        let digest = compute_checksum(ChecksumAlgorithm::Sha256, bytes);
+        assert_eq!(
+            digest,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        verify_checksum(ChecksumAlgorithm::Sha256, bytes, &digest).unwrap();
+        assert!(matches!(
+            verify_checksum(ChecksumAlgorithm::Sha256, bytes, "deadbeef"),
+            Err(ArtifactValidationError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_artifact_integrity_success() {
+        let storage = MemoryStorage::default();
+        let key = StorageKey::new("runs/r/checkpoints/c/workers/w/model.bin").unwrap();
+        let bytes = b"artifact-bytes";
+        storage.put(&key, bytes).unwrap();
+        let checksum = compute_checksum(ChecksumAlgorithm::Sha256, bytes);
+        validate_artifact_integrity(&storage, &key, bytes.len() as u64, "sha256", &checksum)
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_artifact_integrity_failures() {
+        let storage = MemoryStorage::default();
+        let key = StorageKey::new("runs/r/checkpoints/c/workers/w/model.bin").unwrap();
+        let missing = validate_artifact_integrity(&storage, &key, 1, "sha256", "abc");
+        assert!(matches!(
+            missing,
+            Err(ArtifactValidationError::MissingArtifact { .. })
+        ));
+
+        let bytes = b"artifact-bytes";
+        storage.put(&key, bytes).unwrap();
+        let checksum = compute_checksum(ChecksumAlgorithm::Sha256, bytes);
+
+        assert!(matches!(
+            validate_artifact_integrity(&storage, &key, 999, "sha256", &checksum),
+            Err(ArtifactValidationError::SizeMismatch { .. })
+        ));
+        assert!(matches!(
+            validate_artifact_integrity(&storage, &key, bytes.len() as u64, "sha512", &checksum),
+            Err(ArtifactValidationError::UnsupportedChecksumAlgorithm(_))
+        ));
+        assert!(matches!(
+            validate_artifact_integrity(&storage, &key, bytes.len() as u64, "sha256", "deadbeef"),
+            Err(ArtifactValidationError::ChecksumMismatch { .. })
+        ));
     }
 }
