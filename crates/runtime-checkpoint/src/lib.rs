@@ -401,7 +401,9 @@ mod tests {
     use super::*;
     use runtime_storage::{
         checkpoint_manifest_pending, checkpoint_worker_artifact, latest_pointer, LocalStorage,
+        StorageKey,
     };
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -430,6 +432,52 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("runtime-checkpoint-{name}-{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[derive(Clone, Default)]
+    struct MemoryStorage {
+        entries: std::sync::Arc<std::sync::RwLock<BTreeMap<StorageKey, Vec<u8>>>>,
+    }
+
+    impl StorageBackend for MemoryStorage {
+        fn put(&self, key: &StorageKey, bytes: &[u8]) -> Result<(), StorageError> {
+            self.entries
+                .write()
+                .unwrap()
+                .insert(key.clone(), bytes.to_vec());
+            Ok(())
+        }
+
+        fn get(&self, key: &StorageKey) -> Result<Vec<u8>, StorageError> {
+            self.entries
+                .read()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StorageError::NotFound(key.clone()))
+        }
+
+        fn exists(&self, key: &StorageKey) -> Result<bool, StorageError> {
+            Ok(self.entries.read().unwrap().contains_key(key))
+        }
+
+        fn list_prefix(&self, prefix: &StorageKey) -> Result<Vec<StorageKey>, StorageError> {
+            let mut out = self
+                .entries
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|key| key.as_str().starts_with(prefix.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            out.sort();
+            Ok(out)
+        }
+
+        fn delete(&self, key: &StorageKey) -> Result<(), StorageError> {
+            self.entries.write().unwrap().remove(key);
+            Ok(())
+        }
     }
 
     #[test]
@@ -805,5 +853,33 @@ mod tests {
         let err = store.commit_checkpoint(&mut record, 2000).unwrap_err();
         assert!(matches!(err, CheckpointError::ManifestValidation(_)));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_store_works_with_non_local_trait_backend() {
+        let store = CheckpointStore::new(MemoryStorage::default());
+        let mut record = CheckpointRecord::new(
+            RunId("run-memory".into()),
+            CheckpointId("ckpt-memory".into()),
+            9,
+            1000,
+        );
+        store
+            .write_artifact(
+                &mut record,
+                WorkerId("worker-memory".into()),
+                "weights.bin",
+                b"abc",
+                "sum".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        store.write_pending_manifest(&record).unwrap();
+        let committed = store.commit_checkpoint(&mut record, 1002).unwrap();
+        let latest = store
+            .load_latest_manifest(&RunId("run-memory".into()))
+            .unwrap();
+        assert_eq!(latest.checkpoint_id, committed.checkpoint_id);
     }
 }

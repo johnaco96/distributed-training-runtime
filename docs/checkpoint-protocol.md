@@ -69,6 +69,7 @@ Notes:
 - Workers only write artifact payloads under their own `workers/{worker_id}/...` prefix.
 - `manifest.committed.json` and `COMMITTED` are written only by coordinator after validation.
 - `LATEST` is a coordinator-owned pointer (content can be checkpoint_id plus optional step/timestamp).
+- Storage keys are backend-neutral: LocalStorage maps keys to filesystem paths under a configured root, while S3Storage maps keys to S3-compatible object keys (optionally with a configured prefix).
 
 ## 7. Checkpoint ownership rules
 
@@ -201,8 +202,7 @@ When adding S3-compatible backend:
 - Consider conditional writes (etag/version) for pointer races.
 - Validate checksum/size with object metadata where available.
 - Background garbage collection and lifecycle rules become more important.
-- Phase 12A adds only the S3-compatible storage foundation; full coordinator
-  upload/restore artifact wiring is expected in Phase 12B.
+- Phase 12A adds only the S3-compatible storage foundation; Phase 12B wires S3-compatible storage into checkpoint storage tests with local MinIO validation gated by environment variables.
 
 ## 18. Explicit MVP scope
 

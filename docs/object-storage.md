@@ -1,8 +1,7 @@
-# Phase 12A Object Storage Foundation
+# Phase 12 Object Storage (12A + 12B)
 
-Phase 12A adds an **S3-compatible storage backend foundation** in `runtime-storage`.
-
-This phase does **not** claim full coordinator checkpoint artifact upload/restore wiring; that can be completed in Phase 12B.
+Phase 12A added an **S3-compatible storage backend foundation** in `runtime-storage`.
+Phase 12B wires that backend into **checkpoint store write/restore tests** and adds an **env-gated MinIO validation path**.
 
 ## Purpose
 
@@ -56,7 +55,7 @@ docker run -p 9000:9000 -p 9001:9001 `
 
 Create bucket: `dtruntime-checkpoints`.
 
-## Running env-gated MinIO tests
+## Running env-gated MinIO tests (Phase 12B)
 
 MinIO tests are local integration tests and should run only when explicitly enabled, for example with:
 
@@ -68,12 +67,27 @@ $env:DTRUNTIME_S3_BUCKET="dtruntime-checkpoints"
 $env:DTRUNTIME_S3_ACCESS_KEY_ID="minioadmin"
 $env:DTRUNTIME_S3_SECRET_ACCESS_KEY="minioadmin"
 $env:DTRUNTIME_S3_FORCE_PATH_STYLE="true"
+$env:DTRUNTIME_S3_KEY_PREFIX="dev"
 ```
 
-Real cloud S3 validation is a later step after local MinIO validation.
+Then run:
+
+```powershell
+cargo test -p runtime-storage --features s3
+cargo test -p runtime-checkpoint --features s3 minio -- --nocapture
+```
+
+Manual bucket creation flow (if bucket is not already present):
+
+- Open `http://127.0.0.1:9001`
+- Log in with `minioadmin / minioadmin`
+- Create bucket `dtruntime-checkpoints`
+
+Real AWS S3 validation is **not required** for Phase 12B.
 
 ## Limitations
 
 - Phase 12A provides storage backend primitives and key mapping.
-- Full coordinator artifact upload/restore data-plane wiring is expected in Phase 12B.
-- Production readiness, HA, and cloud-hardening are out of scope.
+- Phase 12B wires S3-compatible storage into checkpoint storage tests and adds local env-gated MinIO validation.
+- Coordinator checkpoint RPCs may still report artifact metadata rather than uploading artifact bytes through coordinator RPCs.
+- Real AWS cloud validation, production readiness, HA, and hardening are out of scope.
