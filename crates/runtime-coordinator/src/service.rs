@@ -7,8 +7,8 @@ use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
 
 use crate::state::{
-    BeginCheckpointError, CoordinatorState, GetShardAssignmentsError, RenewShardLeaseError,
-    ReportCheckpointArtifactError, ReportShardProgressError,
+    BeginCheckpointError, CommitCheckpointError, CoordinatorState, GetShardAssignmentsError,
+    RenewShardLeaseError, ReportCheckpointArtifactError, ReportShardProgressError,
 };
 
 #[derive(Clone, Debug)]
@@ -401,11 +401,42 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn commit_checkpoint(
         &self,
-        _request: Request<CommitCheckpointRequest>,
+        request: Request<CommitCheckpointRequest>,
     ) -> Result<Response<CommitCheckpointResponse>, Status> {
-        Err(Status::unimplemented(
-            "CommitCheckpoint is not implemented yet",
-        ))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let checkpoint_id = request
+            .checkpoint_id
+            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?;
+
+        let checkpoint = self
+            .state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                checkpoint_id.value.clone(),
+                request.idempotency_key,
+            )
+            .map_err(|error| match error {
+                CommitCheckpointError::RunNotFound => {
+                    Status::not_found(format!("run {} was not found", run_id.value))
+                }
+                CommitCheckpointError::CheckpointNotFound => {
+                    Status::not_found(format!("checkpoint {} was not found", checkpoint_id.value))
+                }
+                CommitCheckpointError::InvalidInput(message) => Status::invalid_argument(message),
+                CommitCheckpointError::InvalidState => Status::failed_precondition(
+                    "checkpoint is in terminal state, missing artifacts, or cannot be committed",
+                ),
+            })?;
+        Ok(Response::new(CommitCheckpointResponse {
+            state: checkpoint_state_to_proto(checkpoint.checkpoint.state),
+            committed_at: checkpoint
+                .checkpoint
+                .committed_at_millis
+                .map(millis_to_timestamp),
+        }))
     }
 
     async fn get_latest_checkpoint(
@@ -459,6 +490,11 @@ fn checkpoint_state_to_proto(state: runtime_checkpoint::CheckpointState) -> i32 
         runtime_checkpoint::CheckpointState::Failed => CheckpointState::Failed as i32,
         runtime_checkpoint::CheckpointState::Aborted => CheckpointState::Aborted as i32,
     }
+}
+fn millis_to_timestamp(millis: u64) -> prost_types::Timestamp {
+    let seconds = (millis / 1000) as i64;
+    let nanos = ((millis % 1000) * 1_000_000) as i32;
+    prost_types::Timestamp { seconds, nanos }
 }
 
 #[cfg(test)]
@@ -1545,6 +1581,147 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn commit_checkpoint_succeeds_and_is_idempotent() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+        service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_id.clone()),
+                checkpoint_id: Some(CheckpointId {
+                    value: "ckpt-commit".to_string(),
+                }),
+                step: 1,
+                idempotency_key: "cp-key".to_string(),
+            }))
+            .await
+            .unwrap();
+        service
+            .report_checkpoint_artifact(Request::new(artifact_request(
+                run_id.clone(),
+                worker_id,
+                "ckpt-commit",
+                "a.bin",
+                "s3://bucket/a.bin",
+                "artifact-key",
+            )))
+            .await
+            .unwrap();
+        let first = service
+            .commit_checkpoint(Request::new(CommitCheckpointRequest {
+                run_id: Some(run_id.clone()),
+                checkpoint_id: Some(CheckpointId {
+                    value: "ckpt-commit".to_string(),
+                }),
+                idempotency_key: "commit-1".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.state, CheckpointState::Committed as i32);
+        assert!(first.committed_at.is_some());
+        let second = service
+            .commit_checkpoint(Request::new(CommitCheckpointRequest {
+                run_id: Some(run_id.clone()),
+                checkpoint_id: Some(CheckpointId {
+                    value: "ckpt-commit".to_string(),
+                }),
+                idempotency_key: "commit-2".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(second.state, CheckpointState::Committed as i32);
+
+        let status = service
+            .get_run_status(Request::new(GetRunStatusRequest {
+                run_id: Some(run_id),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            status.latest_checkpoint_id,
+            Some(CheckpointId {
+                value: "ckpt-commit".to_string()
+            })
+        );
+        assert_eq!(
+            status.latest_checkpoint_state,
+            CheckpointState::Committed as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_checkpoint_returns_expected_errors() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let missing_run = service
+            .commit_checkpoint(Request::new(CommitCheckpointRequest {
+                run_id: Some(RunId {
+                    value: "missing".to_string(),
+                }),
+                checkpoint_id: Some(CheckpointId {
+                    value: "ckpt-1".to_string(),
+                }),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_run.code(), tonic::Code::NotFound);
+
+        let run_id = create_run(&service).await;
+        let missing_checkpoint = service
+            .commit_checkpoint(Request::new(CommitCheckpointRequest {
+                run_id: Some(run_id.clone()),
+                checkpoint_id: Some(CheckpointId {
+                    value: "missing".to_string(),
+                }),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_checkpoint.code(), tonic::Code::NotFound);
+
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+        service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_id),
+                checkpoint_id: Some(CheckpointId {
+                    value: "ckpt-empty".to_string(),
+                }),
+                step: 1,
+                idempotency_key: "begin-empty".to_string(),
+            }))
+            .await
+            .unwrap();
+        let no_artifacts = service
+            .commit_checkpoint(Request::new(CommitCheckpointRequest {
+                run_id: Some(run_id),
+                checkpoint_id: Some(CheckpointId {
+                    value: "ckpt-empty".to_string(),
+                }),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(no_artifacts.code(), tonic::Code::FailedPrecondition);
     }
 
     #[tokio::test]
