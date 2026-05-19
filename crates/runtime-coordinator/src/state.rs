@@ -214,6 +214,15 @@ pub enum CommitCheckpointError {
     InvalidState,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GetLatestCheckpointError {
+    InvalidInput(&'static str),
+    RunNotFound,
+    NoCommittedCheckpoint,
+    LatestCheckpointMissing,
+    LatestCheckpointNotCommitted,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommitCheckpointResult {
     pub record: CoordinatorCheckpointRecord,
@@ -497,6 +506,41 @@ impl CoordinatorState {
             committed_at_millis,
         })
     }
+
+    pub fn get_latest_checkpoint(
+        &self,
+        run_id: String,
+    ) -> Result<CoordinatorCheckpointRecord, GetLatestCheckpointError> {
+        if run_id.trim().is_empty() {
+            return Err(GetLatestCheckpointError::InvalidInput(
+                "run_id must be non-empty",
+            ));
+        }
+
+        let inner = self.inner.read().expect("coordinator state lock poisoned");
+        let run = inner
+            .runs
+            .get(&run_id)
+            .ok_or(GetLatestCheckpointError::RunNotFound)?;
+        let latest_checkpoint_id = run
+            .latest_checkpoint_id
+            .as_ref()
+            .ok_or(GetLatestCheckpointError::NoCommittedCheckpoint)?;
+
+        let record = inner
+            .checkpoints_by_run
+            .get(&run_id)
+            .and_then(|records| records.get(&latest_checkpoint_id.value))
+            .cloned()
+            .ok_or(GetLatestCheckpointError::LatestCheckpointMissing)?;
+
+        if record.checkpoint.state != DomainCheckpointState::Committed {
+            return Err(GetLatestCheckpointError::LatestCheckpointNotCommitted);
+        }
+
+        Ok(record)
+    }
+
     pub fn register_run(&self, request: RegisterRunRequest) -> RegisteredRun {
         let mut inner = self.inner.write().expect("coordinator state lock poisoned");
 
@@ -1599,6 +1643,117 @@ mod tests {
             first.checkpoint.checkpoint_id
         );
         assert_eq!(second.checkpoint.step, first.checkpoint.step);
+    }
+
+    #[test]
+    fn get_latest_checkpoint_requires_existing_run_and_commit() {
+        let state = CoordinatorState::default();
+        let err = state
+            .get_latest_checkpoint("missing".to_string())
+            .expect_err("missing run should fail");
+        assert_eq!(err, GetLatestCheckpointError::RunNotFound);
+
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let err = state
+            .get_latest_checkpoint(run_id.value.clone())
+            .expect_err("run without committed checkpoint should fail");
+        assert_eq!(err, GetLatestCheckpointError::NoCommittedCheckpoint);
+    }
+
+    #[test]
+    fn get_latest_checkpoint_returns_only_committed_record() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .unwrap()
+            .worker_id;
+
+        state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                "ckpt-pending".to_string(),
+                1,
+                "begin-1".to_string(),
+            )
+            .unwrap();
+        let err = state
+            .get_latest_checkpoint(run_id.value.clone())
+            .expect_err("uncommitted checkpoint should not be latest");
+        assert_eq!(err, GetLatestCheckpointError::NoCommittedCheckpoint);
+
+        state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                "ckpt-committed".to_string(),
+                2,
+                "begin-2".to_string(),
+            )
+            .unwrap();
+        state
+            .report_checkpoint_artifact(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                "ckpt-committed".to_string(),
+                "model.bin".to_string(),
+                "s3://bucket/model.bin".to_string(),
+                10,
+                "sum".to_string(),
+                "sha256".to_string(),
+                "artifact-1".to_string(),
+            )
+            .unwrap();
+        state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "ckpt-committed".to_string(),
+                "commit-1".to_string(),
+            )
+            .unwrap();
+
+        let latest = state
+            .get_latest_checkpoint(run_id.value.clone())
+            .expect("latest committed checkpoint should be returned");
+        assert_eq!(latest.checkpoint.checkpoint_id.0, "ckpt-committed");
+        assert_eq!(latest.checkpoint.state, DomainCheckpointState::Committed);
+        assert_eq!(latest.checkpoint.artifacts.len(), 1);
+
+        state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                "ckpt-committed-2".to_string(),
+                3,
+                "begin-3".to_string(),
+            )
+            .unwrap();
+        state
+            .report_checkpoint_artifact(
+                run_id.value.clone(),
+                worker_id.value,
+                "ckpt-committed-2".to_string(),
+                "model-2.bin".to_string(),
+                "s3://bucket/model-2.bin".to_string(),
+                11,
+                "sum2".to_string(),
+                "sha256".to_string(),
+                "artifact-2".to_string(),
+            )
+            .unwrap();
+        state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "ckpt-committed-2".to_string(),
+                "commit-2".to_string(),
+            )
+            .unwrap();
+
+        let latest = state
+            .get_latest_checkpoint(run_id.value)
+            .expect("newest committed checkpoint should be latest");
+        assert_eq!(latest.checkpoint.checkpoint_id.0, "ckpt-committed-2");
     }
 
     #[test]

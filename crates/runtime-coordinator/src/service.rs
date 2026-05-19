@@ -7,8 +7,9 @@ use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
 
 use crate::state::{
-    BeginCheckpointError, CommitCheckpointError, CoordinatorState, GetShardAssignmentsError,
-    RenewShardLeaseError, ReportCheckpointArtifactError, ReportShardProgressError,
+    BeginCheckpointError, CommitCheckpointError, CoordinatorState, GetLatestCheckpointError,
+    GetShardAssignmentsError, RenewShardLeaseError, ReportCheckpointArtifactError,
+    ReportShardProgressError,
 };
 
 #[derive(Clone, Debug)]
@@ -438,11 +439,66 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn get_latest_checkpoint(
         &self,
-        _request: Request<GetLatestCheckpointRequest>,
+        request: Request<GetLatestCheckpointRequest>,
     ) -> Result<Response<GetLatestCheckpointResponse>, Status> {
-        Err(Status::unimplemented(
-            "GetLatestCheckpoint is not implemented yet",
-        ))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let checkpoint = self
+            .state
+            .get_latest_checkpoint(run_id.value.clone())
+            .map_err(|error| match error {
+                GetLatestCheckpointError::InvalidInput(message) => {
+                    Status::invalid_argument(message)
+                }
+                GetLatestCheckpointError::RunNotFound
+                | GetLatestCheckpointError::NoCommittedCheckpoint => {
+                    Status::not_found("run has no committed checkpoint")
+                }
+                GetLatestCheckpointError::LatestCheckpointMissing
+                | GetLatestCheckpointError::LatestCheckpointNotCommitted => {
+                    Status::failed_precondition(
+                        "latest checkpoint metadata is inconsistent or not committed",
+                    )
+                }
+            })?;
+
+        let manifest = CheckpointManifest {
+            run_id: Some(RunId {
+                value: checkpoint.checkpoint.run_id.0,
+            }),
+            checkpoint_id: Some(CheckpointId {
+                value: checkpoint.checkpoint.checkpoint_id.0,
+            }),
+            step: checkpoint.checkpoint.step,
+            state: checkpoint_state_to_proto(checkpoint.checkpoint.state),
+            storage_backend_kind: self
+                .state
+                .get_run(&run_id)
+                .ok_or_else(|| Status::failed_precondition("run metadata missing"))?
+                .storage_backend_kind,
+            artifacts: checkpoint
+                .checkpoint
+                .artifacts
+                .into_iter()
+                .map(|artifact| ArtifactReport {
+                    artifact_name: artifact.artifact_name,
+                    artifact_uri: artifact.storage_key,
+                    size_bytes: artifact.size_bytes as i64,
+                    checksum: artifact.checksum,
+                    checksum_algorithm: artifact.checksum_algorithm,
+                    uploaded_at: Some(millis_to_timestamp(checkpoint.checkpoint.updated_at_millis)),
+                })
+                .collect(),
+            created_at: Some(millis_to_timestamp(checkpoint.checkpoint.created_at_millis)),
+            committed_at: checkpoint.committed_at_millis.map(millis_to_timestamp),
+        };
+
+        Ok(Response::new(GetLatestCheckpointResponse {
+            manifest: Some(manifest),
+        }))
     }
 
     async fn get_run_status(
@@ -1719,6 +1775,122 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(no_artifacts.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn get_latest_checkpoint_returns_not_found_for_unknown_run() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let error = service
+            .get_latest_checkpoint(Request::new(GetLatestCheckpointRequest {
+                run_id: Some(RunId {
+                    value: "missing".to_string(),
+                }),
+            }))
+            .await
+            .expect_err("unknown run should fail");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_latest_checkpoint_returns_not_found_without_commit() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        let error = service
+            .get_latest_checkpoint(Request::new(GetLatestCheckpointRequest {
+                run_id: Some(run_id.clone()),
+            }))
+            .await
+            .expect_err("no committed checkpoint should fail");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+        service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_id),
+                checkpoint_id: Some(CheckpointId {
+                    value: "pending".to_string(),
+                }),
+                step: 1,
+                idempotency_key: "begin".to_string(),
+            }))
+            .await
+            .unwrap();
+        let error = service
+            .get_latest_checkpoint(Request::new(GetLatestCheckpointRequest {
+                run_id: Some(run_id),
+            }))
+            .await
+            .expect_err("pending checkpoint should not be returned");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_latest_checkpoint_returns_committed_manifest_and_latest_order() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+
+        for (ckpt, step, artifact) in [("ckpt-1", 1, "a.bin"), ("ckpt-2", 2, "b.bin")] {
+            service
+                .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                    run_id: Some(run_id.clone()),
+                    worker_id: Some(worker_id.clone()),
+                    checkpoint_id: Some(CheckpointId {
+                        value: ckpt.to_string(),
+                    }),
+                    step,
+                    idempotency_key: format!("begin-{ckpt}"),
+                }))
+                .await
+                .unwrap();
+            service
+                .report_checkpoint_artifact(Request::new(artifact_request(
+                    run_id.clone(),
+                    worker_id.clone(),
+                    ckpt,
+                    artifact,
+                    &format!("s3://bucket/{artifact}"),
+                    &format!("artifact-{ckpt}"),
+                )))
+                .await
+                .unwrap();
+            service
+                .commit_checkpoint(Request::new(CommitCheckpointRequest {
+                    run_id: Some(run_id.clone()),
+                    checkpoint_id: Some(CheckpointId {
+                        value: ckpt.to_string(),
+                    }),
+                    idempotency_key: format!("commit-{ckpt}"),
+                }))
+                .await
+                .unwrap();
+        }
+
+        let response = service
+            .get_latest_checkpoint(Request::new(GetLatestCheckpointRequest {
+                run_id: Some(run_id),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let manifest = response.manifest.expect("manifest required");
+        assert_eq!(manifest.checkpoint_id.unwrap().value, "ckpt-2");
+        assert_eq!(manifest.state, CheckpointState::Committed as i32);
+        assert_eq!(manifest.artifacts.len(), 1);
+        assert_eq!(manifest.artifacts[0].artifact_name, "b.bin");
     }
 
     #[tokio::test]
