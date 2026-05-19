@@ -109,7 +109,7 @@ Transition rules:
 4. Workers upload artifacts directly to storage under `workers/{worker_id}/...`.
 5. Workers report upload completion metadata (artifact path, size, checksum) via control RPC.
 6. Coordinator transitions to `VALIDATING` when required reports received.
-7. Coordinator validates expected artifact set + reported metadata (+ optional storage existence checks).
+7. Coordinator validates expected artifact set + reported metadata (including storage reads and integrity verification against reported metadata).
 8. On success, coordinator writes `manifest.committed.json`, then `COMMITTED`, then updates `LATEST`.
 9. Coordinator transitions checkpoint state to `COMMITTED` and returns commit success.
 
@@ -166,7 +166,7 @@ Rule: latest lookup must prefer latest **committed** checkpoint, never newest di
   - digest compute/verify helpers,
   - artifact integrity validation (existence/read success, size match, supported algorithm, digest match).
 - Unsupported algorithms are rejected clearly.
-- Phase 12.5B will enforce this validation in the commit path.
+- Phase 12.5B enforces this validation in the commit path before writing committed checkpoint state.
 
 ## 14. Partial checkpoint cleanup policy
 
