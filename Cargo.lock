@@ -2139,10 +2139,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "runtime-checkpoint",
+ "runtime-proto",
  "runtime-storage",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
