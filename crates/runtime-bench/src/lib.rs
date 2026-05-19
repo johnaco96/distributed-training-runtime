@@ -122,7 +122,6 @@ pub fn latency_summary(samples: &[f64]) -> LatencySummary {
     }
 }
 
-#[derive(Debug, Clone)]
 fn with_storage_root<F>(
     root: Option<PathBuf>,
     keep_data: bool,
@@ -160,7 +159,7 @@ pub fn run_dataset_read(
         }
         let start = Instant::now();
         let results = runtime_storage::get_many(
-            storage,
+            &storage,
             keys,
             StorageOperationPolicy {
                 max_concurrent_operations: concurrency,
@@ -231,7 +230,7 @@ pub fn run_checkpoint_write(
             ..StorageOperationPolicy::default()
         };
         let start = Instant::now();
-        let records = upload_checkpoint_artifacts_concurrently(storage, uploads, &policy)
+        let records = upload_checkpoint_artifacts_concurrently(&storage, uploads, &policy)
             .map_err(|e| e.to_string())?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         let mut ckpt = CheckpointRecord::new(
