@@ -143,9 +143,11 @@ See `docs/observability.md` for current scope and usage.
 ### Phase 17 — Hardening (started)
 
 - [x] Phase 17A coordinator error handling consistency + compatibility/version notes documentation complete.
-- [ ] Retries hardening pending.
+- [x] Phase 17B retry/idempotency hardening documentation + tests complete.
 - [ ] Leases hardening follow-up pending.
-- [ ] Idempotency hardening follow-up pending.
 - [ ] Checkpoint cleanup pending.
 - [ ] Versioned protocol messages and negotiation pending.
 - Scope note: protocol compatibility guidance is documented; runtime negotiation is not implemented yet.
+
+
+See `docs/retry-idempotency.md` for current retry/idempotency guarantees and limitations.

@@ -57,13 +57,26 @@ fn already_exists(message: impl Into<String>) -> Status {
     Status::already_exists(message.into())
 }
 
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
+
+fn validate_idempotency_key(operation: &str, idempotency_key: &str) -> Result<(), Status> {
+    if !idempotency_key.is_empty() && idempotency_key.len() > MAX_IDEMPOTENCY_KEY_LEN {
+        return Err(invalid_argument(format!(
+            "{operation} idempotency_key must be <= {MAX_IDEMPOTENCY_KEY_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl CoordinatorService for CoordinatorServiceImpl {
     async fn register_run(
         &self,
         request: Request<RegisterRunRequest>,
     ) -> Result<Response<RegisterRunResponse>, Status> {
-        let registered = self.state.register_run(request.into_inner());
+        let request = request.into_inner();
+        validate_idempotency_key("register_run", &request.idempotency_key)?;
+        let registered = self.state.register_run(request);
 
         let response = RegisterRunResponse {
             run_id: Some(registered.run_id),
@@ -79,6 +92,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
         let request = request.into_inner();
+        validate_idempotency_key("register_worker", &request.idempotency_key)?;
         let run_id = request
             .run_id
             .clone()
@@ -141,6 +155,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         request: Request<RegisterDatasetRequest>,
     ) -> Result<Response<RegisterDatasetResponse>, Status> {
         let request = request.into_inner();
+        validate_idempotency_key("register_dataset", &request.idempotency_key)?;
         let run_id = request
             .run_id
             .clone()
@@ -351,6 +366,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         request: Request<BeginCheckpointRequest>,
     ) -> Result<Response<BeginCheckpointResponse>, Status> {
         let request = request.into_inner();
+        validate_idempotency_key("begin_checkpoint", &request.idempotency_key)?;
         let run_id = request
             .run_id
             .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
@@ -402,6 +418,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         request: Request<ReportCheckpointArtifactRequest>,
     ) -> Result<Response<ReportCheckpointArtifactResponse>, Status> {
         let request = request.into_inner();
+        validate_idempotency_key("report_checkpoint_artifact", &request.idempotency_key)?;
         let run_id = request
             .run_id
             .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
@@ -457,6 +474,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         request: Request<CommitCheckpointRequest>,
     ) -> Result<Response<CommitCheckpointResponse>, Status> {
         let request = request.into_inner();
+        validate_idempotency_key("commit_checkpoint", &request.idempotency_key)?;
         let run_id = request
             .run_id
             .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
@@ -2284,5 +2302,46 @@ mod tests {
         let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
         let snapshot = service.metrics_snapshot();
         assert_eq!(snapshot, RuntimeMetricsSnapshot::default());
+    }
+
+    #[tokio::test]
+    async fn register_run_rejects_overlong_idempotency_key() {
+        let service = build_service();
+        let key = "k".repeat(MAX_IDEMPOTENCY_KEY_LEN + 1);
+        let err = service
+            .register_run(Request::new(register_request(&key)))
+            .await
+            .expect_err("overlong key should be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn begin_checkpoint_rejects_overlong_idempotency_key() {
+        let service = build_service();
+        let run = service
+            .register_run(Request::new(register_request("run")))
+            .await
+            .expect("register run")
+            .into_inner();
+        let run_id = run.run_id.expect("run id");
+        let worker = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker")))
+            .await
+            .expect("register worker")
+            .into_inner();
+        let worker_id = worker.worker_id.expect("worker id");
+
+        let key = "k".repeat(MAX_IDEMPOTENCY_KEY_LEN + 1);
+        let err = service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(run_id),
+                worker_id: Some(worker_id),
+                checkpoint_id: None,
+                step: 1,
+                idempotency_key: key,
+            }))
+            .await
+            .expect_err("overlong key should be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }
