@@ -140,6 +140,35 @@ class RuntimeClient:
         )
         return self._stub.BeginCheckpoint(request)
 
+
+    def report_checkpoint_artifact(
+        self,
+        run_id: str,
+        worker_id: str,
+        checkpoint_id: str,
+        artifact_name: str,
+        artifact_uri: str = "",
+        size_bytes: int = 0,
+        checksum: str = "",
+        checksum_algorithm: str = "",
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.ReportCheckpointArtifactResponse":
+        """Report checkpoint artifact metadata to the coordinator."""
+        request = self._runtime_pb2.ReportCheckpointArtifactRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
+            artifact_report=self._runtime_pb2.ArtifactReport(
+                artifact_name=artifact_name,
+                artifact_uri=artifact_uri,
+                size_bytes=size_bytes,
+                checksum=checksum,
+                checksum_algorithm=checksum_algorithm,
+            ),
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.ReportCheckpointArtifact(request)
+
     def commit_checkpoint(
         self,
         run_id: str,
