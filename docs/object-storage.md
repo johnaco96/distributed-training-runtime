@@ -102,7 +102,7 @@ Real AWS S3 validation is **not required** for Phase 12B.
   - supported checksum algorithm,
   - expected checksum digest.
 - Phase 12.5A adds reusable helpers for this validation layer.
-- Phase 12.5B will wire enforcement into checkpoint commit behavior.
+- Phase 12.5B now enforces commit-time integrity validation before manifest/marker/latest writes.
 
 ## How Phase 12.5 uses object storage
 

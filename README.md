@@ -52,7 +52,7 @@ Phase 12.5A foundation status:
 
 - [x] Add reusable checksum algorithm abstraction (`sha256` currently supported).
 - [x] Add reusable backend-neutral artifact integrity validation helpers.
-- [ ] Enforce artifact validation in commit path (Phase 12.5B).
+- [x] Enforce artifact validation in commit path (Phase 12.5B).
 
 - Wire real checkpoint artifact bytes into the checkpoint flow.
 - Support worker-side artifact upload to the configured storage backend.

@@ -366,6 +366,22 @@ impl<B: StorageBackend> CheckpointStore<B> {
         if record.state == CheckpointState::UploadInProgress {
             record.transition_to(CheckpointState::Validating, committed_at_millis)?;
         }
+        for artifact in &record.artifacts {
+            let storage_key = StorageKey::new(&artifact.storage_key).map_err(|err| match err {
+                StorageError::InvalidKey(message) => {
+                    CheckpointError::InvalidArtifact(format!("invalid storage key: {message}"))
+                }
+                other => CheckpointError::Storage(other),
+            })?;
+            validate_artifact_integrity(
+                &self.storage,
+                &storage_key,
+                artifact.size_bytes,
+                &artifact.checksum_algorithm,
+                &artifact.checksum,
+            )
+            .map_err(CheckpointError::ArtifactValidation)?;
+        }
         if record.state == CheckpointState::Validating {
             record.transition_to(CheckpointState::Committed, committed_at_millis)?;
         }
@@ -439,6 +455,7 @@ pub enum CheckpointError {
     InvalidArtifact(String),
     Serialization(String),
     ManifestValidation(String),
+    ArtifactValidation(ArtifactValidationError),
     Storage(StorageError),
     MissingCommitMarker {
         run_id: String,
@@ -518,6 +535,7 @@ impl Display for CheckpointError {
             Self::InvalidArtifact(m) => write!(f, "invalid artifact metadata: {m}"),
             Self::Serialization(m) => write!(f, "checkpoint manifest serialization error: {m}"),
             Self::ManifestValidation(m) => write!(f, "checkpoint manifest validation error: {m}"),
+            Self::ArtifactValidation(err) => write!(f, "artifact validation error: {err}"),
             Self::Storage(err) => write!(f, "checkpoint storage error: {err}"),
             Self::MissingCommitMarker {
                 run_id,
@@ -1022,6 +1040,185 @@ mod tests {
             .load_latest_manifest(&RunId("run-memory".into()))
             .unwrap();
         assert_eq!(latest.checkpoint_id, committed.checkpoint_id);
+    }
+
+    #[test]
+    fn commit_validates_artifact_integrity_success() {
+        let storage = MemoryStorage::default();
+        let store = CheckpointStore::new(storage);
+        let mut record = CheckpointRecord::new(
+            RunId("run-v".into()),
+            CheckpointId("ckpt-v".into()),
+            1,
+            1000,
+        );
+        let bytes = b"valid-artifact";
+        let checksum = compute_checksum(ChecksumAlgorithm::Sha256, bytes);
+        store
+            .write_artifact(
+                &mut record,
+                WorkerId("worker-1".into()),
+                "weights.bin",
+                bytes,
+                checksum,
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+
+        let committed = store.commit_checkpoint(&mut record, 1002).unwrap();
+        assert!(committed.is_restorable());
+    }
+
+    #[test]
+    fn commit_rejects_missing_artifact() {
+        let store = CheckpointStore::new(MemoryStorage::default());
+        let mut record = CheckpointRecord::new(
+            RunId("run-m".into()),
+            CheckpointId("ckpt-m".into()),
+            1,
+            1000,
+        );
+        let mut a = artifact(WorkerId("worker-1".into()));
+        a.storage_key = "runs/run-m/checkpoints/ckpt-m/workers/worker-1/missing.bin".into();
+        record.add_artifact(a, 1001).unwrap();
+        let err = store.commit_checkpoint(&mut record, 1002).unwrap_err();
+        assert!(matches!(
+            err,
+            CheckpointError::ArtifactValidation(ArtifactValidationError::MissingArtifact { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_rejects_size_mismatch() {
+        let storage = MemoryStorage::default();
+        let key =
+            StorageKey::new("runs/run-s/checkpoints/ckpt-s/workers/worker-1/data.bin").unwrap();
+        let bytes = b"abc";
+        storage.put(&key, bytes).unwrap();
+        let mut record = CheckpointRecord::new(
+            RunId("run-s".into()),
+            CheckpointId("ckpt-s".into()),
+            1,
+            1000,
+        );
+        let mut a = artifact(WorkerId("worker-1".into()));
+        a.storage_key = key.to_string();
+        a.size_bytes = 99;
+        a.checksum = compute_checksum(ChecksumAlgorithm::Sha256, bytes);
+        record.add_artifact(a, 1001).unwrap();
+        let err = CheckpointStore::new(storage)
+            .commit_checkpoint(&mut record, 1002)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CheckpointError::ArtifactValidation(ArtifactValidationError::SizeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_rejects_checksum_mismatch() {
+        let storage = MemoryStorage::default();
+        let key =
+            StorageKey::new("runs/run-c/checkpoints/ckpt-c/workers/worker-1/data.bin").unwrap();
+        let bytes = b"abc";
+        storage.put(&key, bytes).unwrap();
+        let mut record = CheckpointRecord::new(
+            RunId("run-c".into()),
+            CheckpointId("ckpt-c".into()),
+            1,
+            1000,
+        );
+        let mut a = artifact(WorkerId("worker-1".into()));
+        a.storage_key = key.to_string();
+        a.size_bytes = bytes.len() as u64;
+        a.checksum = "deadbeef".into();
+        record.add_artifact(a, 1001).unwrap();
+        let err = CheckpointStore::new(storage)
+            .commit_checkpoint(&mut record, 1002)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CheckpointError::ArtifactValidation(ArtifactValidationError::ChecksumMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_rejects_unsupported_checksum_algorithm() {
+        let storage = MemoryStorage::default();
+        let key =
+            StorageKey::new("runs/run-a/checkpoints/ckpt-a/workers/worker-1/data.bin").unwrap();
+        let bytes = b"abc";
+        storage.put(&key, bytes).unwrap();
+        let mut record = CheckpointRecord::new(
+            RunId("run-a".into()),
+            CheckpointId("ckpt-a".into()),
+            1,
+            1000,
+        );
+        let mut a = artifact(WorkerId("worker-1".into()));
+        a.storage_key = key.to_string();
+        a.size_bytes = bytes.len() as u64;
+        a.checksum_algorithm = "sha512".into();
+        a.checksum = compute_checksum(ChecksumAlgorithm::Sha256, bytes);
+        record.add_artifact(a, 1001).unwrap();
+        let err = CheckpointStore::new(storage)
+            .commit_checkpoint(&mut record, 1002)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CheckpointError::ArtifactValidation(
+                ArtifactValidationError::UnsupportedChecksumAlgorithm(_)
+            )
+        ));
+    }
+
+    #[test]
+    fn failed_validation_checkpoint_is_not_restorable() {
+        let store = CheckpointStore::new(MemoryStorage::default());
+        let mut record = CheckpointRecord::new(
+            RunId("run-fr".into()),
+            CheckpointId("ckpt-fr".into()),
+            1,
+            1000,
+        );
+        let mut a = artifact(WorkerId("worker-1".into()));
+        a.storage_key = "runs/run-fr/checkpoints/ckpt-fr/workers/worker-1/missing.bin".into();
+        record.add_artifact(a, 1001).unwrap();
+        let _ = store.commit_checkpoint(&mut record, 1002).unwrap_err();
+        let latest = store.load_latest_manifest(&RunId("run-fr".into()));
+        assert!(matches!(latest, Err(CheckpointError::NoLatestCheckpoint)));
+    }
+
+    #[test]
+    fn failed_validation_does_not_replace_previous_committed_checkpoint() {
+        let store = CheckpointStore::new(MemoryStorage::default());
+        let run_id = RunId("run-prev".into());
+        let mut good =
+            CheckpointRecord::new(run_id.clone(), CheckpointId("ckpt-good".into()), 1, 1000);
+        let checksum = compute_checksum(ChecksumAlgorithm::Sha256, b"ok");
+        store
+            .write_artifact(
+                &mut good,
+                WorkerId("worker-1".into()),
+                "weights.bin",
+                b"ok",
+                checksum,
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        store.commit_checkpoint(&mut good, 1002).unwrap();
+
+        let mut bad =
+            CheckpointRecord::new(run_id.clone(), CheckpointId("ckpt-bad".into()), 2, 1003);
+        let mut a = artifact(WorkerId("worker-1".into()));
+        a.storage_key = "runs/run-prev/checkpoints/ckpt-bad/workers/worker-1/missing.bin".into();
+        bad.add_artifact(a, 1004).unwrap();
+        let _ = store.commit_checkpoint(&mut bad, 1005).unwrap_err();
+
+        let latest = store.load_latest_manifest(&run_id).unwrap();
+        assert_eq!(latest.checkpoint_id, "ckpt-good");
     }
 
     #[test]
