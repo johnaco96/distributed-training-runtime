@@ -142,6 +142,16 @@ class CommitCheckpointResponse:
     checkpoint_id: Optional[CheckpointId] = None
 
 
+@dataclass
+class GetLatestCheckpointRequest:
+    run_id: Optional[RunId] = None
+
+
+@dataclass
+class GetLatestCheckpointResponse:
+    manifest: object | None = None
+
+
 def install_fake_generated_modules(monkeypatch):
     channel = object()
     grpc_module = types.SimpleNamespace(insecure_channel=Mock(return_value=channel))
@@ -165,6 +175,8 @@ def install_fake_generated_modules(monkeypatch):
         BeginCheckpointResponse=BeginCheckpointResponse,
         CommitCheckpointRequest=CommitCheckpointRequest,
         CommitCheckpointResponse=CommitCheckpointResponse,
+        GetLatestCheckpointRequest=GetLatestCheckpointRequest,
+        GetLatestCheckpointResponse=GetLatestCheckpointResponse,
     )
     stub = Mock()
     runtime_pb2_grpc = types.SimpleNamespace(
@@ -380,5 +392,20 @@ def test_commit_checkpoint_builds_request_and_calls_stub(monkeypatch):
             checkpoint_id=CheckpointId(value="ckpt-1"),
             idempotency_key="idem-commit-1",
         )
+    )
+    assert result == response
+
+
+def test_restore_latest_builds_request_and_calls_stub(monkeypatch):
+    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    manifest = object()
+    response = GetLatestCheckpointResponse(manifest=manifest)
+    stub.GetLatestCheckpoint.return_value = response
+
+    client = RuntimeClient("127.0.0.1:50051")
+    result = client.restore_latest(run_id="run-1")
+
+    stub.GetLatestCheckpoint.assert_called_once_with(
+        GetLatestCheckpointRequest(run_id=RunId(value="run-1"))
     )
     assert result == response
