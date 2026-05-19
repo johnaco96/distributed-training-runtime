@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use runtime_coordinator::init_tracing_from_env;
 use runtime_coordinator::persistence::SqliteMetadataStore;
 use runtime_coordinator::service::CoordinatorServiceImpl;
 use runtime_coordinator::state::CoordinatorState;
@@ -21,11 +22,7 @@ struct CoordinatorCliArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_target(false)
-        .compact()
-        .init();
+    init_tracing_from_env();
 
     let args = coordinator_args(std::env::args().skip(1))?;
     if args.show_help {
@@ -34,7 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr: SocketAddr = args.addr.parse()?;
+    info!(%addr, "runtime-coordinator configured listen address");
+
     let state = if let Some(path) = args.metadata_db {
+        info!(metadata_db_path = %path, "runtime-coordinator using sqlite metadata store");
         let store = SqliteMetadataStore::open(path)?;
         store.init_schema()?;
         Arc::new(CoordinatorState::with_metadata_store(store))
@@ -49,6 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(CoordinatorServiceServer::new(service))
         .serve(addr)
         .await?;
+
+    info!(%addr, "runtime-coordinator server shut down gracefully");
 
     Ok(())
 }
