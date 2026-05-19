@@ -120,67 +120,90 @@ impl StorageBackend for S3Storage {
     fn get(&self, key: &StorageKey) -> Result<Vec<u8>, StorageError> {
         let object_key = self.object_key_for(key)?;
         self.rt.block_on(async {
-            match self
-                .client
-                .get_object()
-                .bucket(&self.bucket)
-                .key(object_key)
-                .send()
-                .await
-            {
-                Ok(out) => out
-                    .body
-                    .collect()
+            run_with_timeout_retry(&self.policy, "s3-get", || async {
+                let _permit = self
+                    .limiter
+                    .acquire()
                     .await
-                    .map(|b| b.into_bytes().to_vec())
-                    .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string()))),
-                Err(err) => {
-                    let msg = err.to_string();
-                    if msg.contains("NoSuchKey") {
-                        Err(StorageError::NotFound(key.clone()))
-                    } else {
-                        Err(StorageError::Io(std::io::Error::other(msg)))
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+                match self
+                    .client
+                    .get_object()
+                    .bucket(&self.bucket)
+                    .key(object_key.clone())
+                    .send()
+                    .await
+                {
+                    Ok(out) => out
+                        .body
+                        .collect()
+                        .await
+                        .map(|b| b.into_bytes().to_vec())
+                        .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string()))),
+                    Err(err) => {
+                        let msg = err.to_string();
+                        if msg.contains("NoSuchKey") {
+                            Err(StorageError::NotFound(key.clone()))
+                        } else {
+                            Err(StorageError::Io(std::io::Error::other(msg)))
+                        }
                     }
                 }
-            }
+            })
+            .await
         })
     }
 
     fn exists(&self, key: &StorageKey) -> Result<bool, StorageError> {
         let object_key = self.object_key_for(key)?;
         self.rt.block_on(async {
-            match self
-                .client
-                .head_object()
-                .bucket(&self.bucket)
-                .key(object_key)
-                .send()
-                .await
-            {
-                Ok(_) => Ok(true),
-                Err(err) => {
-                    let msg = err.to_string();
-                    if msg.contains("NotFound") || msg.contains("404") {
-                        Ok(false)
-                    } else {
-                        Err(StorageError::Io(std::io::Error::other(msg)))
+            run_with_timeout_retry(&self.policy, "s3-exists", || async {
+                let _permit = self
+                    .limiter
+                    .acquire()
+                    .await
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+                match self
+                    .client
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(object_key.clone())
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(err) => {
+                        let msg = err.to_string();
+                        if msg.contains("NotFound") || msg.contains("404") {
+                            Ok(false)
+                        } else {
+                            Err(StorageError::Io(std::io::Error::other(msg)))
+                        }
                     }
                 }
-            }
+            })
+            .await
         })
     }
 
     fn list_prefix(&self, prefix: &StorageKey) -> Result<Vec<StorageKey>, StorageError> {
         let object_prefix = self.object_key_for(prefix)?;
         self.rt.block_on(async {
-            let result = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&object_prefix)
-                .send()
-                .await
-                .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
+            let result = run_with_timeout_retry(&self.policy, "s3-list-prefix", || async {
+                let _permit = self
+                    .limiter
+                    .acquire()
+                    .await
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+                self.client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix(&object_prefix)
+                    .send()
+                    .await
+                    .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))
+            })
+            .await?;
 
             let mut out = Vec::new();
             for object in result.contents() {
@@ -201,14 +224,22 @@ impl StorageBackend for S3Storage {
     fn delete(&self, key: &StorageKey) -> Result<(), StorageError> {
         let object_key = self.object_key_for(key)?;
         self.rt.block_on(async {
-            self.client
-                .delete_object()
-                .bucket(&self.bucket)
-                .key(object_key)
-                .send()
-                .await
-                .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
-            Ok(())
+            run_with_timeout_retry(&self.policy, "s3-delete", || async {
+                let _permit = self
+                    .limiter
+                    .acquire()
+                    .await
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(object_key.clone())
+                    .send()
+                    .await
+                    .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
+                Ok(())
+            })
+            .await
         })
     }
 }

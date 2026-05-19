@@ -67,7 +67,7 @@ Phase 12.5A foundation status:
 - Add MinIO artifact-byte roundtrip tests.
 - Document artifact metadata vs artifact bytes clearly.
 
-### Phase 13 — Performance and Async I/O (started)
+### Phase 13 — Performance and Async I/O (foundation complete)
 
 - Improve async read/write paths.
 - Add batching where useful.
@@ -83,7 +83,7 @@ Phase 12.5A foundation status:
 - [x] Add async timeout helper for async-capable storage operations.
 - [x] Add concurrency/backpressure primitive for storage operations.
 - [x] Wire bounded concurrent checkpoint artifact upload helper (Phase 13B).
-- [ ] Add dataset prefetching prototype (later Phase 13 work).
+- [x] Add dataset prefetching prototype (Phase 13C complete).
 - [ ] Add full benchmark harness (later Phase 13 work).
 
 Phase 13 should optimize the **real artifact byte path introduced in Phase 12.5**, not only metadata reporting.
@@ -94,3 +94,13 @@ Coordinator artifact-byte upload via control-plane RPC remains intentionally out
 - Benchmark harness: pending.
 - Full async read/write rewrite: pending.
 - Production dataset prefetch/cache-aware placement: pending.
+
+
+#### Phase 13D — Storage async/read-write cleanup and status cleanup (complete)
+
+- [x] Extend `StorageOperationPolicy` coverage in `S3Storage` beyond put (get/exists/delete/list_prefix).
+- [x] Add minimal backend-neutral batch helpers in `runtime-storage` (`put_many`, `get_many`, `exists_many`).
+- [x] Keep `StorageBackend` API compatibility and LocalStorage behavior.
+- [x] Clean roadmap/documentation inconsistencies for Phase 13 status.
+
+Next planned step: **Phase 14 benchmark harness**.

@@ -87,7 +87,7 @@ Real AWS S3 validation is **not required** for Phase 12B.
 
 ## Phase 13A reliability guardrails foundation
 
-Phase 13A introduces a reusable `StorageOperationPolicy` in `runtime-storage` for async-capable storage operations (currently used in the S3 backend path as a foundation for later phases).
+Phase 13A/13D provide a reusable `StorageOperationPolicy` in `runtime-storage` for async-capable storage operations. In `S3Storage`, timeout/retry/backpressure now cover `put`, `get`, `exists` (head), `delete`, and `list_prefix`.
 
 Default policy values:
 
@@ -109,6 +109,15 @@ Scope note:
 - MinIO/AWS paths can use these same policies in later Phase 13 work.
 - Normal unit/integration tests remain MinIO-optional and do not require AWS credentials.
 
+
+
+## Phase 13D scope update
+
+Phase 13D extends policy coverage to additional S3 operations without a full async rewrite:
+
+- Timeout/retry/backpressure currently apply to `S3Storage::put`, `get`, `exists`, `delete`, and `list_prefix`.
+- `runtime-storage` now includes small backend-neutral batch helpers: `put_many`, `get_many`, and `exists_many`, each with bounded concurrency via `StorageOperationPolicy.max_concurrent_operations` and per-item result reporting.
+- This remains foundation-level work: multipart upload, coordinator gRPC artifact-byte streaming, production S3 tuning, and benchmark harness work are still future phases.
 
 ## Phase 13B concurrent checkpoint artifact helper
 
