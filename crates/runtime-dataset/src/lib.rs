@@ -39,7 +39,7 @@ pub enum DatasetPrefetchError {
     },
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct DatasetPrefetchResult {
     pub shard_id: String,
     pub storage_key: StorageKey,
