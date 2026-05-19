@@ -1,4 +1,4 @@
-# Observability (Phase 15A foundation)
+# Observability (Phase 15A/15B in-process)
 
 Phase 15A adds a **local, dependency-light observability foundation** for the runtime coordinator.
 
@@ -10,7 +10,7 @@ Implemented in this phase:
 - coordinator startup/shutdown logging
 - reusable in-process metrics primitives (`RuntimeMetrics` + snapshot)
 
-Not implemented yet in this phase:
+Phase 15B wiring now updates metrics from coordinator execution paths. Still not implemented:
 
 - Prometheus endpoint
 - Grafana dashboards
@@ -44,6 +44,18 @@ RUST_LOG=debug cargo run -p runtime-coordinator -- --addr 127.0.0.1:50051
 - `storage_bytes_written` (counter)
 
 Metrics are currently available as **in-process snapshots** only; they are not exported over HTTP and not integrated with Prometheus yet.
+
+## Phase 15B metric semantics
+
+- `active_workers` is refreshed from run worker state during worker registration, heartbeat, and run status reconciliation.
+- `stale_workers` is refreshed alongside `active_workers` after reconciliation/status reads.
+- `shard_assignment_count` increments by the number of shard assignments returned by successful `GetShardAssignment` calls.
+- `checkpoint_writes` increments on successful `CommitCheckpoint` RPC outcomes.
+- `failed_writes` increments on failed `CommitCheckpoint` RPC outcomes.
+- `storage_bytes_written` increments by `artifact_report.size_bytes` on successful `ReportCheckpointArtifact` outcomes.
+- `storage_bytes_read` remains available but is not yet wired to backend byte reads.
+
+Current limitation: storage throughput counters reflect coordinator-observed reported artifact bytes, not physical backend transfer accounting.
 
 ## Later optional work
 

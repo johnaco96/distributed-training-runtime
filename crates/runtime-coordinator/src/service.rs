@@ -5,21 +5,39 @@ use std::sync::Arc;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
+use tracing::{error, info};
 
 use crate::state::{
     BeginCheckpointError, CommitCheckpointError, CoordinatorState, GetLatestCheckpointError,
     GetShardAssignmentsError, RenewShardLeaseError, ReportCheckpointArtifactError,
     ReportShardProgressError,
 };
+use crate::{RuntimeMetrics, RuntimeMetricsSnapshot};
 
 #[derive(Clone, Debug)]
 pub struct CoordinatorServiceImpl {
     state: Arc<CoordinatorState>,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl CoordinatorServiceImpl {
     pub fn new(state: Arc<CoordinatorState>) -> Self {
-        Self { state }
+        Self::with_metrics(state, Arc::new(RuntimeMetrics::default()))
+    }
+
+    pub fn with_metrics(state: Arc<CoordinatorState>, metrics: Arc<RuntimeMetrics>) -> Self {
+        Self { state, metrics }
+    }
+
+    pub fn metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    fn update_worker_metrics(&self, run_id: &RunId) {
+        if let Some((active, stale)) = self.state.worker_counts(run_id) {
+            self.metrics.set_active_workers(active);
+            self.metrics.set_stale_workers(stale);
+        }
     }
 }
 
@@ -61,6 +79,8 @@ impl CoordinatorService for CoordinatorServiceImpl {
             lease_renewal_deadline: Some(registered.lease_renewal_deadline.into()),
             server_time: Some(registered.server_time.into()),
         };
+        self.update_worker_metrics(&run_id);
+        info!(run_id = %run_id.value, worker_id = %registered.worker_id.value, active_workers = self.metrics_snapshot().active_workers, "worker registered");
 
         Ok(Response::new(response))
     }
@@ -87,6 +107,8 @@ impl CoordinatorService for CoordinatorServiceImpl {
             next_heartbeat_deadline: Some(heartbeat.next_heartbeat_deadline.into()),
             server_time: Some(heartbeat.server_time.into()),
         };
+        self.update_worker_metrics(&run_id);
+        info!(run_id = %run_id.value, worker_id = %worker_id.value, "heartbeat accepted");
 
         Ok(Response::new(response))
     }
@@ -177,6 +199,10 @@ impl CoordinatorService for CoordinatorServiceImpl {
             assignment_policy: shard_assignments.assignment_policy,
             server_time: Some(shard_assignments.server_time.into()),
         };
+        for _ in &response.assignments {
+            self.metrics.inc_shard_assignment_count();
+        }
+        info!(run_id = %run_id.value, worker_id = %worker_id.value, shard_count = response.assignments.len(), "shard assignment produced");
 
         Ok(Response::new(response))
     }
@@ -362,6 +388,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let artifact_report = request
             .artifact_report
             .ok_or_else(|| Status::invalid_argument("artifact_report is required"))?;
+        let reported_size_bytes = artifact_report.size_bytes.max(0) as u64;
 
         let checkpoint = self
             .state
@@ -371,7 +398,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 checkpoint_id.value.clone(),
                 artifact_report.artifact_name,
                 artifact_report.artifact_uri,
-                artifact_report.size_bytes.max(0) as u64,
+                reported_size_bytes,
                 artifact_report.checksum,
                 artifact_report.checksum_algorithm,
                 request.idempotency_key,
@@ -393,6 +420,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
                     "checkpoint is in terminal state or cannot accept artifacts",
                 ),
             })?;
+        self.metrics.add_storage_bytes_written(reported_size_bytes);
 
         Ok(Response::new(ReportCheckpointArtifactResponse {
             accepted: true,
@@ -419,18 +447,24 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 checkpoint_id.value.clone(),
                 request.idempotency_key,
             )
-            .map_err(|error| match error {
-                CommitCheckpointError::RunNotFound => {
-                    Status::not_found(format!("run {} was not found", run_id.value))
+            .map_err(|error| {
+                self.metrics.inc_failed_writes();
+                error!(run_id = %run_id.value, checkpoint_id = %checkpoint_id.value, ?error, "checkpoint commit failed");
+                match error {
+                    CommitCheckpointError::RunNotFound => {
+                        Status::not_found(format!("run {} was not found", run_id.value))
+                    }
+                    CommitCheckpointError::CheckpointNotFound => {
+                        Status::not_found(format!("checkpoint {} was not found", checkpoint_id.value))
+                    }
+                    CommitCheckpointError::InvalidInput(message) => Status::invalid_argument(message),
+                    CommitCheckpointError::InvalidState => Status::failed_precondition(
+                        "checkpoint is in terminal state, missing artifacts, or cannot be committed",
+                    ),
                 }
-                CommitCheckpointError::CheckpointNotFound => {
-                    Status::not_found(format!("checkpoint {} was not found", checkpoint_id.value))
-                }
-                CommitCheckpointError::InvalidInput(message) => Status::invalid_argument(message),
-                CommitCheckpointError::InvalidState => Status::failed_precondition(
-                    "checkpoint is in terminal state, missing artifacts, or cannot be committed",
-                ),
             })?;
+        self.metrics.inc_checkpoint_writes();
+        info!(run_id = %run_id.value, checkpoint_id = %checkpoint_id.value, "checkpoint commit succeeded");
         Ok(Response::new(CommitCheckpointResponse {
             state: checkpoint_state_to_proto(checkpoint.record.checkpoint.state),
             committed_at: Some(millis_to_timestamp(checkpoint.committed_at_millis)),
@@ -511,6 +545,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
             .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
 
         self.state.reconcile_worker_liveness();
+        self.update_worker_metrics(&run_id);
 
         let record = self
             .state
@@ -1613,6 +1648,7 @@ mod tests {
             .await
             .unwrap();
         assert!(third.get_ref().accepted);
+        assert_eq!(service.metrics_snapshot().storage_bytes_written, 30);
     }
 
     #[tokio::test]
@@ -1695,6 +1731,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(second.state, CheckpointState::Committed as i32);
+        assert_eq!(service.metrics_snapshot().checkpoint_writes, 2);
 
         let status = service
             .get_run_status(Request::new(GetRunStatusRequest {
@@ -1731,6 +1768,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing_run.code(), tonic::Code::NotFound);
+        assert_eq!(service.metrics_snapshot().failed_writes, 1);
 
         let run_id = create_run(&service).await;
         let missing_checkpoint = service
@@ -1744,6 +1782,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing_checkpoint.code(), tonic::Code::NotFound);
+        assert_eq!(service.metrics_snapshot().failed_writes, 2);
 
         let worker_id = service
             .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
@@ -2159,5 +2198,67 @@ mod tests {
             .expect_err("unknown run should be missing");
 
         assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn register_worker_updates_active_worker_metric() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        service
+            .register_worker(Request::new(worker_request(run_id, "worker-key")))
+            .await
+            .unwrap();
+        assert_eq!(service.metrics_snapshot().active_workers, 1);
+    }
+
+    #[tokio::test]
+    async fn get_run_status_updates_stale_worker_metric() {
+        let state = Arc::new(CoordinatorState::default());
+        let service = CoordinatorServiceImpl::new(state.clone());
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(1)
+        ));
+        service
+            .get_run_status(Request::new(GetRunStatusRequest {
+                run_id: Some(run_id),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(service.metrics_snapshot().stale_workers, 1);
+    }
+
+    #[tokio::test]
+    async fn shard_assignment_increments_metric() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+        let worker_id = register_worker_for_assignment(&service, run_id.clone(), 0, "k").await;
+        service
+            .get_shard_assignment(Request::new(GetShardAssignmentRequest {
+                run_id: Some(run_id),
+                worker_id: Some(worker_id),
+                dataset_id: Some(dataset_id),
+                max_assignments: 10,
+            }))
+            .await
+            .unwrap();
+        assert!(service.metrics_snapshot().shard_assignment_count > 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_available_from_service() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let snapshot = service.metrics_snapshot();
+        assert_eq!(snapshot, RuntimeMetricsSnapshot::default());
     }
 }

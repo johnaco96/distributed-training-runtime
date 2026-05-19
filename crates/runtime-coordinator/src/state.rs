@@ -671,6 +671,20 @@ impl CoordinatorState {
         inner.runs.get(&run_id.value).cloned()
     }
 
+    pub fn worker_counts(&self, run_id: &RunId) -> Option<(u64, u64)> {
+        let inner = self.inner.read().expect("coordinator state lock poisoned");
+        let workers = inner.workers_by_run.get(&run_id.value)?;
+        let active = workers
+            .values()
+            .filter(|worker| worker.state == WorkerState::Active as i32)
+            .count() as u64;
+        let stale = workers
+            .values()
+            .filter(|worker| worker.state == WorkerState::Stale as i32)
+            .count() as u64;
+        Some((active, stale))
+    }
+
     /// Reconciles in-memory worker liveness against the current server time.
     ///
     /// The MVP coordinator marks active workers stale when heartbeat deadlines
