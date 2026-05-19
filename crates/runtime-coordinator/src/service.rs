@@ -72,6 +72,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
             .state
             .register_worker(request)
             .ok_or_else(|| Status::not_found(format!("run {} was not found", run_id.value)))?;
+        let worker_id_value = registered.worker_id.value.clone();
 
         let response = RegisterWorkerResponse {
             worker_id: Some(registered.worker_id),
@@ -80,7 +81,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
             server_time: Some(registered.server_time.into()),
         };
         self.update_worker_metrics(&run_id);
-        info!(run_id = %run_id.value, worker_id = %registered.worker_id.value, active_workers = self.metrics_snapshot().active_workers, "worker registered");
+        info!(run_id = %run_id.value, worker_id = %worker_id_value, active_workers = self.metrics_snapshot().active_workers, "worker registered");
 
         Ok(Response::new(response))
     }
