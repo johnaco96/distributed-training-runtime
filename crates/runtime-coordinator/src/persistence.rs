@@ -103,10 +103,26 @@ CREATE TABLE IF NOT EXISTS latest_checkpoints (
         conn.execute("INSERT OR REPLACE INTO runs(run_id,name,status,created_at_millis,idempotency_key) VALUES(?1,?2,?3,?4,NULL)",params![run.run_id,run.run_name,run.latest_checkpoint_state, to_millis(run.registered_at)])?;
         Ok(())
     }
-    pub fn save_worker(&self, w: &WorkerRecord) -> rusqlite::Result<()> {
+    pub fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite");
-        conn.execute("INSERT OR REPLACE INTO workers(run_id,worker_id,rank,world_size,status,last_heartbeat_millis,idempotency_key) VALUES(?1,?2,?3,?4,?5,?6,NULL)",params![w.run_id,w.worker_id,w.rank,w.rank+1,w.state,to_millis(w.last_heartbeat_at)])?;
+        conn.execute("INSERT OR REPLACE INTO workers(run_id,worker_id,rank,world_size,status,last_heartbeat_millis,idempotency_key) VALUES(?1,?2,?3,?4,?5,?6,NULL)",params![w.run_id,w.worker_id,w.rank,world_size,w.state,to_millis(w.last_heartbeat_at)])?;
         Ok(())
+    }
+    pub fn load_workers_for_run(
+        &self,
+        run_id: &str,
+    ) -> rusqlite::Result<Vec<(String, u32, u32, i32)>> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn.prepare("SELECT worker_id, rank, world_size, status FROM workers WHERE run_id=?1 ORDER BY worker_id")?;
+        stmt.query_map(params![run_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, i64>(1)? as u32,
+                r.get::<_, i64>(2)? as u32,
+                r.get(3)?,
+            ))
+        })?
+        .collect()
     }
     pub fn save_dataset(&self, d: &DatasetRecord) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite");
@@ -237,6 +253,7 @@ fn to_millis(t: std::time::SystemTime) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runtime_proto::runtime::v1::WorkerState;
     use tempfile::tempdir;
 
     #[test]
@@ -246,5 +263,35 @@ mod tests {
         let store = SqliteMetadataStore::open(&path).unwrap();
         store.init_schema().unwrap();
         store.init_schema().unwrap();
+    }
+
+    #[test]
+    fn worker_metadata_survives_persistence_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+        let worker = WorkerRecord {
+            run_id: "run-1".to_string(),
+            worker_id: "worker-0".to_string(),
+            rank: 2,
+            host: "localhost".to_string(),
+            sdk_version: "0.1.0".to_string(),
+            protocol_version: "v1".to_string(),
+            state: WorkerState::Active as i32,
+            registered_at: std::time::SystemTime::now(),
+            last_heartbeat_at: std::time::SystemTime::now(),
+            next_heartbeat_deadline: std::time::SystemTime::now(),
+            failure_deadline: std::time::SystemTime::now(),
+        };
+        store.save_worker(&worker, 4).unwrap();
+        store.save_worker(&worker, 4).unwrap();
+
+        let reopened = SqliteMetadataStore::open(&path).unwrap();
+        let workers = reopened.load_workers_for_run("run-1").unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].0, "worker-0");
+        assert_eq!(workers[0].1, 2);
+        assert_eq!(workers[0].2, 4);
     }
 }

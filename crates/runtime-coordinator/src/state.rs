@@ -287,9 +287,11 @@ impl CoordinatorState {
             store.save_run(run).expect("persist run");
         }
     }
-    fn persist_worker(&self, worker: &WorkerRecord) {
+    fn persist_worker(&self, worker: &WorkerRecord, world_size: u32) {
         if let Some(store) = &self.metadata_store {
-            store.save_worker(worker).expect("persist worker");
+            store
+                .save_worker(worker, world_size)
+                .expect("persist worker");
         }
     }
     fn persist_dataset(&self, dataset: &DatasetRecord) {
@@ -1012,6 +1014,11 @@ impl CoordinatorState {
             return None;
         }
 
+        let world_size = inner
+            .runs
+            .get(&run_id)
+            .expect("run must exist when registering worker")
+            .world_size;
         let idempotency_key = worker_idempotency_key(&run_id, &request.idempotency_key);
         if let Some(worker_id) =
             idempotency_lookup(&inner.worker_idempotency_keys, &idempotency_key)
@@ -1059,7 +1066,7 @@ impl CoordinatorState {
             .workers_by_run
             .entry(run_id.clone())
             .or_default()
-            .insert(worker_id.clone(), worker);
+            .insert(worker_id.clone(), worker.clone());
         refresh_active_worker_count(&mut inner, &run_id);
 
         if !request.idempotency_key.is_empty() {
@@ -1067,6 +1074,8 @@ impl CoordinatorState {
                 .worker_idempotency_keys
                 .insert(idempotency_key, worker_id.clone());
         }
+
+        self.persist_worker(&worker, world_size);
 
         Some(RegisteredWorker {
             worker_id: WorkerId { value: worker_id },
@@ -1099,8 +1108,15 @@ impl CoordinatorState {
         worker.failure_deadline = failure_deadline;
         worker.state = WorkerState::Active as i32;
         let state = worker.state;
+        let worker_snapshot = worker.clone();
+        let world_size = inner
+            .runs
+            .get(&run_id.value)
+            .expect("run must exist when recording heartbeat")
+            .world_size;
 
         refresh_active_worker_count(&mut inner, &run_id.value);
+        self.persist_worker(&worker_snapshot, world_size);
 
         Some(WorkerHeartbeat {
             state,
