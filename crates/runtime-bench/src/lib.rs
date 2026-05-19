@@ -621,10 +621,11 @@ async fn run_worker_rpc_async(
     let mut samples = Vec::with_capacity(1 + workers + (workers * heartbeats));
     let start = Instant::now();
 
+    let bench_run_id = format!("worker-rpc-{}", start.elapsed().as_nanos());
     let t0 = Instant::now();
     let run_res = client
         .register_run(Request::new(RegisterRunRequest {
-            idempotency_key: "bench-register-run".into(),
+            idempotency_key: format!("{bench_run_id}-register-run"),
             run_name: "runtime-bench-worker-rpc".into(),
             assignment_policy: AssignmentPolicy::StaticRank as i32,
             storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
@@ -654,7 +655,7 @@ async fn run_worker_rpc_async(
         let t = Instant::now();
         let resp = client
             .register_worker(Request::new(RegisterWorkerRequest {
-                idempotency_key: format!("bench-register-worker-{i}"),
+                idempotency_key: format!("{bench_run_id}-register-worker-{i}"),
                 run_id: Some(run_id.clone()),
                 worker_id: Some(worker_id.clone()),
                 rank: i as u32,
@@ -681,7 +682,7 @@ async fn run_worker_rpc_async(
                 .heartbeat(Request::new(HeartbeatRequest {
                     run_id: Some(run_id.clone()),
                     worker_id: Some(worker_id.clone()),
-                    idempotency_key: format!("bench-heartbeat-{}-{}", worker_id.value, h),
+                    idempotency_key: format!("{bench_run_id}-heartbeat-{}-{}", worker_id.value, h),
                     client_time: None,
                     active_shard_ids: Vec::new(),
                 }))

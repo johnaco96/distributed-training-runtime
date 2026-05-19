@@ -38,3 +38,8 @@ Later hardening phases may add one or both of:
 - capability negotiation between client and coordinator.
 
 Those mechanisms are not part of Phase 17A and are not yet enforced at runtime.
+
+
+## Related reliability notes
+
+For retry safety and idempotent replay behavior at current protocol shape, see `docs/retry-idempotency.md`.
