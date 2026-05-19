@@ -21,7 +21,7 @@ pub struct DatasetPrefetchSuccess {
     pub bytes_read: u64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum DatasetPrefetchError {
     Storage(StorageError),
     InvalidChecksumMetadata,
