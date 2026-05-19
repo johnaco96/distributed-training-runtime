@@ -89,3 +89,8 @@ Phase 12.5A foundation status:
 Phase 13 should optimize the **real artifact byte path introduced in Phase 12.5**, not only metadata reporting.
 
 Coordinator artifact-byte upload via control-plane RPC remains intentionally out of scope until Phase 12.5 is implemented.
+
+- Phase 13C dataset prefetching prototype: complete.
+- Benchmark harness: pending.
+- Full async read/write rewrite: pending.
+- Production dataset prefetch/cache-aware placement: pending.

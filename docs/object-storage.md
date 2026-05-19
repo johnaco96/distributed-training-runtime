@@ -146,3 +146,16 @@ runs/{run_id}/checkpoints/{checkpoint_id}/manifest.committed.json
 runs/{run_id}/checkpoints/{checkpoint_id}/COMMITTED
 runs/{run_id}/LATEST
 ```
+
+## Phase 13C: Dataset prefetching prototype
+
+`runtime-dataset` now includes a bounded prefetch helper for dataset shard objects that reads through the existing `StorageBackend` abstraction. It is intentionally small and backend-neutral, so it works with local storage, memory-backed test storage, and S3-backed storage implementations without introducing a separate cache layer.
+
+Highlights:
+- Accepts `DatasetPrefetchItem` inputs containing shard id, storage key, and optional expected size and checksum metadata.
+- Uses `StorageOperationPolicy.max_concurrent_operations` to bound in-flight prefetches.
+- Returns per-item success/failure results (partial failures do not panic or abort the whole batch).
+- Validates expected size and checksum when provided.
+
+Scope note: this is a prototype for worker-side loading workflows. It is **not** a production dataset cache, does **not** implement cache-aware placement, and does **not** include distributed prefetch scheduling.
+

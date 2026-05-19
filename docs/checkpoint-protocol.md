@@ -249,7 +249,7 @@ Current protocol behavior and roadmap alignment:
 
 Phase 13B adds a backend-neutral helper in `runtime-checkpoint` for uploading multiple checkpoint artifacts with bounded concurrency. Worker/client code can upload artifact bytes first through `StorageBackend`, receive checksum/size metadata, and then report metadata for commit. Commit-time integrity checks from Phase 12.5B remain authoritative and still verify existence/size/checksum before commit finalization.
 
-## 21. Risks and follow-ups
+## 22. Risks and follow-ups
 
 - **Risk:** coordinator/storage mismatch after crashes.
   - **Follow-up:** define precise reconciliation RPC/state persistence behavior.
