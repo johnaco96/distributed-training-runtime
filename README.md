@@ -106,9 +106,11 @@ Coordinator artifact-byte upload via control-plane RPC remains intentionally out
 Next planned step: **Phase 14 benchmark harness**.
 
 
-### Phase 14 — Benchmark Harness (started)
+### Phase 14 — Benchmark Harness (complete)
 
 - [x] Phase 13 complete.
 - [x] Phase 14A local benchmark CLI and local benchmarks (`dataset-read`, `checkpoint-write`, `checkpoint-restore`) complete.
-- [ ] Phase 14B worker registration/heartbeat overhead benchmark pending.
+- [x] Phase 14B worker registration/heartbeat overhead benchmark complete (`worker-rpc`).
 - Local benchmark scope only; no cloud/distributed performance claims yet.
+
+Next planned step: **Phase 15 observability**.

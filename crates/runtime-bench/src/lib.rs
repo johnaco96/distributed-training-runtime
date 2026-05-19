@@ -6,9 +6,21 @@ use runtime_checkpoint::{
 };
 use runtime_storage::{LocalStorage, StorageBackend, StorageKey, StorageOperationPolicy};
 use serde::{Deserialize, Serialize};
+
+use runtime_proto::runtime::v1::coordinator_service_client::CoordinatorServiceClient;
+use runtime_proto::runtime::v1::{
+    AssignmentPolicy, HeartbeatRequest, RegisterRunRequest, RegisterWorkerRequest, RunId,
+    StorageBackendKind, WorkerId,
+};
 use std::fs;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
+use tokio::runtime::Runtime;
+use tonic::Request;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkSample {
@@ -404,4 +416,151 @@ mod tests {
         let s = run_checkpoint_restore(3, 2, 128, 2, None, false).unwrap();
         assert_eq!(s.operation_count, 3);
     }
+
+    #[test]
+    fn worker_rpc_summary_name() {
+        let s = BenchmarkSummary::from_samples("worker-rpc", &[], 0.0);
+        assert_eq!(s.benchmark, "worker-rpc");
+    }
+}
+
+pub fn run_worker_rpc(
+    workers: usize,
+    heartbeats: usize,
+    addr: Option<String>,
+    start_coordinator: bool,
+) -> Result<BenchmarkSummary, String> {
+    let runtime = Runtime::new().map_err(|e| e.to_string())?;
+    runtime.block_on(run_worker_rpc_async(
+        workers,
+        heartbeats,
+        addr,
+        start_coordinator,
+    ))
+}
+
+async fn run_worker_rpc_async(
+    workers: usize,
+    heartbeats: usize,
+    addr: Option<String>,
+    start_coordinator: bool,
+) -> Result<BenchmarkSummary, String> {
+    let addr = addr.unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    let mut child = if start_coordinator {
+        Some(start_local_coordinator(&addr)?)
+    } else {
+        None
+    };
+    let endpoint = format!("http://{addr}");
+    let mut client = CoordinatorServiceClient::connect(endpoint)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut samples = Vec::with_capacity(1 + workers + (workers * heartbeats));
+    let start = Instant::now();
+
+    let t0 = Instant::now();
+    let run_res = client
+        .register_run(Request::new(RegisterRunRequest {
+            idempotency_key: "bench-register-run".into(),
+            run_name: "runtime-bench-worker-rpc".into(),
+            assignment_policy: AssignmentPolicy::StaticRank as i32,
+            storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
+            world_size: workers as u32,
+            run_version: "bench".into(),
+        }))
+        .await;
+    let run_id = run_res
+        .as_ref()
+        .ok()
+        .and_then(|r| r.get_ref().run_id.clone())
+        .unwrap_or(RunId {
+            value: "missing-run".into(),
+        });
+    samples.push(BenchmarkSample {
+        latency_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        bytes: 0,
+        success: run_res.is_ok(),
+        retry_count: 0,
+    });
+
+    let mut worker_ids = Vec::with_capacity(workers);
+    for i in 0..workers {
+        let worker_id = WorkerId {
+            value: format!("worker-{i}"),
+        };
+        let t = Instant::now();
+        let resp = client
+            .register_worker(Request::new(RegisterWorkerRequest {
+                idempotency_key: format!("bench-register-worker-{i}"),
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_id.clone()),
+                rank: i as u32,
+                host: "localhost".into(),
+                sdk_version: "bench".into(),
+                protocol_version: "v1".into(),
+            }))
+            .await;
+        samples.push(BenchmarkSample {
+            latency_ms: t.elapsed().as_secs_f64() * 1000.0,
+            bytes: 0,
+            success: resp.is_ok(),
+            retry_count: 0,
+        });
+        if resp.is_ok() {
+            worker_ids.push(worker_id);
+        }
+    }
+
+    for h in 0..heartbeats {
+        for worker_id in &worker_ids {
+            let t = Instant::now();
+            let resp = client
+                .heartbeat(Request::new(HeartbeatRequest {
+                    run_id: Some(run_id.clone()),
+                    worker_id: Some(worker_id.clone()),
+                    idempotency_key: format!("bench-heartbeat-{}-{}", worker_id.value, h),
+                    client_time: None,
+                    active_shard_ids: Vec::new(),
+                }))
+                .await;
+            samples.push(BenchmarkSample {
+                latency_ms: t.elapsed().as_secs_f64() * 1000.0,
+                bytes: 0,
+                success: resp.is_ok(),
+                retry_count: 0,
+            });
+        }
+    }
+
+    if let Some(mut c) = child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    Ok(BenchmarkSummary::from_samples(
+        "worker-rpc",
+        &samples,
+        start.elapsed().as_secs_f64() * 1000.0,
+    ))
+}
+
+fn start_local_coordinator(addr: &str) -> Result<Child, String> {
+    let mut child = Command::new("cargo")
+        .args(["run", "-p", "runtime-coordinator", "--", "--addr", addr])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    for _ in 0..80 {
+        if TcpStream::connect(addr).is_ok() {
+            return Ok(child);
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            return Err("runtime-coordinator exited before benchmark client connected".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!("timed out waiting for coordinator at {addr}"))
 }
