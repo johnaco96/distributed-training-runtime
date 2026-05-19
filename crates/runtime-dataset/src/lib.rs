@@ -323,7 +323,7 @@ mod tests {
             ..StorageOperationPolicy::default()
         };
         let err = prefetch_dataset_shards(&storage, &items, &policy).unwrap_err();
-        assert!(matches!(err, StorageError::InvalidPolicy(_)));
+        assert!(matches!(err, StorageError::InvalidKey(_)));
     }
 
     #[test]

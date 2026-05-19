@@ -2065,6 +2065,10 @@ version = "0.1.0"
 [[package]]
 name = "runtime-dataset"
 version = "0.1.0"
+dependencies = [
+ "runtime-checkpoint",
+ "runtime-storage",
+]
 
 [[package]]
 name = "runtime-proto"
