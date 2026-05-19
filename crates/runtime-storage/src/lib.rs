@@ -256,7 +256,12 @@ where
             });
         }
     });
-    Ok(out.lock().expect("result lock").drain(..).collect())
+    let results = {
+        let mut guard = out.lock().expect("result lock");
+        guard.drain(..).collect()
+    };
+
+    Ok(results)
 }
 
 pub fn get_many<B>(
@@ -282,7 +287,12 @@ where
             });
         }
     });
-    Ok(out.lock().expect("result lock").drain(..).collect())
+    let results = {
+        let mut guard = out.lock().expect("result lock");
+        guard.drain(..).collect()
+    };
+
+    Ok(results)
 }
 
 pub fn exists_many<B>(
@@ -308,7 +318,12 @@ where
             });
         }
     });
-    Ok(out.lock().expect("result lock").drain(..).collect())
+    let results = {
+        let mut guard = out.lock().expect("result lock");
+        guard.drain(..).collect()
+    };
+
+    Ok(results)
 }
 
 #[derive(Debug, Clone)]
