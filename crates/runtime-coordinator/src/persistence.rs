@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +12,6 @@ use runtime_checkpoint::{
     ArtifactRecord, CheckpointId as DomainCheckpointId, CheckpointRecord,
     CheckpointState as DomainCheckpointState, RunId as DomainRunId, WorkerId as DomainWorkerId,
 };
-use runtime_proto::runtime::v1::CheckpointId;
 
 #[derive(Clone, Debug)]
 pub struct SqliteMetadataStore {

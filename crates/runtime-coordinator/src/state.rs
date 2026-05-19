@@ -779,7 +779,7 @@ impl CoordinatorState {
             .datasets_by_run
             .entry(run_id.clone())
             .or_default()
-            .insert(dataset_id.clone(), record);
+            .insert(dataset_id.clone(), record.clone());
 
         if !request.idempotency_key.is_empty() {
             inner
