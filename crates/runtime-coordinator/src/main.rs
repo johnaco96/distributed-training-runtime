@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .init();
 
-    let addr: SocketAddr = "127.0.0.1:50051".parse()?;
+    let addr: SocketAddr = coordinator_addr()?.parse()?;
     let state = Arc::new(CoordinatorState::default());
     let service = CoordinatorServiceImpl::new(state);
 
@@ -29,4 +29,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+fn coordinator_addr() -> Result<String, Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let mut addr = String::from("127.0.0.1:50051");
+
+    while let Some(arg) = args.next() {
+        if arg == "--addr" {
+            addr = args.next().ok_or("--addr requires an address")?;
+        } else {
+            return Err(format!("unexpected argument: {arg}").into());
+        }
+    }
+
+    Ok(addr)
 }
