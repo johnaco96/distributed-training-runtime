@@ -1019,6 +1019,160 @@ mod tests {
     }
 
     #[test]
+    fn worker_death_simulation_marks_worker_failed() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker should register")
+            .worker_id;
+
+        assert_eq!(
+            state
+                .get_run(&run_id)
+                .expect("run should exist")
+                .active_worker_count,
+            1
+        );
+
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+
+        let stale_worker = state
+            .inner
+            .read()
+            .unwrap()
+            .workers_by_run
+            .get(&run_id.value)
+            .and_then(|workers| workers.get(&worker_id.value))
+            .cloned()
+            .expect("worker should exist");
+        assert_eq!(stale_worker.state, WorkerState::Stale as i32);
+
+        assert!(state.set_worker_failure_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+
+        let failed_worker = state
+            .inner
+            .read()
+            .unwrap()
+            .workers_by_run
+            .get(&run_id.value)
+            .and_then(|workers| workers.get(&worker_id.value))
+            .cloned()
+            .expect("worker should exist");
+        assert_eq!(failed_worker.state, WorkerState::Failed as i32);
+    }
+
+    #[test]
+    fn failed_worker_is_excluded_from_run_status() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker should register")
+            .worker_id;
+
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+        assert!(state.set_worker_failure_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+
+        let run = state.get_run(&run_id).expect("run should exist");
+        assert_eq!(run.active_worker_count, 0);
+    }
+
+    #[test]
+    fn failed_worker_record_is_retained() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker should register")
+            .worker_id;
+
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+        assert!(state.set_worker_failure_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+
+        let worker = state
+            .inner
+            .read()
+            .unwrap()
+            .workers_by_run
+            .get(&run_id.value)
+            .and_then(|workers| workers.get(&worker_id.value))
+            .cloned();
+        assert!(worker.is_some(), "failed worker record should be retained");
+    }
+
+    #[test]
+    fn heartbeat_after_simulated_death_reactivates_worker() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker should register")
+            .worker_id;
+
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+        assert!(state.set_worker_failure_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+
+        let heartbeat = state
+            .record_heartbeat(&run_id, &worker_id)
+            .expect("failed worker heartbeat should succeed");
+        let worker = state
+            .inner
+            .read()
+            .unwrap()
+            .workers_by_run
+            .get(&run_id.value)
+            .and_then(|workers| workers.get(&worker_id.value))
+            .cloned()
+            .expect("worker should exist");
+        let run = state.get_run(&run_id).expect("run should exist");
+
+        assert_eq!(heartbeat.state, WorkerState::Active as i32);
+        assert_eq!(worker.state, WorkerState::Active as i32);
+        assert_eq!(run.active_worker_count, 1);
+    }
+
+    #[test]
     fn register_run_stores_run_metadata() {
         let state = CoordinatorState::default();
 
