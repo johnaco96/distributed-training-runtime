@@ -154,6 +154,16 @@ class RuntimeClient:
         )
         return self._stub.CommitCheckpoint(request)
 
+    def restore_latest(
+        self,
+        run_id: str,
+    ) -> "runtime_pb2.GetLatestCheckpointResponse":
+        """Fetch latest committed checkpoint metadata from the coordinator."""
+        request = self._runtime_pb2.GetLatestCheckpointRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+        )
+        return self._stub.GetLatestCheckpoint(request)
+
     def heartbeat(
         self,
         run_id: str,
