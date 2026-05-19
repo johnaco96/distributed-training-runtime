@@ -60,6 +60,8 @@ Do not commit generated benchmark output files.
 
 - Local coordinator scaling only (single-machine benchmark scope).
 - Reports one summary line per worker count.
+- Without `--addr`, each row runs against a fresh local coordinator process (row isolation).
+- With `--addr`, auto-start is disabled and all rows target the same external coordinator.
 - Uses the same metrics fields as `worker-rpc` (ops/success/failure/failure_rate/elapsed/latency/retries).
 - Throughput fields remain control-plane values (`total_bytes=0`, `mb_per_sec=0.0`).
 - Do **not** claim hundreds/thousands of workers or production scale until those counts are actually benchmarked.
