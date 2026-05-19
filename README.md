@@ -114,3 +114,13 @@ Next planned step: **Phase 14 benchmark harness**.
 - Local benchmark scope only; no cloud/distributed performance claims yet.
 
 Next planned step: **Phase 15 observability**.
+
+
+### Phase 15 — Observability (started)
+
+- [x] Phase 14 complete.
+- [x] Phase 15A structured logging and in-process metrics foundation complete.
+- [ ] Wire foundation metrics through additional coordinator/storage/checkpoint execution paths.
+- [ ] Add optional Prometheus/Grafana integration later.
+
+See `docs/observability.md` for current scope and usage.
