@@ -109,6 +109,11 @@ Scope note:
 - MinIO/AWS paths can use these same policies in later Phase 13 work.
 - Normal unit/integration tests remain MinIO-optional and do not require AWS credentials.
 
+
+## Phase 13B concurrent checkpoint artifact helper
+
+`runtime-checkpoint` now provides a bounded concurrent upload helper that uses `StorageBackend`, so it works with both `LocalStorage` and `S3Storage`. Concurrency is bounded via `StorageOperationPolicy.max_concurrent_operations`. This helper uploads artifact bytes and returns artifact metadata including checksum/size, but it is not multipart upload and does not stream artifact bytes through coordinator gRPC.
+
 ## Limitations
 
 - Phase 12A provides storage backend primitives and key mapping.

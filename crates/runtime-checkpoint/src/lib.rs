@@ -3,6 +3,7 @@
 use runtime_storage::{
     checkpoint_committed_marker, checkpoint_manifest_committed, checkpoint_manifest_pending,
     checkpoint_worker_artifact, latest_pointer, StorageBackend, StorageError, StorageKey,
+    StorageOperationPolicy,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,6 +98,67 @@ pub fn validate_artifact_integrity(
     verify_checksum(algorithm, &bytes, expected_checksum)
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CheckpointArtifactUpload {
+    pub worker_id: WorkerId,
+    pub artifact_name: String,
+    pub storage_key: StorageKey,
+    pub bytes: Vec<u8>,
+    pub checksum_algorithm: ChecksumAlgorithm,
+}
+
+pub fn upload_checkpoint_artifacts_concurrently(
+    storage: &impl StorageBackend,
+    uploads: Vec<CheckpointArtifactUpload>,
+    policy: &StorageOperationPolicy,
+) -> Result<Vec<ArtifactRecord>, CheckpointError> {
+    policy.validate().map_err(CheckpointError::Storage)?;
+    if uploads.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(uploads.len());
+    for chunk in uploads.chunks(policy.max_concurrent_operations) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for upload in chunk.iter().cloned() {
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let digest = compute_checksum(upload.checksum_algorithm, &upload.bytes);
+                    let size_bytes = upload.bytes.len() as u64;
+                    let result = (|| -> Result<ArtifactRecord, CheckpointError> {
+                        storage.put(&upload.storage_key, &upload.bytes)?;
+                        validate_artifact_integrity(
+                            storage,
+                            &upload.storage_key,
+                            size_bytes,
+                            upload.checksum_algorithm.as_str(),
+                            &digest,
+                        )
+                        .map_err(CheckpointError::ArtifactValidation)?;
+                        Ok(ArtifactRecord {
+                            worker_id: upload.worker_id,
+                            artifact_name: upload.artifact_name,
+                            storage_key: upload.storage_key.to_string(),
+                            size_bytes,
+                            checksum: digest,
+                            checksum_algorithm: upload.checksum_algorithm.as_str().to_string(),
+                        })
+                    })();
+                    let _ = tx.send(result);
+                });
+            }
+        });
+        drop(tx);
+        for _ in 0..chunk.len() {
+            let item = rx.recv().map_err(|e| {
+                CheckpointError::Storage(StorageError::Io(std::io::Error::other(e.to_string())))
+            })??;
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointState {
@@ -594,6 +656,89 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("runtime-checkpoint-{name}-{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[derive(Clone, Default)]
+    struct TrackingMemoryStorage {
+        entries: std::sync::Arc<std::sync::RwLock<BTreeMap<StorageKey, Vec<u8>>>>,
+        in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_put: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl TrackingMemoryStorage {
+        fn max_seen(&self) -> usize {
+            self.max_seen.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn set_fail_put(&self, v: bool) {
+            self.fail_put.store(v, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl StorageBackend for TrackingMemoryStorage {
+        fn put(&self, key: &StorageKey, bytes: &[u8]) -> Result<(), StorageError> {
+            if self.fail_put.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(StorageError::Io(std::io::Error::other("forced failure")));
+            }
+            let now = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            loop {
+                let prev = self.max_seen.load(std::sync::atomic::Ordering::SeqCst);
+                if now <= prev {
+                    break;
+                }
+                if self
+                    .max_seen
+                    .compare_exchange(
+                        prev,
+                        now,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.entries
+                .write()
+                .unwrap()
+                .insert(key.clone(), bytes.to_vec());
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn get(&self, key: &StorageKey) -> Result<Vec<u8>, StorageError> {
+            self.entries
+                .read()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StorageError::NotFound(key.clone()))
+        }
+        fn exists(&self, key: &StorageKey) -> Result<bool, StorageError> {
+            Ok(self.entries.read().unwrap().contains_key(key))
+        }
+        fn list_prefix(&self, prefix: &StorageKey) -> Result<Vec<StorageKey>, StorageError> {
+            let p = format!("{}/", prefix.as_str());
+            let mut keys: Vec<_> = self
+                .entries
+                .read()
+                .unwrap()
+                .keys()
+                .filter(|k| k.as_str().starts_with(&p))
+                .cloned()
+                .collect();
+            keys.sort();
+            Ok(keys)
+        }
+        fn delete(&self, key: &StorageKey) -> Result<(), StorageError> {
+            self.entries.write().unwrap().remove(key);
+            Ok(())
+        }
     }
 
     #[derive(Clone, Default)]
@@ -1229,6 +1374,135 @@ mod tests {
         assert_eq!(latest.checkpoint_id, "ckpt-good");
     }
 
+    #[test]
+    fn concurrent_upload_writes_all_artifacts_and_returns_metadata() {
+        let storage = MemoryStorage::default();
+        let policy = StorageOperationPolicy::default();
+        let uploads = vec![
+            CheckpointArtifactUpload {
+                worker_id: WorkerId("w1".into()),
+                artifact_name: "a.bin".into(),
+                storage_key: StorageKey::new("runs/r/checkpoints/c/workers/w1/a.bin").unwrap(),
+                bytes: b"aaa".to_vec(),
+                checksum_algorithm: ChecksumAlgorithm::Sha256,
+            },
+            CheckpointArtifactUpload {
+                worker_id: WorkerId("w2".into()),
+                artifact_name: "b.bin".into(),
+                storage_key: StorageKey::new("runs/r/checkpoints/c/workers/w2/b.bin").unwrap(),
+                bytes: b"bbb".to_vec(),
+                checksum_algorithm: ChecksumAlgorithm::Sha256,
+            },
+        ];
+        let results = upload_checkpoint_artifacts_concurrently(&storage, uploads, &policy).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.checksum_algorithm == "sha256"));
+    }
+
+    #[test]
+    fn concurrent_upload_metadata_uses_real_sha256() {
+        let storage = MemoryStorage::default();
+        let policy = StorageOperationPolicy::default();
+        let uploads = vec![CheckpointArtifactUpload {
+            worker_id: WorkerId("w1".into()),
+            artifact_name: "x".into(),
+            storage_key: StorageKey::new("runs/r/checkpoints/c/workers/w1/x").unwrap(),
+            bytes: b"hello world".to_vec(),
+            checksum_algorithm: ChecksumAlgorithm::Sha256,
+        }];
+        let results = upload_checkpoint_artifacts_concurrently(&storage, uploads, &policy).unwrap();
+        assert_eq!(
+            results[0].checksum,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[test]
+    fn concurrent_upload_respects_concurrency_limit() {
+        let storage = TrackingMemoryStorage::default();
+        let policy = StorageOperationPolicy {
+            max_concurrent_operations: 2,
+            ..Default::default()
+        };
+        let uploads: Vec<_> = (0..8)
+            .map(|i| CheckpointArtifactUpload {
+                worker_id: WorkerId(format!("w{i}")),
+                artifact_name: format!("a{i}.bin"),
+                storage_key: StorageKey::new(format!("runs/r/checkpoints/c/workers/w{i}/a{i}.bin"))
+                    .unwrap(),
+                bytes: vec![i as u8],
+                checksum_algorithm: ChecksumAlgorithm::Sha256,
+            })
+            .collect();
+        let _ = upload_checkpoint_artifacts_concurrently(&storage, uploads, &policy).unwrap();
+        assert!(storage.max_seen() <= 2);
+    }
+
+    #[test]
+    fn concurrent_upload_rejects_zero_concurrency_policy() {
+        let storage = MemoryStorage::default();
+        let policy = StorageOperationPolicy {
+            max_concurrent_operations: 0,
+            ..Default::default()
+        };
+        let err = upload_checkpoint_artifacts_concurrently(&storage, vec![], &policy).unwrap_err();
+        assert!(matches!(
+            err,
+            CheckpointError::Storage(StorageError::InvalidKey(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_upload_failure_returns_error() {
+        let storage = TrackingMemoryStorage::default();
+        storage.set_fail_put(true);
+        let policy = StorageOperationPolicy::default();
+        let uploads = vec![CheckpointArtifactUpload {
+            worker_id: WorkerId("w1".into()),
+            artifact_name: "x".into(),
+            storage_key: StorageKey::new("runs/r/checkpoints/c/workers/w1/x").unwrap(),
+            bytes: b"x".to_vec(),
+            checksum_algorithm: ChecksumAlgorithm::Sha256,
+        }];
+        assert!(upload_checkpoint_artifacts_concurrently(&storage, uploads, &policy).is_err());
+    }
+
+    #[test]
+    fn uploaded_metadata_can_be_committed_successfully() {
+        let store = CheckpointStore::new(MemoryStorage::default());
+        let mut record = CheckpointRecord::new(
+            RunId("run-up".into()),
+            CheckpointId("ckpt-up".into()),
+            1,
+            1000,
+        );
+        let policy = StorageOperationPolicy::default();
+        let uploads = vec![
+            CheckpointArtifactUpload {
+                worker_id: WorkerId("w1".into()),
+                artifact_name: "a.bin".into(),
+                storage_key: StorageKey::new("runs/run-up/checkpoints/ckpt-up/workers/w1/a.bin")
+                    .unwrap(),
+                bytes: b"abc".to_vec(),
+                checksum_algorithm: ChecksumAlgorithm::Sha256,
+            },
+            CheckpointArtifactUpload {
+                worker_id: WorkerId("w2".into()),
+                artifact_name: "b.bin".into(),
+                storage_key: StorageKey::new("runs/run-up/checkpoints/ckpt-up/workers/w2/b.bin")
+                    .unwrap(),
+                bytes: b"xyz".to_vec(),
+                checksum_algorithm: ChecksumAlgorithm::Sha256,
+            },
+        ];
+        let artifacts =
+            upload_checkpoint_artifacts_concurrently(&store.storage, uploads, &policy).unwrap();
+        for a in artifacts {
+            record.add_artifact(a, 1001).unwrap();
+        }
+        let committed = store.commit_checkpoint(&mut record, 2000).unwrap();
+        assert_eq!(committed.artifacts.len(), 2);
+    }
     #[test]
     fn checksum_algorithm_parsing_and_canonical_name() {
         assert_eq!(
