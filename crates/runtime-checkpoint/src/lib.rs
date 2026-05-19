@@ -583,6 +583,9 @@ mod tests {
             checksum_algorithm: "sha256".into(),
         }
     }
+    fn checksum_sha256(bytes: &[u8]) -> String {
+        compute_checksum(ChecksumAlgorithm::Sha256, bytes)
+    }
     fn test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -735,15 +738,16 @@ mod tests {
         let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
         let (run_id, checkpoint_id, worker_id) = ids();
         let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        let bytes = b"x";
         store
             .write_artifact(
                 &mut record,
                 worker_id,
                 "a.bin",
-                b"x",
-                "c".into(),
+                bytes,
+                checksum_sha256(bytes),
                 "sha256".into(),
-                1001,
+                bytes.len() as u64,
             )
             .unwrap();
         let manifest = store.commit_checkpoint(&mut record, 2000).unwrap();
@@ -768,15 +772,16 @@ mod tests {
         let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
         let (run_id, checkpoint_id, worker_id) = ids();
         let mut record = CheckpointRecord::new(run_id, checkpoint_id, 1, 1000);
+        let bytes = b"x";
         store
             .write_artifact(
                 &mut record,
                 worker_id,
                 "a.bin",
-                b"x",
-                "c".into(),
+                bytes,
+                checksum_sha256(bytes),
                 "sha256".into(),
-                1001,
+                bytes.len() as u64,
             )
             .unwrap();
         store.commit_checkpoint(&mut record, 2000).unwrap();
@@ -889,15 +894,16 @@ mod tests {
 
         let mut checkpoint_1 =
             CheckpointRecord::new(run_id.clone(), CheckpointId("ckpt-1".into()), 10, 1000);
+        let bytes_a = b"a";
         store
             .write_artifact(
                 &mut checkpoint_1,
                 worker_id.clone(),
                 "a.bin",
-                b"a",
-                "sum-a".into(),
+                bytes_a,
+                checksum_sha256(bytes_a),
                 "sha256".into(),
-                1001,
+                bytes_a.len() as u64,
             )
             .unwrap();
         store.commit_checkpoint(&mut checkpoint_1, 2000).unwrap();
@@ -981,15 +987,16 @@ mod tests {
             let first_store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
             let mut record =
                 CheckpointRecord::new(run_id.clone(), checkpoint_id.clone(), 123, 1000);
+            let bytes = b"tensor";
             first_store
                 .write_artifact(
                     &mut record,
                     worker_id.clone(),
                     "tensor.bin",
-                    b"tensor",
-                    "sum".into(),
+                    bytes,
+                    checksum_sha256(bytes),
                     "sha256".into(),
-                    1001,
+                    bytes.len() as u64,
                 )
                 .unwrap();
             first_store.commit_checkpoint(&mut record, 2000).unwrap();
@@ -1023,15 +1030,16 @@ mod tests {
             9,
             1000,
         );
+        let bytes = b"abc";
         store
             .write_artifact(
                 &mut record,
                 WorkerId("worker-memory".into()),
                 "weights.bin",
-                b"abc",
-                "sum".into(),
+                bytes,
+                checksum_sha256(bytes),
                 "sha256".into(),
-                1001,
+                bytes.len() as u64,
             )
             .unwrap();
         store.write_pending_manifest(&record).unwrap();
