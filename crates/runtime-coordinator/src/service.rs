@@ -2249,7 +2249,7 @@ mod tests {
                 run_id: Some(run_id),
                 worker_id: Some(worker_id),
                 dataset_id: Some(dataset_id),
-                max_assignments: 10,
+                idempotency_key: "metrics-shard-assignment".to_string(),
             }))
             .await
             .unwrap();
