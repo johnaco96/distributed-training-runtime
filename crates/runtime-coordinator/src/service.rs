@@ -337,6 +337,8 @@ impl CoordinatorService for CoordinatorServiceImpl {
             .run_id
             .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
 
+        self.state.reconcile_worker_liveness();
+
         let record = self
             .state
             .get_run(&run_id)
@@ -805,6 +807,79 @@ mod tests {
             .expect("get_run_status should succeed")
             .into_inner();
 
+        assert_eq!(status.active_worker_count, 1);
+    }
+
+    #[tokio::test]
+    async fn get_run_status_marks_stale_worker_inactive_after_deadline() {
+        let state = Arc::new(CoordinatorState::default());
+        let service = CoordinatorServiceImpl::new(Arc::clone(&state));
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .expect("register_worker should succeed")
+            .into_inner()
+            .worker_id
+            .expect("register worker response should include worker_id");
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+
+        let status = service
+            .get_run_status(Request::new(GetRunStatusRequest {
+                run_id: Some(run_id.clone()),
+            }))
+            .await
+            .expect("get_run_status should succeed")
+            .into_inner();
+
+        assert_eq!(status.active_worker_count, 0);
+        let record = state.get_run(&run_id).expect("run should exist");
+        assert_eq!(record.active_worker_count, 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reactivates_stale_worker_for_status() {
+        let state = Arc::new(CoordinatorState::default());
+        let service = CoordinatorServiceImpl::new(Arc::clone(&state));
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .expect("register_worker should succeed")
+            .into_inner()
+            .worker_id
+            .expect("register worker response should include worker_id");
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            std::time::SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+
+        let heartbeat = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_id),
+                idempotency_key: "heartbeat-key".to_string(),
+                client_time: None,
+                active_shard_ids: Vec::new(),
+            }))
+            .await
+            .expect("heartbeat should succeed")
+            .into_inner();
+        let status = service
+            .get_run_status(Request::new(GetRunStatusRequest {
+                run_id: Some(run_id),
+            }))
+            .await
+            .expect("get_run_status should succeed")
+            .into_inner();
+
+        assert_eq!(heartbeat.state, WorkerState::Active as i32);
         assert_eq!(status.active_worker_count, 1);
     }
 
