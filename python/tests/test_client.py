@@ -130,6 +130,29 @@ class BeginCheckpointResponse:
     checkpoint_id: Optional[CheckpointId] = None
 
 
+
+
+@dataclass
+class ArtifactReport:
+    artifact_name: str = ""
+    artifact_uri: str = ""
+    size_bytes: int = 0
+    checksum: str = ""
+    checksum_algorithm: str = ""
+
+
+@dataclass
+class ReportCheckpointArtifactRequest:
+    run_id: Optional[RunId] = None
+    worker_id: Optional[WorkerId] = None
+    checkpoint_id: Optional[CheckpointId] = None
+    artifact_report: Optional[ArtifactReport] = None
+    idempotency_key: str = ""
+
+
+@dataclass
+class ReportCheckpointArtifactResponse:
+    accepted: bool = False
 @dataclass
 class CommitCheckpointRequest:
     run_id: Optional[RunId] = None
@@ -173,6 +196,9 @@ def install_fake_generated_modules(monkeypatch):
         GetShardAssignmentResponse=GetShardAssignmentResponse,
         BeginCheckpointRequest=BeginCheckpointRequest,
         BeginCheckpointResponse=BeginCheckpointResponse,
+        ArtifactReport=ArtifactReport,
+        ReportCheckpointArtifactRequest=ReportCheckpointArtifactRequest,
+        ReportCheckpointArtifactResponse=ReportCheckpointArtifactResponse,
         CommitCheckpointRequest=CommitCheckpointRequest,
         CommitCheckpointResponse=CommitCheckpointResponse,
         GetLatestCheckpointRequest=GetLatestCheckpointRequest,
@@ -369,6 +395,44 @@ def test_begin_checkpoint_builds_request_and_calls_stub(monkeypatch):
             checkpoint_id=CheckpointId(value="ckpt-1"),
             step=42,
             idempotency_key="idem-checkpoint-1",
+        )
+    )
+    assert result == response
+
+
+
+
+def test_report_checkpoint_artifact_builds_request_and_calls_stub(monkeypatch):
+    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    response = ReportCheckpointArtifactResponse(accepted=True)
+    stub.ReportCheckpointArtifact.return_value = response
+
+    client = RuntimeClient("127.0.0.1:50051")
+    result = client.report_checkpoint_artifact(
+        run_id="run-1",
+        worker_id="worker-1",
+        checkpoint_id="ckpt-1",
+        artifact_name="model-state",
+        artifact_uri="s3://bucket/checkpoints/ckpt-1/model.pt",
+        size_bytes=1024,
+        checksum="abc123",
+        checksum_algorithm="sha256",
+        idempotency_key="idem-artifact-1",
+    )
+
+    stub.ReportCheckpointArtifact.assert_called_once_with(
+        ReportCheckpointArtifactRequest(
+            run_id=RunId(value="run-1"),
+            worker_id=WorkerId(value="worker-1"),
+            checkpoint_id=CheckpointId(value="ckpt-1"),
+            artifact_report=ArtifactReport(
+                artifact_name="model-state",
+                artifact_uri="s3://bucket/checkpoints/ckpt-1/model.pt",
+                size_bytes=1024,
+                checksum="abc123",
+                checksum_algorithm="sha256",
+            ),
+            idempotency_key="idem-artifact-1",
         )
     )
     assert result == response
