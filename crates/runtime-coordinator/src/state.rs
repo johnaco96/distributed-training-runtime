@@ -188,6 +188,7 @@ pub struct ReportedShardProgress {
 pub struct CoordinatorCheckpointRecord {
     pub checkpoint: CheckpointRecord,
     pub initiated_by_worker_id: String,
+    pub committed_at_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,7 +214,12 @@ pub enum CommitCheckpointError {
     InvalidState,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitCheckpointResult {
+    pub record: CoordinatorCheckpointRecord,
+    pub committed_at_millis: u64,
+}
+
 pub enum GetShardAssignmentsError {
     RunNotFound,
     WorkerNotFound,
@@ -305,6 +311,7 @@ impl CoordinatorState {
                 now_millis,
             ),
             initiated_by_worker_id: worker_id,
+            committed_at_millis: None,
         };
         inner
             .checkpoints_by_run
@@ -420,7 +427,7 @@ impl CoordinatorState {
         run_id: String,
         checkpoint_id: String,
         _idempotency_key: String,
-    ) -> Result<CoordinatorCheckpointRecord, CommitCheckpointError> {
+    ) -> Result<CommitCheckpointResult, CommitCheckpointError> {
         if run_id.trim().is_empty() {
             return Err(CommitCheckpointError::InvalidInput(
                 "run_id must be non-empty",
@@ -453,22 +460,30 @@ impl CoordinatorState {
             return Err(CommitCheckpointError::InvalidState);
         }
 
-        let now_millis = now_millis();
-        if record.checkpoint.state == DomainCheckpointState::UploadInProgress {
+        let committed_at_millis = if record.checkpoint.state == DomainCheckpointState::Committed {
             record
-                .checkpoint
-                .transition_to(DomainCheckpointState::Validating, now_millis)
-                .map_err(map_commit_checkpoint_error)?;
-        }
-        if record.checkpoint.state == DomainCheckpointState::Validating {
-            record
-                .checkpoint
-                .transition_to(DomainCheckpointState::Committed, now_millis)
-                .map_err(map_commit_checkpoint_error)?;
-        }
-        if record.checkpoint.state != DomainCheckpointState::Committed {
-            return Err(CommitCheckpointError::InvalidState);
-        }
+                .committed_at_millis
+                .unwrap_or(record.checkpoint.updated_at_millis)
+        } else {
+            let now_millis = now_millis();
+            if record.checkpoint.state == DomainCheckpointState::UploadInProgress {
+                record
+                    .checkpoint
+                    .transition_to(DomainCheckpointState::Validating, now_millis)
+                    .map_err(map_commit_checkpoint_error)?;
+            }
+            if record.checkpoint.state == DomainCheckpointState::Validating {
+                record
+                    .checkpoint
+                    .transition_to(DomainCheckpointState::Committed, now_millis)
+                    .map_err(map_commit_checkpoint_error)?;
+            }
+            if record.checkpoint.state != DomainCheckpointState::Committed {
+                return Err(CommitCheckpointError::InvalidState);
+            }
+            record.committed_at_millis = Some(now_millis);
+            now_millis
+        };
 
         let response = record.clone();
         if let Some(run) = inner.runs.get_mut(&run_id) {
@@ -477,7 +492,10 @@ impl CoordinatorState {
             });
             run.latest_checkpoint_state = CheckpointState::Committed as i32;
         }
-        Ok(response)
+        Ok(CommitCheckpointResult {
+            record: response,
+            committed_at_millis,
+        })
     }
     pub fn register_run(&self, request: RegisterRunRequest) -> RegisteredRun {
         let mut inner = self.inner.write().expect("coordinator state lock poisoned");
@@ -1738,8 +1756,15 @@ mod tests {
                 "commit-1".to_string(),
             )
             .expect("commit should succeed");
-        assert_eq!(committed.checkpoint.state, DomainCheckpointState::Committed);
-        assert!(committed.checkpoint.committed_at_millis.is_some());
+        assert_eq!(
+            committed.record.checkpoint.state,
+            DomainCheckpointState::Committed
+        );
+        assert!(committed.record.committed_at_millis.is_some());
+        assert_eq!(
+            committed.committed_at_millis,
+            committed.record.committed_at_millis.unwrap()
+        );
 
         let run = state.get_run(&run_id).unwrap();
         assert_eq!(
@@ -1756,6 +1781,9 @@ mod tests {
         let repeated = state
             .commit_checkpoint(run_id.value, "ckpt-1".to_string(), "commit-2".to_string())
             .expect("repeated commit should be harmless");
-        assert_eq!(repeated.checkpoint.state, DomainCheckpointState::Committed);
+        assert_eq!(
+            repeated.record.checkpoint.state,
+            DomainCheckpointState::Committed
+        );
     }
 }

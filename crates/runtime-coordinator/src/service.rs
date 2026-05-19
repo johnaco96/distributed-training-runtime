@@ -431,11 +431,8 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 ),
             })?;
         Ok(Response::new(CommitCheckpointResponse {
-            state: checkpoint_state_to_proto(checkpoint.checkpoint.state),
-            committed_at: checkpoint
-                .checkpoint
-                .committed_at_millis
-                .map(millis_to_timestamp),
+            state: checkpoint_state_to_proto(result.record.checkpoint.state),
+            committed_at: Some(millis_to_timestamp(result.committed_at_millis)),
         }))
     }
 
