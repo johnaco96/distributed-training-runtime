@@ -396,17 +396,19 @@ pub fn run_scaling_workers(
     simulated: bool,
 ) -> Result<Vec<BenchmarkSummary>, String> {
     validate_worker_counts(worker_counts)?;
+    let auto_start_per_step = addr.is_none() && start_coordinator;
     worker_counts
         .iter()
-        .enumerate()
-        .map(|(index, workers)| {
+        .map(|workers| {
+            let benchmark_name = scaling_benchmark_name(*workers, simulated);
             run_worker_rpc_with_name(
                 *workers,
                 heartbeats,
                 addr.clone(),
-                if index == 0 { start_coordinator } else { false },
-                scaling_benchmark_name(*workers, simulated),
+                auto_start_per_step,
+                benchmark_name.clone(),
             )
+            .map_err(|e| format!("scaling step {benchmark_name} failed: {e}"))
         })
         .collect()
 }

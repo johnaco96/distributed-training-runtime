@@ -12,6 +12,11 @@ Phase 16 measures **local coordinator control-plane RPC behavior** as worker cou
 
 This is not a cloud benchmark, not Kubernetes benchmarking, and not multi-machine distributed training validation.
 
+Coordinator lifecycle semantics for `scaling-workers`:
+
+- Without `--addr`, each worker-count row starts and uses its own local coordinator process.
+- With `--addr`, no local coordinator is auto-started and all rows target the provided external coordinator.
+
 ## Prerequisite
 
 Verify CLI availability and options:
