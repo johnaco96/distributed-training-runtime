@@ -601,6 +601,39 @@ mod tests {
         assert!(matches!(err, CheckpointError::NoLatestCheckpoint));
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn interrupted_checkpoint_with_only_pending_manifest_is_not_restorable() {
+        let dir = test_dir("interrupted-pending-only");
+        let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+        let (run_id, checkpoint_id, worker_id) = ids();
+        let mut record = CheckpointRecord::new(run_id.clone(), checkpoint_id.clone(), 7, 1000);
+
+        store
+            .write_artifact(
+                &mut record,
+                worker_id,
+                "weights.bin",
+                b"artifact-bytes",
+                "sum".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        store.write_pending_manifest(&record).unwrap();
+
+        let err = store.load_latest_manifest(&run_id).unwrap_err();
+        assert!(matches!(err, CheckpointError::NoLatestCheckpoint));
+
+        let pending_bytes = store
+            .storage
+            .get(&checkpoint_manifest_pending(&run_id.0, &checkpoint_id.0))
+            .unwrap();
+        let pending_manifest = CheckpointManifest::from_json_bytes(&pending_bytes).unwrap();
+        assert!(!pending_manifest.is_restorable());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn load_latest_fails_without_commit_marker() {
         let dir = test_dir("missing-marker");
@@ -637,6 +670,130 @@ mod tests {
             .load_latest_manifest(&RunId("run-1".into()))
             .unwrap_err();
         assert!(matches!(err, CheckpointError::MissingCommitMarker { .. }));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn newer_partial_checkpoint_does_not_replace_previous_committed_checkpoint() {
+        let dir = test_dir("newer-partial-does-not-win");
+        let store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+        let run_id = RunId("run-partial".into());
+        let worker_id = WorkerId("worker-a".into());
+
+        let mut checkpoint_1 =
+            CheckpointRecord::new(run_id.clone(), CheckpointId("ckpt-1".into()), 10, 1000);
+        store
+            .write_artifact(
+                &mut checkpoint_1,
+                worker_id.clone(),
+                "a.bin",
+                b"a",
+                "sum-a".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        store.commit_checkpoint(&mut checkpoint_1, 2000).unwrap();
+        let latest_after_commit = store.load_latest_manifest(&run_id).unwrap();
+        assert_eq!(latest_after_commit.checkpoint_id, "ckpt-1");
+
+        let mut checkpoint_2 =
+            CheckpointRecord::new(run_id.clone(), CheckpointId("ckpt-2".into()), 11, 3000);
+        store
+            .write_artifact(
+                &mut checkpoint_2,
+                worker_id,
+                "b.bin",
+                b"b",
+                "sum-b".into(),
+                "sha256".into(),
+                3001,
+            )
+            .unwrap();
+        store.write_pending_manifest(&checkpoint_2).unwrap();
+
+        let latest_after_newer_partial = store.load_latest_manifest(&run_id).unwrap();
+        assert_eq!(latest_after_newer_partial.checkpoint_id, "ckpt-1");
+        assert_eq!(latest_after_newer_partial.step, 10);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_missing_committed_marker_is_not_restorable() {
+        let dir = test_dir("missing-committed-marker");
+        let storage = LocalStorage::new(&dir).unwrap();
+        let store = CheckpointStore::new(storage.clone());
+        let run_id = RunId("run-marker".into());
+        let checkpoint_id = CheckpointId("ckpt-marker".into());
+        let worker_id = WorkerId("worker-z".into());
+        let mut record = CheckpointRecord::new(run_id.clone(), checkpoint_id.clone(), 5, 1000);
+
+        store
+            .write_artifact(
+                &mut record,
+                worker_id,
+                "state.bin",
+                b"state",
+                "sum".into(),
+                "sha256".into(),
+                1001,
+            )
+            .unwrap();
+        record
+            .transition_to(CheckpointState::Validating, 1002)
+            .unwrap();
+        record
+            .transition_to(CheckpointState::Committed, 1003)
+            .unwrap();
+        let committed_manifest = CheckpointManifest::from_record(&record, Some(1003)).unwrap();
+        storage
+            .put(
+                &checkpoint_manifest_committed(&run_id.0, &checkpoint_id.0),
+                &committed_manifest.to_json_bytes().unwrap(),
+            )
+            .unwrap();
+        storage
+            .put(&latest_pointer(&run_id.0), checkpoint_id.0.as_bytes())
+            .unwrap();
+
+        let err = store.load_latest_manifest(&run_id).unwrap_err();
+        assert!(matches!(err, CheckpointError::MissingCommitMarker { .. }));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn committed_checkpoint_survives_store_recreation() {
+        let dir = test_dir("survives-store-recreation");
+        let run_id = RunId("run-recreate".into());
+        let checkpoint_id = CheckpointId("ckpt-recreate".into());
+        let worker_id = WorkerId("worker-recreate".into());
+
+        {
+            let first_store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+            let mut record =
+                CheckpointRecord::new(run_id.clone(), checkpoint_id.clone(), 123, 1000);
+            first_store
+                .write_artifact(
+                    &mut record,
+                    worker_id.clone(),
+                    "tensor.bin",
+                    b"tensor",
+                    "sum".into(),
+                    "sha256".into(),
+                    1001,
+                )
+                .unwrap();
+            first_store.commit_checkpoint(&mut record, 2000).unwrap();
+        }
+
+        let second_store = CheckpointStore::new(LocalStorage::new(&dir).unwrap());
+        let latest = second_store.load_latest_manifest(&run_id).unwrap();
+        assert_eq!(latest.checkpoint_id, checkpoint_id.0);
+        assert_eq!(latest.step, 123);
+        assert!(latest.is_restorable());
+
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
