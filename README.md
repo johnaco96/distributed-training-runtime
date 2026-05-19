@@ -32,3 +32,47 @@ Rust Coordinator
         |
         v
 Storage / Workers / Checkpoints
+
+## Project status and roadmap
+
+Completed through **Phase 12 — S3-Compatible Storage**:
+
+- [x] Add object storage abstraction implementation.
+- [x] Support MinIO locally.
+- [x] Add S3-compatible checkpoint writes.
+- [x] Add S3-compatible checkpoint restore.
+- [x] Test local MinIO before real cloud storage.
+- [x] Document object key layout.
+
+Next up:
+
+### Phase 12.5 — Checkpoint Artifact Data Plane
+
+- Wire real checkpoint artifact bytes into the checkpoint flow.
+- Support worker-side artifact upload to the configured storage backend.
+- Support LocalStorage and S3Storage/MinIO backends.
+- Ensure ReportCheckpointArtifact metadata matches the actual stored object.
+- Validate:
+  - artifact exists
+  - size matches
+  - checksum matches
+  - checksum algorithm matches
+  - URI/key is backend-neutral
+- Reject CommitCheckpoint if required artifacts are missing or invalid.
+- Add LocalStorage artifact-byte roundtrip tests.
+- Add MinIO artifact-byte roundtrip tests.
+- Document artifact metadata vs artifact bytes clearly.
+
+### Phase 13 — Performance and Async I/O
+
+- Improve async read/write paths.
+- Add batching where useful.
+- Add concurrent checkpoint uploads.
+- Add dataset prefetching prototype.
+- Add backpressure limits.
+- Add timeout and retry behavior.
+
+Phase 13 should optimize the **real artifact byte path introduced in Phase 12.5**, not only metadata reporting.
+
+Coordinator artifact-byte upload via control-plane RPC remains intentionally out of scope until Phase 12.5 is implemented.
+
