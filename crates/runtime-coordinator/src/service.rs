@@ -276,12 +276,21 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 RenewShardLeaseError::EmptyWorldSize => {
                     failed_precondition("run world_size must be greater than zero")
                 }
-                RenewShardLeaseError::NotShardOwner => failed_precondition(format!(
-                    "worker {} is not the owner of shard {}",
-                    worker_id.value, shard_id.value
-                )),
-                RenewShardLeaseError::InvalidLeaseEpoch => failed_precondition(
-                    "stale lease epoch: request lease_epoch does not match current assignment",
+                RenewShardLeaseError::NotShardOwner => {
+                    warn!(run_id = %run_id.value, worker_id = %worker_id.value, shard_id = %shard_id.value, "non-owner shard lease renewal attempt rejected");
+                    failed_precondition(format!(
+                        "worker {} is not the owner of shard {}",
+                        worker_id.value, shard_id.value
+                    ))
+                }
+                RenewShardLeaseError::InvalidLeaseEpoch => {
+                    warn!(run_id = %run_id.value, worker_id = %worker_id.value, shard_id = %shard_id.value, lease_epoch = request.lease_epoch, "stale lease epoch in shard lease renewal");
+                    failed_precondition(
+                        "stale lease epoch: request lease_epoch does not match current assignment",
+                    )
+                }
+                RenewShardLeaseError::WorkerNotActive => failed_precondition(
+                    "worker must be active before renewing shard leases; heartbeat first to reactivate",
                 ),
             })?;
 
@@ -325,7 +334,6 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 request.is_complete,
             )
             .map_err(|error| {
-                warn!(run_id = %run_id.value, worker_id = %worker_id.value, shard_id = %shard_id.value, ?error, "shard progress update rejected");
                 match error {
                 ReportShardProgressError::RunNotFound => {
                     not_found(format!("run {} was not found", run_id.value))
@@ -342,13 +350,20 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 ReportShardProgressError::EmptyWorldSize => {
                     failed_precondition("run world_size must be greater than zero")
                 }
-                ReportShardProgressError::NotShardOwner => failed_precondition(format!(
-                    "worker {} is not the owner of shard {}",
-                    worker_id.value, shard_id.value
-                )),
+                ReportShardProgressError::NotShardOwner => {
+                    warn!(run_id = %run_id.value, worker_id = %worker_id.value, shard_id = %shard_id.value, "non-owner shard progress report rejected");
+                    failed_precondition(format!(
+                        "worker {} is not the owner of shard {}",
+                        worker_id.value, shard_id.value
+                    ))
+                }
                 ReportShardProgressError::InvalidLeaseEpoch => {
+                    warn!(run_id = %run_id.value, worker_id = %worker_id.value, shard_id = %shard_id.value, lease_epoch = request.lease_epoch, "stale lease epoch in shard progress report");
                     failed_precondition("stale lease epoch: request lease_epoch does not match current assignment")
                 }
+                ReportShardProgressError::WorkerNotActive => failed_precondition(
+                    "worker must be active before reporting shard progress; heartbeat first to reactivate",
+                ),
             }
             })?;
 
