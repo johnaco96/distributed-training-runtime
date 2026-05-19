@@ -19,13 +19,16 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const WORKER_FAILURE_INTERVAL: Duration = Duration::from_secs(90);
 const SHARD_LEASE_DURATION: Duration = Duration::from_secs(30);
 
+use crate::persistence::SqliteMetadataStore;
+
 /// Shared coordinator state.
 ///
 /// This is intentionally in-memory only for the MVP coordinator. It is not
 /// persisted and will be lost when the process exits.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CoordinatorState {
     inner: RwLock<CoordinatorStateInner>,
+    metadata_store: Option<SqliteMetadataStore>,
     next_run_id: AtomicU64,
     next_worker_id: AtomicU64,
     next_dataset_id: AtomicU64,
@@ -257,7 +260,58 @@ pub enum ReportShardProgressError {
     InvalidLeaseEpoch,
 }
 
+impl Default for CoordinatorState {
+    fn default() -> Self {
+        Self {
+            inner: RwLock::new(CoordinatorStateInner::default()),
+            metadata_store: None,
+            next_run_id: AtomicU64::new(0),
+            next_worker_id: AtomicU64::new(0),
+            next_dataset_id: AtomicU64::new(0),
+            next_shard_id: AtomicU64::new(0),
+            next_checkpoint_id: AtomicU64::new(0),
+        }
+    }
+}
+
 impl CoordinatorState {
+    pub fn with_metadata_store(metadata_store: SqliteMetadataStore) -> Self {
+        Self {
+            metadata_store: Some(metadata_store),
+            ..Self::default()
+        }
+    }
+
+    fn persist_run(&self, run: &RunRecord) {
+        if let Some(store) = &self.metadata_store {
+            store.save_run(run).expect("persist run");
+        }
+    }
+    fn persist_worker(&self, worker: &WorkerRecord) {
+        if let Some(store) = &self.metadata_store {
+            store.save_worker(worker).expect("persist worker");
+        }
+    }
+    fn persist_dataset(&self, dataset: &DatasetRecord) {
+        if let Some(store) = &self.metadata_store {
+            store.save_dataset(dataset).expect("persist dataset");
+        }
+    }
+    fn persist_checkpoint(&self, run_id: &str, idem: &str, rec: &CoordinatorCheckpointRecord) {
+        if let Some(store) = &self.metadata_store {
+            store
+                .save_checkpoint(run_id, idem, rec)
+                .expect("persist checkpoint");
+        }
+    }
+    fn persist_artifact(&self, run_id: &str, checkpoint_id: &str, artifact: &ArtifactRecord) {
+        if let Some(store) = &self.metadata_store {
+            store
+                .save_checkpoint_artifact(run_id, checkpoint_id, artifact)
+                .expect("persist artifact");
+        }
+    }
+
     pub fn begin_checkpoint(
         &self,
         run_id: String,
@@ -423,6 +477,10 @@ impl CoordinatorState {
             )
             .map_err(map_checkpoint_error)?;
         let response = record.clone();
+        if let Some(last) = response.checkpoint.artifacts.last() {
+            self.persist_artifact(&run_id, &checkpoint_id, last);
+        }
+        self.persist_checkpoint(&run_id, "", &response);
         if !idempotency_key.is_empty() {
             inner
                 .checkpoint_artifact_idempotency_keys
@@ -501,6 +559,15 @@ impl CoordinatorState {
             });
             run.latest_checkpoint_state = CheckpointState::Committed as i32;
         }
+        if let Some(store) = &self.metadata_store {
+            store
+                .mark_checkpoint_committed(
+                    &run_id,
+                    &response.checkpoint.checkpoint_id.0,
+                    committed_at_millis,
+                )
+                .expect("mark committed");
+        }
         Ok(CommitCheckpointResult {
             record: response,
             committed_at_millis,
@@ -515,6 +582,15 @@ impl CoordinatorState {
             return Err(GetLatestCheckpointError::InvalidInput(
                 "run_id must be non-empty",
             ));
+        }
+
+        if let Some(store) = &self.metadata_store {
+            if let Some(record) = store
+                .load_latest_checkpoint(&run_id)
+                .expect("load latest checkpoint")
+            {
+                return Ok(record);
+            }
         }
 
         let inner = self.inner.read().expect("coordinator state lock poisoned");
@@ -579,7 +655,8 @@ impl CoordinatorState {
                 .run_idempotency_keys
                 .insert(request.idempotency_key, run_id.clone());
         }
-        inner.runs.insert(run_id.clone(), record);
+        inner.runs.insert(run_id.clone(), record.clone());
+        self.persist_run(&record);
 
         RegisteredRun {
             run_id: RunId { value: run_id },
@@ -710,6 +787,7 @@ impl CoordinatorState {
                 .insert(idempotency_key, dataset_id.clone());
         }
 
+        self.persist_dataset(&record);
         Some(RegisteredDataset {
             dataset_id: DatasetId { value: dataset_id },
             accepted_shard_count,
