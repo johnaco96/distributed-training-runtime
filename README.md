@@ -126,3 +126,10 @@ Next planned step: **Phase 15 observability**.
 Next planned step: **Phase 16 scaling tests**.
 
 See `docs/observability.md` for current scope and usage.
+
+
+### Phase 16 — Scaling tests (started)
+
+- [x] Phase 16A local scaling benchmark command complete (`runtime-bench scaling-workers` for `1,2,4,8,16`).
+- [ ] Simulated larger worker-count scaling runs pending.
+- Local coordinator benchmark scope only; no multi-machine/distributed production claims.

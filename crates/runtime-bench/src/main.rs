@@ -2,7 +2,8 @@
 
 use clap::{Parser, Subcommand};
 use runtime_bench::{
-    run_checkpoint_restore, run_checkpoint_write, run_dataset_read, run_worker_rpc, write_outputs,
+    parse_workers_list, run_checkpoint_restore, run_checkpoint_write, run_dataset_read,
+    run_scaling_workers, run_worker_rpc, write_outputs, write_outputs_many,
 };
 use std::path::PathBuf;
 
@@ -64,7 +65,20 @@ enum Command {
         #[arg(long, default_value_t = false)]
         keep_data: bool,
     },
-
+    ScalingWorkers {
+        #[arg(long, default_value = "1,2,4,8,16")]
+        workers_list: String,
+        #[arg(long, default_value_t = 10)]
+        heartbeats: usize,
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long, default_value_t = true)]
+        start_coordinator: bool,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+    },
     WorkerRpc {
         #[arg(long, default_value_t = 8)]
         workers: usize,
@@ -83,7 +97,7 @@ enum Command {
 
 fn main() -> Result<(), String> {
     let cli = Cli::parse();
-    let (summary, csv, json) = match cli.cmd {
+    let (summaries, csv, json) = match cli.cmd {
         Command::DatasetRead {
             items,
             payload_bytes,
@@ -93,7 +107,13 @@ fn main() -> Result<(), String> {
             root,
             keep_data,
         } => (
-            run_dataset_read(items, payload_bytes, concurrency, root, keep_data)?,
+            vec![run_dataset_read(
+                items,
+                payload_bytes,
+                concurrency,
+                root,
+                keep_data,
+            )?],
             out_csv,
             out_json,
         ),
@@ -106,7 +126,13 @@ fn main() -> Result<(), String> {
             root,
             keep_data,
         } => (
-            run_checkpoint_write(artifacts, payload_bytes, concurrency, root, keep_data)?,
+            vec![run_checkpoint_write(
+                artifacts,
+                payload_bytes,
+                concurrency,
+                root,
+                keep_data,
+            )?],
             out_csv,
             out_json,
         ),
@@ -120,17 +146,32 @@ fn main() -> Result<(), String> {
             root,
             keep_data,
         } => (
-            run_checkpoint_restore(
+            vec![run_checkpoint_restore(
                 iterations,
                 artifacts,
                 payload_bytes,
                 concurrency,
                 root,
                 keep_data,
-            )?,
+            )?],
             out_csv,
             out_json,
         ),
+        Command::ScalingWorkers {
+            workers_list,
+            heartbeats,
+            addr,
+            start_coordinator,
+            out_csv,
+            out_json,
+        } => {
+            let worker_counts = parse_workers_list(&workers_list)?;
+            (
+                run_scaling_workers(&worker_counts, heartbeats, addr, start_coordinator)?,
+                out_csv,
+                out_json,
+            )
+        }
         Command::WorkerRpc {
             workers,
             heartbeats,
@@ -139,13 +180,40 @@ fn main() -> Result<(), String> {
             out_csv,
             out_json,
         } => (
-            run_worker_rpc(workers, heartbeats, addr, start_coordinator)?,
+            vec![run_worker_rpc(
+                workers,
+                heartbeats,
+                addr,
+                start_coordinator,
+            )?],
             out_csv,
             out_json,
         ),
     };
-    println!("benchmark={} ops={} success={} fail={} failure_rate={:.4} bytes={} elapsed_ms={:.3} mb_per_sec={:.3} p50={:.3} p90={:.3} p99={:.3} retries={}", summary.benchmark, summary.operation_count, summary.success_count, summary.failure_count, summary.failure_rate, summary.total_bytes, summary.elapsed_ms, summary.mb_per_sec, summary.p50_latency_ms, summary.p90_latency_ms, summary.p99_latency_ms, summary.retry_count);
-    write_outputs(&summary, csv.as_deref(), json.as_deref())?;
+
+    for summary in &summaries {
+        println!(
+            "benchmark={} ops={} success={} fail={} failure_rate={:.4} bytes={} elapsed_ms={:.3} mb_per_sec={:.3} p50={:.3} p90={:.3} p99={:.3} retries={}",
+            summary.benchmark,
+            summary.operation_count,
+            summary.success_count,
+            summary.failure_count,
+            summary.failure_rate,
+            summary.total_bytes,
+            summary.elapsed_ms,
+            summary.mb_per_sec,
+            summary.p50_latency_ms,
+            summary.p90_latency_ms,
+            summary.p99_latency_ms,
+            summary.retry_count
+        );
+    }
+
+    if summaries.len() == 1 {
+        write_outputs(&summaries[0], csv.as_deref(), json.as_deref())?;
+    } else {
+        write_outputs_many(&summaries, csv.as_deref(), json.as_deref())?;
+    }
     Ok(())
 }
 
@@ -153,6 +221,29 @@ fn main() -> Result<(), String> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn scaling_workers_subcommand_parses() {
+        let cli = Cli::parse_from([
+            "runtime-bench",
+            "scaling-workers",
+            "--workers-list",
+            "1,2,4,8,16",
+            "--heartbeats",
+            "10",
+        ]);
+        match cli.cmd {
+            Command::ScalingWorkers {
+                workers_list,
+                heartbeats,
+                ..
+            } => {
+                assert_eq!(workers_list, "1,2,4,8,16");
+                assert_eq!(heartbeats, 10);
+            }
+            _ => panic!("expected scaling-workers subcommand"),
+        }
+    }
 
     #[test]
     fn worker_rpc_subcommand_parses() {

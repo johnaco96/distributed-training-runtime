@@ -9,6 +9,9 @@ Phase 14A adds a **local-only** benchmark harness via `runtime-bench`.
 - Local coordinator RPC overhead benchmark for run/worker registration and worker heartbeats.
 
 ## Commands
+- `cargo run -p runtime-bench -- scaling-workers`
+- `cargo run -p runtime-bench -- scaling-workers --workers-list 1,2,4,8,16 --heartbeats 10`
+- `cargo run -p runtime-bench -- scaling-workers --out-csv scaling.csv`
 - `cargo run -p runtime-bench -- worker-rpc --workers 8 --heartbeats 10`
 - `cargo run -p runtime-bench -- worker-rpc --workers 2 --heartbeats 2 --addr 127.0.0.1:50051 --start-coordinator false`
 - `cargo run -p runtime-bench -- dataset-read --items 128 --payload-bytes 65536 --concurrency 16`
@@ -47,3 +50,12 @@ It reports operation count, success/failure, failure rate, elapsed time, p50/p90
 - No production/distributed scaling claims.
 
 Do not commit generated benchmark output files.
+
+## Scaling workers benchmark (Phase 16A)
+`scaling-workers` runs the local coordinator `worker-rpc` flow at worker counts `1,2,4,8,16` by default.
+
+- Local coordinator scaling only (single-machine benchmark scope).
+- Reports one summary line per worker count.
+- Uses the same metrics fields as `worker-rpc` (ops/success/failure/failure_rate/elapsed/latency/retries).
+- Throughput fields remain control-plane values (`total_bytes=0`, `mb_per_sec=0.0`).
+- Do **not** claim hundreds/thousands of workers or production scale until those counts are actually benchmarked.

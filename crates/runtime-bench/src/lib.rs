@@ -326,6 +326,90 @@ pub fn run_checkpoint_restore(
     })
 }
 
+pub fn scaling_benchmark_name(workers: usize) -> String {
+    format!("worker-rpc-{workers}-workers")
+}
+
+pub fn parse_workers_list(input: &str) -> Result<Vec<usize>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("workers list cannot be empty".into());
+    }
+    trimmed
+        .split(',')
+        .map(|part| {
+            let value = part.trim();
+            if value.is_empty() {
+                return Err("workers list cannot contain empty values".to_string());
+            }
+            let workers: isize = value
+                .parse()
+                .map_err(|_| format!("invalid worker count '{value}'"))?;
+            if workers <= 0 {
+                return Err(format!("worker count must be > 0, got {workers}"));
+            }
+            Ok(workers as usize)
+        })
+        .collect()
+}
+
+pub fn run_worker_rpc_with_name(
+    workers: usize,
+    heartbeats: usize,
+    addr: Option<String>,
+    start_coordinator: bool,
+    benchmark_name: impl Into<String>,
+) -> Result<BenchmarkSummary, String> {
+    let mut summary = run_worker_rpc(workers, heartbeats, addr, start_coordinator)?;
+    summary.benchmark = benchmark_name.into();
+    Ok(summary)
+}
+
+pub fn run_scaling_workers(
+    worker_counts: &[usize],
+    heartbeats: usize,
+    addr: Option<String>,
+    start_coordinator: bool,
+) -> Result<Vec<BenchmarkSummary>, String> {
+    worker_counts
+        .iter()
+        .enumerate()
+        .map(|(index, workers)| {
+            run_worker_rpc_with_name(
+                *workers,
+                heartbeats,
+                addr.clone(),
+                if index == 0 { start_coordinator } else { false },
+                scaling_benchmark_name(*workers),
+            )
+        })
+        .collect()
+}
+
+pub fn write_outputs_many(
+    summaries: &[BenchmarkSummary],
+    csv: Option<&Path>,
+    json: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(path) = csv {
+        let mut body = String::from(BenchmarkSummary::csv_header());
+        for summary in summaries {
+            body.push('\n');
+            body.push_str(&summary.to_csv_row());
+        }
+        body.push('\n');
+        fs::write(path, body).map_err(|e| e.to_string())?;
+    }
+    if let Some(path) = json {
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(summaries).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn write_outputs(
     summary: &BenchmarkSummary,
     csv: Option<&Path>,
@@ -416,6 +500,46 @@ mod tests {
     fn checkpoint_restore_small() {
         let s = run_checkpoint_restore(3, 2, 128, 2, None, false).unwrap();
         assert_eq!(s.operation_count, 3);
+    }
+
+    #[test]
+    fn parse_workers_list_ok() {
+        assert_eq!(
+            parse_workers_list("1,2,4,8,16").unwrap(),
+            vec![1, 2, 4, 8, 16]
+        );
+    }
+
+    #[test]
+    fn parse_workers_list_rejects_invalid() {
+        assert!(parse_workers_list("").is_err());
+        assert!(parse_workers_list("0").is_err());
+        assert!(parse_workers_list("-1").is_err());
+        assert!(parse_workers_list("abc").is_err());
+        assert!(parse_workers_list("1,,2").is_err());
+    }
+
+    #[test]
+    fn write_outputs_many_writes_multiple_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("bench.csv");
+        let json_path = dir.path().join("bench.json");
+        let summaries = vec![
+            BenchmarkSummary::from_samples("worker-rpc-1-workers", &[], 1.0),
+            BenchmarkSummary::from_samples("worker-rpc-2-workers", &[], 2.0),
+        ];
+        write_outputs_many(&summaries, Some(&csv_path), Some(&json_path)).unwrap();
+        let csv = fs::read_to_string(csv_path).unwrap();
+        assert!(csv.contains("worker-rpc-1-workers"));
+        assert!(csv.contains("worker-rpc-2-workers"));
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(json_path).unwrap()).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scaling_summary_name() {
+        assert_eq!(scaling_benchmark_name(16), "worker-rpc-16-workers");
     }
 
     #[test]
