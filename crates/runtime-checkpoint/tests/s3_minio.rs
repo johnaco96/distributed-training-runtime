@@ -2,8 +2,11 @@
 
 #[cfg(feature = "s3")]
 mod tests {
-    use runtime_checkpoint::{CheckpointId, CheckpointRecord, CheckpointStore, RunId, WorkerId};
-    use runtime_storage::{S3Storage, S3StorageConfig};
+    use runtime_checkpoint::{
+        upload_checkpoint_artifacts_concurrently, CheckpointArtifactUpload, CheckpointId,
+        CheckpointRecord, CheckpointStore, ChecksumAlgorithm, RunId, WorkerId,
+    };
+    use runtime_storage::{S3Storage, S3StorageConfig, StorageKey, StorageOperationPolicy};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn env_required(name: &str) -> String {
@@ -46,7 +49,7 @@ mod tests {
         })
         .expect("create s3 storage");
 
-        let store = CheckpointStore::new(storage);
+        let store = CheckpointStore::new(storage.clone());
         let run_id = RunId("run-minio".into());
         let checkpoint_id = CheckpointId("ckpt-minio".into());
         let worker_id = WorkerId("worker-0".into());
@@ -55,17 +58,41 @@ mod tests {
         store
             .write_pending_manifest(&record)
             .expect("write pending manifest");
-        let artifact = store
-            .write_artifact(
-                &mut record,
-                worker_id,
-                "model.bin",
-                b"minio-bytes",
-                "sum".into(),
-                "sha256".into(),
-                1001,
-            )
-            .expect("write artifact");
+        let artifacts = upload_checkpoint_artifacts_concurrently(
+            &storage,
+            vec![
+                CheckpointArtifactUpload {
+                    worker_id: worker_id.clone(),
+                    artifact_name: "model.bin".into(),
+                    storage_key: StorageKey::new(format!(
+                        "runs/{}/checkpoints/{}/workers/{}/model.bin",
+                        run_id.0, checkpoint_id.0, worker_id.0
+                    ))
+                    .unwrap(),
+                    bytes: b"minio-bytes".to_vec(),
+                    checksum_algorithm: ChecksumAlgorithm::Sha256,
+                },
+                CheckpointArtifactUpload {
+                    worker_id: worker_id.clone(),
+                    artifact_name: "optim.bin".into(),
+                    storage_key: StorageKey::new(format!(
+                        "runs/{}/checkpoints/{}/workers/{}/optim.bin",
+                        run_id.0, checkpoint_id.0, worker_id.0
+                    ))
+                    .unwrap(),
+                    bytes: b"minio-optim".to_vec(),
+                    checksum_algorithm: ChecksumAlgorithm::Sha256,
+                },
+            ],
+            &StorageOperationPolicy {
+                max_concurrent_operations: 2,
+                ..Default::default()
+            },
+        )
+        .expect("upload artifacts");
+        for a in artifacts.clone() {
+            record.add_artifact(a, 1001).expect("add artifact");
+        }
         let committed = store
             .commit_checkpoint(&mut record, 2000)
             .expect("commit checkpoint");
@@ -73,8 +100,6 @@ mod tests {
 
         assert_eq!(latest.checkpoint_id, committed.checkpoint_id);
         assert_eq!(latest.checkpoint_id, checkpoint_id.0);
-        assert_eq!(latest.artifacts.len(), 1);
-        assert_eq!(latest.artifacts[0].artifact_name, artifact.artifact_name);
-        assert_eq!(latest.artifacts[0].storage_key, artifact.storage_key);
+        assert_eq!(latest.artifacts.len(), 2);
     }
 }
