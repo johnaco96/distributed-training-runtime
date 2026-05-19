@@ -5,7 +5,7 @@ use std::sync::Arc;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::state::{
     BeginCheckpointError, CommitCheckpointError, CoordinatorState, GetLatestCheckpointError,
@@ -39,6 +39,22 @@ impl CoordinatorServiceImpl {
             self.metrics.set_stale_workers(stale);
         }
     }
+}
+
+fn invalid_argument(message: impl Into<String>) -> Status {
+    Status::invalid_argument(message.into())
+}
+
+fn not_found(message: impl Into<String>) -> Status {
+    Status::not_found(message.into())
+}
+
+fn failed_precondition(message: impl Into<String>) -> Status {
+    Status::failed_precondition(message.into())
+}
+
+fn already_exists(message: impl Into<String>) -> Status {
+    Status::already_exists(message.into())
 }
 
 #[tonic::async_trait]
@@ -101,7 +117,13 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let heartbeat = self
             .state
             .record_heartbeat(&run_id, &worker_id)
-            .ok_or_else(|| Status::not_found("run or worker was not found"))?;
+            .ok_or_else(|| {
+                warn!(run_id = %run_id.value, worker_id = %worker_id.value, "heartbeat rejected for unknown worker");
+                not_found(format!(
+                    "worker {} was not found under run {}",
+                    worker_id.value, run_id.value
+                ))
+            })?;
 
         let response = HeartbeatResponse {
             state: heartbeat.state,
@@ -158,16 +180,16 @@ impl CoordinatorService for CoordinatorServiceImpl {
             .get_shard_assignments(&run_id, &worker_id, &dataset_id)
             .map_err(|error| match error {
                 GetShardAssignmentsError::RunNotFound => {
-                    Status::not_found(format!("run {} was not found", run_id.value))
+                    not_found(format!("run {} was not found", run_id.value))
                 }
                 GetShardAssignmentsError::WorkerNotFound => {
-                    Status::not_found(format!("worker {} was not found", worker_id.value))
+                    not_found(format!("worker {} was not found", worker_id.value))
                 }
                 GetShardAssignmentsError::DatasetNotFound => {
-                    Status::not_found(format!("dataset {} was not found", dataset_id.value))
+                    not_found(format!("dataset {} was not found", dataset_id.value))
                 }
                 GetShardAssignmentsError::EmptyWorldSize => {
-                    Status::failed_precondition("run world_size must be greater than zero")
+                    failed_precondition("run world_size must be greater than zero")
                 }
             })?;
 
@@ -228,24 +250,24 @@ impl CoordinatorService for CoordinatorServiceImpl {
             .renew_shard_lease(&run_id, &worker_id, &shard_id, request.lease_epoch)
             .map_err(|error| match error {
                 RenewShardLeaseError::RunNotFound => {
-                    Status::not_found(format!("run {} was not found", run_id.value))
+                    not_found(format!("run {} was not found", run_id.value))
                 }
                 RenewShardLeaseError::WorkerNotFound => {
-                    Status::not_found(format!("worker {} was not found", worker_id.value))
+                    not_found(format!("worker {} was not found", worker_id.value))
                 }
                 RenewShardLeaseError::ShardNotFound => {
-                    Status::not_found(format!("shard {} was not found", shard_id.value))
+                    not_found(format!("shard {} was not found", shard_id.value))
                 }
                 RenewShardLeaseError::EmptyWorldSize => {
-                    Status::failed_precondition("run world_size must be greater than zero")
+                    failed_precondition("run world_size must be greater than zero")
                 }
-                RenewShardLeaseError::NotShardOwner => Status::failed_precondition(format!(
+                RenewShardLeaseError::NotShardOwner => failed_precondition(format!(
                     "worker {} is not the owner of shard {}",
                     worker_id.value, shard_id.value
                 )),
-                RenewShardLeaseError::InvalidLeaseEpoch => {
-                    Status::failed_precondition("lease_epoch does not match current assignment")
-                }
+                RenewShardLeaseError::InvalidLeaseEpoch => failed_precondition(
+                    "stale lease epoch: request lease_epoch does not match current assignment",
+                ),
             })?;
 
         let response = RenewShardLeaseResponse {
@@ -287,29 +309,32 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 request.progress_offset,
                 request.is_complete,
             )
-            .map_err(|error| match error {
+            .map_err(|error| {
+                warn!(run_id = %run_id.value, worker_id = %worker_id.value, shard_id = %shard_id.value, ?error, "shard progress update rejected");
+                match error {
                 ReportShardProgressError::RunNotFound => {
-                    Status::not_found(format!("run {} was not found", run_id.value))
+                    not_found(format!("run {} was not found", run_id.value))
                 }
                 ReportShardProgressError::WorkerNotFound => {
-                    Status::not_found(format!("worker {} was not found", worker_id.value))
+                    not_found(format!("worker {} was not found", worker_id.value))
                 }
                 ReportShardProgressError::DatasetNotFound => {
-                    Status::not_found(format!("dataset {} was not found", dataset_id.value))
+                    not_found(format!("dataset {} was not found", dataset_id.value))
                 }
                 ReportShardProgressError::ShardNotFound => {
-                    Status::not_found(format!("shard {} was not found", shard_id.value))
+                    not_found(format!("shard {} was not found", shard_id.value))
                 }
                 ReportShardProgressError::EmptyWorldSize => {
-                    Status::failed_precondition("run world_size must be greater than zero")
+                    failed_precondition("run world_size must be greater than zero")
                 }
-                ReportShardProgressError::NotShardOwner => Status::failed_precondition(format!(
+                ReportShardProgressError::NotShardOwner => failed_precondition(format!(
                     "worker {} is not the owner of shard {}",
                     worker_id.value, shard_id.value
                 )),
                 ReportShardProgressError::InvalidLeaseEpoch => {
-                    Status::failed_precondition("lease_epoch does not match current assignment")
+                    failed_precondition("stale lease epoch: request lease_epoch does not match current assignment")
                 }
+            }
             })?;
 
         let response = ReportShardProgressResponse {
@@ -356,7 +381,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
                     Status::invalid_argument("worker_id must be non-empty")
                 }
                 BeginCheckpointError::CheckpointConflict => {
-                    Status::already_exists("checkpoint_id already exists with conflicting metadata")
+                    already_exists("checkpoint_id already exists with conflicting metadata")
                 }
             })?;
         let created_at = std::time::UNIX_EPOCH
@@ -406,18 +431,16 @@ impl CoordinatorService for CoordinatorServiceImpl {
             )
             .map_err(|error| match error {
                 ReportCheckpointArtifactError::RunNotFound => {
-                    Status::not_found(format!("run {} was not found", run_id.value))
+                    not_found(format!("run {} was not found", run_id.value))
                 }
                 ReportCheckpointArtifactError::WorkerNotFound => {
-                    Status::not_found(format!("worker {} was not found", worker_id.value))
+                    not_found(format!("worker {} was not found", worker_id.value))
                 }
                 ReportCheckpointArtifactError::CheckpointNotFound => {
-                    Status::not_found(format!("checkpoint {} was not found", checkpoint_id.value))
+                    not_found(format!("checkpoint {} was not found", checkpoint_id.value))
                 }
-                ReportCheckpointArtifactError::InvalidInput(message) => {
-                    Status::invalid_argument(message)
-                }
-                ReportCheckpointArtifactError::InvalidState => Status::failed_precondition(
+                ReportCheckpointArtifactError::InvalidInput(message) => invalid_argument(message),
+                ReportCheckpointArtifactError::InvalidState => failed_precondition(
                     "checkpoint is in terminal state or cannot accept artifacts",
                 ),
             })?;

@@ -128,7 +128,7 @@ Next planned step: **Phase 16 scaling tests**.
 See `docs/observability.md` for current scope and usage.
 
 
-### Phase 16 — Scaling tests (in validation)
+### Phase 16 — Scaling tests (complete)
 
 - [x] Phase 16A local scaling benchmark command complete (`runtime-bench scaling-workers` for `1,2,4,8,16`).
 - [x] Phase 16B simulated larger worker-count mode implemented (`--simulate-large`, default `32,64,128`, local logical-worker simulation).
@@ -136,5 +136,16 @@ See `docs/observability.md` for current scope and usage.
 - Local coordinator benchmark scope only; no multi-machine/distributed production claims.
 - Phase 16 remains pending full local validation after pull until all requested validation commands pass in a local environment.
 
-- [ ] Phase 16 full completion pending fresh local validation after latest pull.
-- Next planned step after Phase 16 validation: **Phase 17 hardening**.
+- [x] Phase 16 full completion validated locally (including simulated-large runs).
+- Next planned step: **Phase 17 hardening**.
+
+
+### Phase 17 — Hardening (started)
+
+- [x] Phase 17A coordinator error handling consistency + compatibility/version notes documentation complete.
+- [ ] Retries hardening pending.
+- [ ] Leases hardening follow-up pending.
+- [ ] Idempotency hardening follow-up pending.
+- [ ] Checkpoint cleanup pending.
+- [ ] Versioned protocol messages and negotiation pending.
+- Scope note: protocol compatibility guidance is documented; runtime negotiation is not implemented yet.
