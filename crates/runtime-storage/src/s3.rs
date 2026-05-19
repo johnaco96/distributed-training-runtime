@@ -1,10 +1,13 @@
 use crate::object_key::{normalize_key_prefix, storage_key_to_object_key};
-use crate::{StorageBackend, StorageError, StorageKey};
+use crate::{
+    run_with_timeout_retry, StorageBackend, StorageError, StorageKey, StorageOperationPolicy,
+};
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone)]
 pub struct S3StorageConfig {
@@ -43,10 +46,14 @@ pub struct S3Storage {
     bucket: String,
     key_prefix: Option<String>,
     rt: std::sync::Arc<tokio::runtime::Runtime>,
+    policy: StorageOperationPolicy,
+    limiter: std::sync::Arc<Semaphore>,
 }
 
 impl S3Storage {
     pub fn new(config: S3StorageConfig) -> Result<Self, StorageError> {
+        let policy = StorageOperationPolicy::default();
+        policy.validate()?;
         config.validate()?;
         let key_prefix = config.normalized_key_prefix()?;
         let rt = tokio::runtime::Runtime::new().map_err(StorageError::Io)?;
@@ -75,6 +82,8 @@ impl S3Storage {
             bucket: config.bucket,
             key_prefix,
             rt: std::sync::Arc::new(rt),
+            limiter: std::sync::Arc::new(Semaphore::new(policy.max_concurrent_operations)),
+            policy,
         })
     }
 
@@ -87,14 +96,23 @@ impl StorageBackend for S3Storage {
     fn put(&self, key: &StorageKey, bytes: &[u8]) -> Result<(), StorageError> {
         let object_key = self.object_key_for(key)?;
         self.rt.block_on(async {
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(object_key)
-                .body(ByteStream::from(bytes.to_vec()))
-                .send()
-                .await
-                .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
+            run_with_timeout_retry(&self.policy, "s3-put", || async {
+                let _permit = self
+                    .limiter
+                    .acquire()
+                    .await
+                    .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
+                self.client
+                    .put_object()
+                    .bucket(&self.bucket)
+                    .key(object_key.clone())
+                    .body(ByteStream::from(bytes.to_vec()))
+                    .send()
+                    .await
+                    .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
+                Ok(())
+            })
+            .await?;
             Ok(())
         })
     }

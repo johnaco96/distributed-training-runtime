@@ -35,7 +35,7 @@ Storage / Workers / Checkpoints
 
 ## Project status and roadmap
 
-Completed through **Phase 12 — S3-Compatible Storage**:
+Completed through **Phase 12.5 — Checkpoint Artifact Data Plane foundation**:
 
 - [x] Add object storage abstraction implementation.
 - [x] Support MinIO locally.
@@ -43,8 +43,6 @@ Completed through **Phase 12 — S3-Compatible Storage**:
 - [x] Add S3-compatible checkpoint restore.
 - [x] Test local MinIO before real cloud storage.
 - [x] Document object key layout.
-
-Next up:
 
 ### Phase 12.5 — Checkpoint Artifact Data Plane
 
@@ -69,7 +67,7 @@ Phase 12.5A foundation status:
 - Add MinIO artifact-byte roundtrip tests.
 - Document artifact metadata vs artifact bytes clearly.
 
-### Phase 13 — Performance and Async I/O
+### Phase 13 — Performance and Async I/O (started)
 
 - Improve async read/write paths.
 - Add batching where useful.
@@ -77,6 +75,15 @@ Phase 12.5A foundation status:
 - Add dataset prefetching prototype.
 - Add backpressure limits.
 - Add timeout and retry behavior.
+
+#### Phase 13A — Timeout/Retry/Backpressure foundation (in progress)
+
+- [x] Add reusable storage operation policy defaults.
+- [x] Add retry helper with capped exponential backoff and retryability guard.
+- [x] Add async timeout helper for async-capable storage operations.
+- [x] Add concurrency/backpressure primitive for storage operations.
+- [ ] Wire full concurrent checkpoint uploads (later Phase 13 work).
+- [ ] Add dataset prefetching prototype (later Phase 13 work).
 
 Phase 13 should optimize the **real artifact byte path introduced in Phase 12.5**, not only metadata reporting.
 
