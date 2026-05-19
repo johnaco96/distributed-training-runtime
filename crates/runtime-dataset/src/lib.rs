@@ -137,7 +137,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
@@ -327,7 +328,7 @@ mod tests {
 
     #[test]
     fn prefetch_respects_concurrency_limit() {
-        let storage = TrackingMemoryStorage::with_gate(5);
+        let storage = TrackingMemoryStorage::new_with_delay(Duration::from_millis(10));
         let mut items = Vec::new();
         for i in 0..5 {
             let key = StorageKey::new(format!("datasets/run-a/s{i}.bin")).unwrap();
@@ -352,78 +353,77 @@ mod tests {
 
     #[derive(Default, Clone)]
     struct TrackingMemoryStorage {
-        entries: Arc<Mutex<BTreeMap<StorageKey, Vec<u8>>>>,
-        state: Arc<(Mutex<GateState>, Condvar)>,
-        gate_target: usize,
+        entries: Arc<RwLock<BTreeMap<StorageKey, Vec<u8>>>>,
+        in_flight: Arc<AtomicUsize>,
+        max_seen: Arc<AtomicUsize>,
+        get_delay: Duration,
     }
 
-    #[derive(Default)]
-    struct GateState {
-        active: usize,
-        max_seen: usize,
-        entered: usize,
+    struct InFlightGuard<'a> {
+        in_flight: &'a AtomicUsize,
+    }
+
+    impl Drop for InFlightGuard<'_> {
+        fn drop(&mut self) {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     impl TrackingMemoryStorage {
-        fn with_gate(gate_target: usize) -> Self {
+        fn new_with_delay(get_delay: Duration) -> Self {
             Self {
-                gate_target,
+                get_delay,
                 ..Self::default()
             }
         }
 
         fn max_seen(&self) -> usize {
-            self.state.0.lock().unwrap().max_seen
+            self.max_seen.load(Ordering::SeqCst)
         }
     }
 
     impl StorageBackend for TrackingMemoryStorage {
         fn put(&self, key: &StorageKey, bytes: &[u8]) -> Result<(), StorageError> {
             self.entries
-                .lock()
+                .write()
                 .unwrap()
                 .insert(key.clone(), bytes.to_vec());
             Ok(())
         }
 
         fn get(&self, key: &StorageKey) -> Result<Vec<u8>, StorageError> {
-            static SPIN: AtomicUsize = AtomicUsize::new(0);
-            let (lock, cv) = &*self.state;
-            let mut st = lock.lock().unwrap();
-            st.active += 1;
-            st.entered += 1;
-            st.max_seen = st.max_seen.max(st.active);
-            if self.gate_target > 0 {
-                while st.entered < self.gate_target && st.active < self.gate_target {
-                    st = cv.wait(st).unwrap();
-                }
-                cv.notify_all();
+            let now_in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _guard = InFlightGuard {
+                in_flight: &self.in_flight,
+            };
+            let mut previous = self.max_seen.load(Ordering::SeqCst);
+            while now_in_flight > previous
+                && self
+                    .max_seen
+                    .compare_exchange(previous, now_in_flight, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                previous = self.max_seen.load(Ordering::SeqCst);
             }
-            drop(st);
-            for _ in 0..1000 {
-                let _ = SPIN.fetch_add(1, Ordering::Relaxed);
-            }
+            std::thread::sleep(self.get_delay);
             let out = self
                 .entries
-                .lock()
+                .read()
                 .unwrap()
                 .get(key)
                 .cloned()
                 .ok_or_else(|| StorageError::NotFound(key.clone()));
-            let mut st = lock.lock().unwrap();
-            st.active -= 1;
-            cv.notify_all();
             out
         }
 
         fn exists(&self, key: &StorageKey) -> Result<bool, StorageError> {
-            Ok(self.entries.lock().unwrap().contains_key(key))
+            Ok(self.entries.read().unwrap().contains_key(key))
         }
 
         fn list_prefix(&self, prefix: &StorageKey) -> Result<Vec<StorageKey>, StorageError> {
             Ok(self
                 .entries
-                .lock()
+                .read()
                 .unwrap()
                 .keys()
                 .filter(|k| k.as_str().starts_with(prefix.as_str()))
@@ -432,7 +432,7 @@ mod tests {
         }
 
         fn delete(&self, key: &StorageKey) -> Result<(), StorageError> {
-            self.entries.lock().unwrap().remove(key);
+            self.entries.write().unwrap().remove(key);
             Ok(())
         }
     }
