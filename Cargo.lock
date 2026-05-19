@@ -724,6 +724,7 @@ version = "0.1.0"
 name = "runtime-checkpoint"
 version = "0.1.0"
 dependencies = [
+ "runtime-storage",
  "serde",
  "serde_json",
 ]
