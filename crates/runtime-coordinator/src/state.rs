@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
+use runtime_checkpoint::{
+    CheckpointId as DomainCheckpointId, CheckpointRecord, RunId as DomainRunId,
+};
 use runtime_proto::runtime::v1::{
     CheckpointId, CheckpointState, DatasetId, DatasetMetadata, RegisterDatasetRequest,
     RegisterRunRequest, RegisterWorkerRequest, RunId, ShardId, ShardLeaseState, ShardMetadata,
@@ -26,6 +29,7 @@ pub struct CoordinatorState {
     next_worker_id: AtomicU64,
     next_dataset_id: AtomicU64,
     next_shard_id: AtomicU64,
+    next_checkpoint_id: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -37,6 +41,8 @@ struct CoordinatorStateInner {
     datasets_by_run: HashMap<String, HashMap<String, DatasetRecord>>,
     dataset_idempotency_keys: HashMap<String, String>,
     shard_progress: HashMap<ShardProgressKey, ShardProgressRecord>,
+    checkpoints_by_run: HashMap<String, HashMap<String, CoordinatorCheckpointRecord>>,
+    checkpoint_idempotency_keys: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,6 +182,20 @@ pub struct ReportedShardProgress {
     pub lease_state: i32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoordinatorCheckpointRecord {
+    pub checkpoint: CheckpointRecord,
+    pub initiated_by_worker_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BeginCheckpointError {
+    RunNotFound,
+    WorkerNotFound,
+    InvalidWorkerId,
+    CheckpointConflict,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GetShardAssignmentsError {
     RunNotFound,
@@ -206,6 +226,95 @@ pub enum ReportShardProgressError {
 }
 
 impl CoordinatorState {
+    pub fn begin_checkpoint(
+        &self,
+        run_id: String,
+        worker_id: String,
+        checkpoint_id: String,
+        step: u64,
+        idempotency_key: String,
+    ) -> Result<CoordinatorCheckpointRecord, BeginCheckpointError> {
+        if worker_id.trim().is_empty() {
+            return Err(BeginCheckpointError::InvalidWorkerId);
+        }
+        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
+        if !inner.runs.contains_key(&run_id) {
+            return Err(BeginCheckpointError::RunNotFound);
+        }
+        if !inner
+            .workers_by_run
+            .get(&run_id)
+            .is_some_and(|workers| workers.contains_key(&worker_id))
+        {
+            return Err(BeginCheckpointError::WorkerNotFound);
+        }
+
+        let scoped_idempotency_key = checkpoint_idempotency_key(&run_id, &idempotency_key);
+        if let Some(existing_checkpoint_id) =
+            idempotency_lookup(&inner.checkpoint_idempotency_keys, &scoped_idempotency_key)
+        {
+            let record = inner
+                .checkpoints_by_run
+                .get(&run_id)
+                .and_then(|records| records.get(&existing_checkpoint_id))
+                .cloned()
+                .expect("checkpoint idempotency key must reference an existing checkpoint");
+            return Ok(record);
+        }
+
+        let checkpoint_id = if checkpoint_id.trim().is_empty() {
+            self.generate_checkpoint_id()
+        } else {
+            checkpoint_id
+        };
+
+        if let Some(existing) = inner
+            .checkpoints_by_run
+            .get(&run_id)
+            .and_then(|records| records.get(&checkpoint_id))
+        {
+            if existing.initiated_by_worker_id == worker_id && existing.checkpoint.step == step {
+                return Ok(existing.clone());
+            }
+            return Err(BeginCheckpointError::CheckpointConflict);
+        }
+
+        let now_millis = now_millis();
+        let record = CoordinatorCheckpointRecord {
+            checkpoint: CheckpointRecord::new(
+                DomainRunId(run_id.clone()),
+                DomainCheckpointId(checkpoint_id.clone()),
+                step,
+                now_millis,
+            ),
+            initiated_by_worker_id: worker_id,
+        };
+        inner
+            .checkpoints_by_run
+            .entry(run_id.clone())
+            .or_default()
+            .insert(checkpoint_id.clone(), record.clone());
+
+        if !idempotency_key.is_empty() {
+            inner
+                .checkpoint_idempotency_keys
+                .insert(scoped_idempotency_key, checkpoint_id);
+        }
+        Ok(record)
+    }
+
+    pub fn get_checkpoint(
+        &self,
+        run_id: &RunId,
+        checkpoint_id: &str,
+    ) -> Option<CoordinatorCheckpointRecord> {
+        let inner = self.inner.read().expect("coordinator state lock poisoned");
+        inner
+            .checkpoints_by_run
+            .get(&run_id.value)
+            .and_then(|records| records.get(checkpoint_id))
+            .cloned()
+    }
     pub fn register_run(&self, request: RegisterRunRequest) -> RegisteredRun {
         let mut inner = self.inner.write().expect("coordinator state lock poisoned");
 
@@ -715,6 +824,10 @@ impl CoordinatorState {
         let id = self.next_shard_id.fetch_add(1, Ordering::Relaxed) + 1;
         format!("shard-{id}")
     }
+    fn generate_checkpoint_id(&self) -> String {
+        let id = self.next_checkpoint_id.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("checkpoint-{id}")
+    }
 
     fn shard_record(&self, shard: ShardMetadata, dataset_id: &str) -> ShardRecord {
         let shard_id = shard
@@ -806,6 +919,15 @@ fn worker_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
 
 fn dataset_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
     scoped_idempotency_key(run_id, idempotency_key)
+}
+fn checkpoint_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
+    scoped_idempotency_key(run_id, idempotency_key)
+}
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis() as u64
 }
 
 fn scoped_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
@@ -1199,6 +1321,73 @@ mod tests {
             record.latest_checkpoint_state,
             CheckpointState::Unspecified as i32
         );
+    }
+
+    #[test]
+    fn begin_checkpoint_requires_existing_run_and_worker() {
+        let state = CoordinatorState::default();
+        let err = state
+            .begin_checkpoint(
+                "missing".to_string(),
+                "worker-1".to_string(),
+                "c1".to_string(),
+                10,
+                String::new(),
+            )
+            .expect_err("missing run should fail");
+        assert_eq!(err, BeginCheckpointError::RunNotFound);
+
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let err = state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                "missing-worker".to_string(),
+                "c1".to_string(),
+                10,
+                String::new(),
+            )
+            .expect_err("missing worker should fail");
+        assert_eq!(err, BeginCheckpointError::WorkerNotFound);
+    }
+
+    #[test]
+    fn begin_checkpoint_generates_id_and_supports_idempotency() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker registration should succeed")
+            .worker_id;
+
+        let first = state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                String::new(),
+                55,
+                "idem-1".to_string(),
+            )
+            .expect("begin checkpoint should succeed");
+        assert_eq!(first.checkpoint.checkpoint_id.0, "checkpoint-1");
+        assert_eq!(
+            first.checkpoint.state,
+            runtime_checkpoint::CheckpointState::Initiated
+        );
+
+        let second = state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_id.value,
+                "different-checkpoint".to_string(),
+                77,
+                "idem-1".to_string(),
+            )
+            .expect("idempotent begin should return first");
+        assert_eq!(
+            second.checkpoint.checkpoint_id,
+            first.checkpoint.checkpoint_id
+        );
+        assert_eq!(second.checkpoint.step, first.checkpoint.step);
     }
 
     #[test]

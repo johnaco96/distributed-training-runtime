@@ -7,7 +7,8 @@ use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
 
 use crate::state::{
-    CoordinatorState, GetShardAssignmentsError, RenewShardLeaseError, ReportShardProgressError,
+    BeginCheckpointError, CoordinatorState, GetShardAssignmentsError, RenewShardLeaseError,
+    ReportShardProgressError,
 };
 
 #[derive(Clone, Debug)]
@@ -294,11 +295,53 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
     async fn begin_checkpoint(
         &self,
-        _request: Request<BeginCheckpointRequest>,
+        request: Request<BeginCheckpointRequest>,
     ) -> Result<Response<BeginCheckpointResponse>, Status> {
-        Err(Status::unimplemented(
-            "BeginCheckpoint is not implemented yet",
-        ))
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let worker_id = request
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+
+        let checkpoint = self
+            .state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_id.value.clone(),
+                request
+                    .checkpoint_id
+                    .map(|checkpoint_id| checkpoint_id.value)
+                    .unwrap_or_default(),
+                request.step,
+                request.idempotency_key,
+            )
+            .map_err(|error| match error {
+                BeginCheckpointError::RunNotFound => {
+                    Status::not_found(format!("run {} was not found", run_id.value))
+                }
+                BeginCheckpointError::WorkerNotFound => {
+                    Status::not_found(format!("worker {} was not found", worker_id.value))
+                }
+                BeginCheckpointError::InvalidWorkerId => {
+                    Status::invalid_argument("worker_id must be non-empty")
+                }
+                BeginCheckpointError::CheckpointConflict => {
+                    Status::already_exists("checkpoint_id already exists with conflicting metadata")
+                }
+            })?;
+        let created_at = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(checkpoint.checkpoint.created_at_millis);
+
+        Ok(Response::new(BeginCheckpointResponse {
+            checkpoint_id: Some(CheckpointId {
+                value: checkpoint.checkpoint.checkpoint_id.0,
+            }),
+            state: CheckpointState::Initiated as i32,
+            created_at: Some(created_at.into()),
+            artifact_specs: Vec::new(),
+        }))
     }
 
     async fn report_checkpoint_artifact(
@@ -1214,6 +1257,118 @@ mod tests {
             .expect_err("unknown shard should be missing");
 
         assert_eq!(error.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn begin_checkpoint_succeeds_for_existing_run_and_worker() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .expect("register worker should succeed")
+            .into_inner()
+            .worker_id
+            .expect("worker id should be set");
+
+        let response = service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(run_id),
+                worker_id: Some(worker_id),
+                checkpoint_id: Some(CheckpointId {
+                    value: "ckpt-explicit".to_string(),
+                }),
+                step: 9,
+                idempotency_key: "cp-key-1".to_string(),
+            }))
+            .await
+            .expect("begin checkpoint should succeed")
+            .into_inner();
+        assert_eq!(
+            response.checkpoint_id,
+            Some(CheckpointId {
+                value: "ckpt-explicit".to_string()
+            })
+        );
+        assert_eq!(response.state, CheckpointState::Initiated as i32);
+        assert!(response.created_at.is_some());
+        assert!(response.artifact_specs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn begin_checkpoint_returns_not_found_for_unknown_run_or_worker() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_err = service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(RunId {
+                    value: "missing".to_string(),
+                }),
+                worker_id: Some(WorkerId {
+                    value: "worker-1".to_string(),
+                }),
+                checkpoint_id: None,
+                step: 1,
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect_err("unknown run should fail");
+        assert_eq!(run_err.code(), tonic::Code::NotFound);
+
+        let run_id = create_run(&service).await;
+        let worker_err = service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(run_id),
+                worker_id: Some(WorkerId {
+                    value: "missing-worker".to_string(),
+                }),
+                checkpoint_id: None,
+                step: 1,
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect_err("unknown worker should fail");
+        assert_eq!(worker_err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn begin_checkpoint_generates_id_and_is_idempotent_by_key() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .expect("register worker should succeed")
+            .into_inner()
+            .worker_id
+            .expect("worker id should be set");
+
+        let first = service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_id.clone()),
+                checkpoint_id: None,
+                step: 12,
+                idempotency_key: "cp-key-1".to_string(),
+            }))
+            .await
+            .expect("first begin should succeed")
+            .into_inner();
+        let second = service
+            .begin_checkpoint(Request::new(BeginCheckpointRequest {
+                run_id: Some(run_id),
+                worker_id: Some(worker_id),
+                checkpoint_id: Some(CheckpointId {
+                    value: "different".to_string(),
+                }),
+                step: 999,
+                idempotency_key: "cp-key-1".to_string(),
+            }))
+            .await
+            .expect("idempotent begin should succeed")
+            .into_inner();
+        assert_eq!(first.checkpoint_id, second.checkpoint_id);
+        assert_eq!(first.state, CheckpointState::Initiated as i32);
+        assert_eq!(first.checkpoint_id.unwrap().value, "checkpoint-1");
     }
 
     #[tokio::test]
