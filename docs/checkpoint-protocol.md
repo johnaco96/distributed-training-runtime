@@ -223,7 +223,22 @@ Included now:
 - Cross-run deduplication and incremental checkpoint graph compaction.
 - Full production observability/SLO definitions.
 
-## 20. Risks and follow-ups
+
+## 20. Artifact metadata vs artifact bytes
+
+Artifact metadata and artifact bytes are related but distinct:
+
+- **Artifact metadata** includes artifact name, worker ID, storage key/URI, size, checksum, and checksum algorithm.
+- **Artifact bytes** are the actual model/optimizer/scheduler/training-state files produced by workers.
+
+Current protocol behavior and roadmap alignment:
+
+- The current checkpoint protocol already carries artifact metadata and backend-neutral storage keys.
+- Phase 12 completed backend-neutral checkpoint storage and S3-compatible/MinIO-compatible checkpoint-layer support.
+- Phase 12.5 introduces the explicit worker artifact-byte data path and validates that metadata matches stored objects.
+- Commit semantics should require that expected artifacts both exist and match their reported metadata before checkpoint commit succeeds.
+
+## 21. Risks and follow-ups
 
 - **Risk:** coordinator/storage mismatch after crashes.
   - **Follow-up:** define precise reconciliation RPC/state persistence behavior.

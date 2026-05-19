@@ -91,3 +91,18 @@ Real AWS S3 validation is **not required** for Phase 12B.
 - Phase 12B wires S3-compatible storage into checkpoint storage tests and adds local env-gated MinIO validation.
 - Coordinator checkpoint RPCs may still report artifact metadata rather than uploading artifact bytes through coordinator RPCs.
 - Real AWS cloud validation, production readiness, HA, and hardening are out of scope.
+
+## How Phase 12.5 uses object storage
+
+- `S3Storage` and `LocalStorage` are backend implementations of the same storage abstraction.
+- Phase 12.5 will use these backends for **real worker artifact-byte uploads**, not only metadata reporting.
+- The object key layout remains:
+
+```text
+runs/{run_id}/checkpoints/{checkpoint_id}/manifest.pending.json
+runs/{run_id}/checkpoints/{checkpoint_id}/workers/{worker_id}/{artifact_name}
+runs/{run_id}/checkpoints/{checkpoint_id}/manifest.committed.json
+runs/{run_id}/checkpoints/{checkpoint_id}/COMMITTED
+runs/{run_id}/LATEST
+```
+
