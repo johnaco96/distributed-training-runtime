@@ -326,8 +326,16 @@ pub fn run_checkpoint_restore(
     })
 }
 
-pub fn scaling_benchmark_name(workers: usize) -> String {
-    format!("worker-rpc-{workers}-workers")
+pub const DEFAULT_SCALING_WORKERS: &str = "1,2,4,8,16";
+pub const DEFAULT_SIMULATED_SCALING_WORKERS: &str = "32,64,128";
+pub const MAX_WORKER_COUNT_GUARDRAIL: usize = 1024;
+
+pub fn scaling_benchmark_name(workers: usize, simulated: bool) -> String {
+    if simulated {
+        format!("simulated-worker-rpc-{workers}-workers")
+    } else {
+        format!("worker-rpc-{workers}-workers")
+    }
 }
 
 pub fn parse_workers_list(input: &str) -> Result<Vec<usize>, String> {
@@ -365,12 +373,29 @@ pub fn run_worker_rpc_with_name(
     Ok(summary)
 }
 
+pub fn validate_worker_counts(worker_counts: &[usize]) -> Result<(), String> {
+    for workers in worker_counts {
+        if *workers == 0 {
+            return Err("worker count must be > 0".into());
+        }
+        if *workers > MAX_WORKER_COUNT_GUARDRAIL {
+            return Err(format!(
+                "worker count {} exceeds maximum allowed {} to avoid accidental local overload",
+                workers, MAX_WORKER_COUNT_GUARDRAIL
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn run_scaling_workers(
     worker_counts: &[usize],
     heartbeats: usize,
     addr: Option<String>,
     start_coordinator: bool,
+    simulated: bool,
 ) -> Result<Vec<BenchmarkSummary>, String> {
+    validate_worker_counts(worker_counts)?;
     worker_counts
         .iter()
         .enumerate()
@@ -380,7 +405,7 @@ pub fn run_scaling_workers(
                 heartbeats,
                 addr.clone(),
                 if index == 0 { start_coordinator } else { false },
-                scaling_benchmark_name(*workers),
+                scaling_benchmark_name(*workers, simulated),
             )
         })
         .collect()
@@ -525,13 +550,13 @@ mod tests {
         let csv_path = dir.path().join("bench.csv");
         let json_path = dir.path().join("bench.json");
         let summaries = vec![
-            BenchmarkSummary::from_samples("worker-rpc-1-workers", &[], 1.0),
-            BenchmarkSummary::from_samples("worker-rpc-2-workers", &[], 2.0),
+            BenchmarkSummary::from_samples("simulated-worker-rpc-1-workers", &[], 1.0),
+            BenchmarkSummary::from_samples("simulated-worker-rpc-2-workers", &[], 2.0),
         ];
         write_outputs_many(&summaries, Some(&csv_path), Some(&json_path)).unwrap();
         let csv = fs::read_to_string(csv_path).unwrap();
-        assert!(csv.contains("worker-rpc-1-workers"));
-        assert!(csv.contains("worker-rpc-2-workers"));
+        assert!(csv.contains("simulated-worker-rpc-1-workers"));
+        assert!(csv.contains("simulated-worker-rpc-2-workers"));
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(json_path).unwrap()).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 2);
@@ -539,7 +564,17 @@ mod tests {
 
     #[test]
     fn scaling_summary_name() {
-        assert_eq!(scaling_benchmark_name(16), "worker-rpc-16-workers");
+        assert_eq!(scaling_benchmark_name(16, false), "worker-rpc-16-workers");
+        assert_eq!(
+            scaling_benchmark_name(64, true),
+            "simulated-worker-rpc-64-workers"
+        );
+    }
+
+    #[test]
+    fn validate_worker_count_guardrail() {
+        assert!(validate_worker_counts(&[32, 64, 128]).is_ok());
+        assert!(validate_worker_counts(&[1025]).is_err());
     }
 
     #[test]

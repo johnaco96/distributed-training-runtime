@@ -3,7 +3,8 @@
 use clap::{Parser, Subcommand};
 use runtime_bench::{
     parse_workers_list, run_checkpoint_restore, run_checkpoint_write, run_dataset_read,
-    run_scaling_workers, run_worker_rpc, write_outputs, write_outputs_many,
+    run_scaling_workers, run_worker_rpc, validate_worker_counts, write_outputs, write_outputs_many,
+    DEFAULT_SCALING_WORKERS, DEFAULT_SIMULATED_SCALING_WORKERS,
 };
 use std::path::PathBuf;
 
@@ -66,8 +67,10 @@ enum Command {
         keep_data: bool,
     },
     ScalingWorkers {
-        #[arg(long, default_value = "1,2,4,8,16")]
-        workers_list: String,
+        #[arg(long)]
+        workers_list: Option<String>,
+        #[arg(long, default_value_t = false)]
+        simulate_large: bool,
         #[arg(long, default_value_t = 10)]
         heartbeats: usize,
         #[arg(long)]
@@ -165,9 +168,22 @@ fn main() -> Result<(), String> {
             out_csv,
             out_json,
         } => {
-            let worker_counts = parse_workers_list(&workers_list)?;
+            let default_workers = if simulate_large {
+                DEFAULT_SIMULATED_SCALING_WORKERS
+            } else {
+                DEFAULT_SCALING_WORKERS
+            };
+            let worker_counts =
+                parse_workers_list(workers_list.as_deref().unwrap_or(default_workers))?;
+            validate_worker_counts(&worker_counts)?;
             (
-                run_scaling_workers(&worker_counts, heartbeats, addr, start_coordinator)?,
+                run_scaling_workers(
+                    &worker_counts,
+                    heartbeats,
+                    addr,
+                    start_coordinator,
+                    simulate_large,
+                )?,
                 out_csv,
                 out_json,
             )
@@ -229,6 +245,7 @@ mod tests {
             "scaling-workers",
             "--workers-list",
             "1,2,4,8,16",
+            "--simulate-large",
             "--heartbeats",
             "10",
         ]);
@@ -236,10 +253,30 @@ mod tests {
             Command::ScalingWorkers {
                 workers_list,
                 heartbeats,
+                simulate_large,
                 ..
             } => {
-                assert_eq!(workers_list, "1,2,4,8,16");
+                assert_eq!(workers_list.as_deref(), Some("1,2,4,8,16"));
                 assert_eq!(heartbeats, 10);
+                assert!(simulate_large);
+            }
+            _ => panic!("expected scaling-workers subcommand"),
+        }
+    }
+
+    #[test]
+    fn scaling_workers_simulated_defaults() {
+        let cli = Cli::parse_from(["runtime-bench", "scaling-workers", "--simulate-large"]);
+        match cli.cmd {
+            Command::ScalingWorkers {
+                workers_list,
+                simulate_large,
+                ..
+            } => {
+                assert!(simulate_large);
+                assert!(workers_list.is_none());
+                let parsed = parse_workers_list(DEFAULT_SIMULATED_SCALING_WORKERS).unwrap();
+                assert_eq!(parsed, vec![32, 64, 128]);
             }
             _ => panic!("expected scaling-workers subcommand"),
         }

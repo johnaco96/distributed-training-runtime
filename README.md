@@ -128,8 +128,12 @@ Next planned step: **Phase 16 scaling tests**.
 See `docs/observability.md` for current scope and usage.
 
 
-### Phase 16 — Scaling tests (started)
+### Phase 16 — Scaling tests (in validation)
 
 - [x] Phase 16A local scaling benchmark command complete (`runtime-bench scaling-workers` for `1,2,4,8,16`).
-- [ ] Simulated larger worker-count scaling runs pending.
+- [x] Phase 16B simulated larger worker-count mode implemented (`--simulate-large`, default `32,64,128`, local logical-worker simulation).
 - Local coordinator benchmark scope only; no multi-machine/distributed production claims.
+
+
+- [ ] Phase 16 full completion pending fresh local validation after latest pull.
+- Next planned step after Phase 16 validation: **Phase 17 hardening**.
