@@ -12,6 +12,7 @@ use runtime_proto::runtime::v1::{
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const WORKER_FAILURE_INTERVAL: Duration = Duration::from_secs(90);
 const SHARD_LEASE_DURATION: Duration = Duration::from_secs(30);
 
 /// Shared coordinator state.
@@ -64,6 +65,7 @@ pub struct WorkerRecord {
     pub registered_at: SystemTime,
     pub last_heartbeat_at: SystemTime,
     pub next_heartbeat_deadline: SystemTime,
+    pub failure_deadline: SystemTime,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -257,9 +259,10 @@ impl CoordinatorState {
 
     /// Reconciles in-memory worker liveness against the current server time.
     ///
-    /// The MVP coordinator only marks active workers stale when their heartbeat
-    /// deadline has passed. It does not fail, remove, or recover workers and it
-    /// does not revoke shard leases.
+    /// The MVP coordinator marks active workers stale when heartbeat deadlines
+    /// pass and stale workers failed when the longer failure deadline passes.
+    /// It does not remove or recover workers and it does not revoke shard
+    /// leases.
     pub fn reconcile_worker_liveness(&self) {
         let mut inner = self.inner.write().expect("coordinator state lock poisoned");
         reconcile_worker_liveness(&mut inner, SystemTime::now());
@@ -279,6 +282,24 @@ impl CoordinatorState {
             .and_then(|workers| workers.get_mut(&worker_id.value))
             .map(|worker| {
                 worker.next_heartbeat_deadline = deadline;
+            })
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub fn set_worker_failure_deadline_for_test(
+        &self,
+        run_id: &RunId,
+        worker_id: &WorkerId,
+        deadline: SystemTime,
+    ) -> bool {
+        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
+        inner
+            .workers_by_run
+            .get_mut(&run_id.value)
+            .and_then(|workers| workers.get_mut(&worker_id.value))
+            .map(|worker| {
+                worker.failure_deadline = deadline;
             })
             .is_some()
     }
@@ -606,6 +627,7 @@ impl CoordinatorState {
             .unwrap_or_else(|| self.generate_worker_id());
         let now = SystemTime::now();
         let next_heartbeat_deadline = now + HEARTBEAT_INTERVAL;
+        let failure_deadline = now + WORKER_FAILURE_INTERVAL;
         let worker = WorkerRecord {
             run_id: run_id.clone(),
             worker_id: worker_id.clone(),
@@ -617,6 +639,7 @@ impl CoordinatorState {
             registered_at: now,
             last_heartbeat_at: now,
             next_heartbeat_deadline,
+            failure_deadline,
         };
 
         inner
@@ -657,8 +680,10 @@ impl CoordinatorState {
             .and_then(|workers| workers.get_mut(&worker_id.value))?;
         let now = SystemTime::now();
         let next_heartbeat_deadline = now + HEARTBEAT_INTERVAL;
+        let failure_deadline = now + WORKER_FAILURE_INTERVAL;
         worker.last_heartbeat_at = now;
         worker.next_heartbeat_deadline = next_heartbeat_deadline;
+        worker.failure_deadline = failure_deadline;
         worker.state = WorkerState::Active as i32;
         let state = worker.state;
 
@@ -737,8 +762,13 @@ fn reconcile_worker_liveness(inner: &mut CoordinatorStateInner, now: SystemTime)
     for (run_id, workers) in &mut inner.workers_by_run {
         let mut changed = false;
         for worker in workers.values_mut() {
-            if worker.state == WorkerState::Active as i32 && worker.next_heartbeat_deadline < now {
-                worker.state = WorkerState::Stale as i32;
+            if worker.state == WorkerState::Active as i32 {
+                if worker.next_heartbeat_deadline < now {
+                    worker.state = WorkerState::Stale as i32;
+                    changed = true;
+                }
+            } else if worker.state == WorkerState::Stale as i32 && worker.failure_deadline < now {
+                worker.state = WorkerState::Failed as i32;
                 changed = true;
             }
         }
@@ -908,6 +938,83 @@ mod tests {
 
         let record = state.get_run(&run_id).expect("run should exist");
         assert_eq!(heartbeat.state, WorkerState::Active as i32);
+        assert_eq!(record.active_worker_count, 1);
+    }
+
+    #[test]
+    fn reconcile_worker_liveness_marks_stale_workers_failed_after_failure_deadline() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker should register")
+            .worker_id;
+
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+        assert!(state.set_worker_failure_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+
+        state.reconcile_worker_liveness();
+
+        let record = state.get_run(&run_id).expect("run should exist");
+        let worker = state
+            .inner
+            .read()
+            .unwrap()
+            .workers_by_run
+            .get(&run_id.value)
+            .and_then(|workers| workers.get(&worker_id.value))
+            .cloned()
+            .expect("worker should exist");
+        assert_eq!(worker.state, WorkerState::Failed as i32);
+        assert_eq!(record.active_worker_count, 0);
+    }
+
+    #[test]
+    fn heartbeat_reactivates_failed_worker() {
+        let state = CoordinatorState::default();
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker should register")
+            .worker_id;
+        assert!(state.set_worker_heartbeat_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+        assert!(state.set_worker_failure_deadline_for_test(
+            &run_id,
+            &worker_id,
+            SystemTime::UNIX_EPOCH,
+        ));
+        state.reconcile_worker_liveness();
+
+        let heartbeat = state
+            .record_heartbeat(&run_id, &worker_id)
+            .expect("failed worker heartbeat should succeed");
+
+        let record = state.get_run(&run_id).expect("run should exist");
+        let worker = state
+            .inner
+            .read()
+            .unwrap()
+            .workers_by_run
+            .get(&run_id.value)
+            .and_then(|workers| workers.get(&worker_id.value))
+            .cloned()
+            .expect("worker should exist");
+        assert_eq!(heartbeat.state, WorkerState::Active as i32);
+        assert_eq!(worker.state, WorkerState::Active as i32);
         assert_eq!(record.active_worker_count, 1);
     }
 
