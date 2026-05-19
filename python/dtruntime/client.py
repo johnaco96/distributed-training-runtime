@@ -140,6 +140,20 @@ class RuntimeClient:
         )
         return self._stub.BeginCheckpoint(request)
 
+    def commit_checkpoint(
+        self,
+        run_id: str,
+        checkpoint_id: str,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.CommitCheckpointResponse":
+        """Commit a checkpoint with the coordinator and return its response."""
+        request = self._runtime_pb2.CommitCheckpointRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.CommitCheckpoint(request)
+
     def heartbeat(
         self,
         run_id: str,
