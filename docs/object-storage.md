@@ -92,6 +92,18 @@ Real AWS S3 validation is **not required** for Phase 12B.
 - Coordinator checkpoint RPCs may still report artifact metadata rather than uploading artifact bytes through coordinator RPCs.
 - Real AWS cloud validation, production readiness, HA, and hardening are out of scope.
 
+## Artifact integrity validation (Phase 12.5A)
+
+- Artifact integrity validation is backend-neutral and uses the shared `StorageBackend` interface.
+- `LocalStorage` and `S3Storage` both expose stored artifact bytes via `StorageBackend::get`.
+- Validation should not trust reported metadata blindly; it verifies stored object bytes against:
+  - expected existence/readability,
+  - expected byte length,
+  - supported checksum algorithm,
+  - expected checksum digest.
+- Phase 12.5A adds reusable helpers for this validation layer.
+- Phase 12.5B will wire enforcement into checkpoint commit behavior.
+
 ## How Phase 12.5 uses object storage
 
 - `S3Storage` and `LocalStorage` are backend implementations of the same storage abstraction.
@@ -105,4 +117,3 @@ runs/{run_id}/checkpoints/{checkpoint_id}/manifest.committed.json
 runs/{run_id}/checkpoints/{checkpoint_id}/COMMITTED
 runs/{run_id}/LATEST
 ```
-
