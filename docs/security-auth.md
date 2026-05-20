@@ -46,3 +46,7 @@ Phase 20F-3 adds an internal authorization model with optional metadata-based ca
 
 
 Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
+
+
+## Phase 20F-3 authorization matrix coverage update
+Service-level metadata authorization tests now cover coordinator RPC groups across admin-only and worker-scoped endpoints (including worker self-mismatch denial and missing/invalid identity rejection). This remains local/dev metadata identity scaffolding and is not production identity assurance. Production mTLS/SPIFFE identity extraction and policy integration remain future work.
