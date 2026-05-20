@@ -3102,6 +3102,8 @@ mod tests {
             .heartbeat(Request::new(HeartbeatRequest {
                 run_id: Some(run_id),
                 worker_id: Some(worker_id),
+                active_shard_ids: Vec::new(),
+                client_time: None,
                 idempotency_key: "heartbeat-key".to_string(),
             }))
             .await
@@ -3121,6 +3123,8 @@ mod tests {
                 worker_id: Some(WorkerId {
                     value: "missing-worker".to_string(),
                 }),
+                active_shard_ids: Vec::new(),
+                client_time: None,
                 idempotency_key: "heartbeat-key".to_string(),
             }))
             .await
