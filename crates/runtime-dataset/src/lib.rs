@@ -437,7 +437,7 @@ mod tests {
         fn exists(&self, _key: &StorageKey) -> Result<bool, SE> {
             Ok(true)
         }
-        fn list_prefix(&self, _prefix: &str) -> Result<Vec<StorageKey>, SE> {
+        fn list_prefix(&self, _prefix: &StorageKey) -> Result<Vec<StorageKey>, SE> {
             Ok(vec![])
         }
     }

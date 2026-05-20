@@ -67,7 +67,20 @@ pub trait AuditSink: Send + Sync + 'static {
 pub struct TracingAuditSink;
 impl AuditSink for TracingAuditSink {
     fn emit(&self, event: AuditEvent) {
-        tracing::info!(target: "runtime_coordinator::audit", ?event.kind, ?event.outcome, subject = ?event.subject, role = ?event.role, worker_id = ?event.worker_id, run_id = ?event.run_id, dataset_id = ?event.dataset_id, checkpoint_id = ?event.checkpoint_id, reason = ?event.reason, request_name = ?event.request_name, "audit event");
+        tracing::info!(
+            target: "runtime_coordinator::audit",
+            kind = ?event.kind,
+            outcome = ?event.outcome,
+            subject = ?event.subject,
+            role = ?event.role,
+            worker_id = ?event.worker_id,
+            run_id = ?event.run_id,
+            dataset_id = ?event.dataset_id,
+            checkpoint_id = ?event.checkpoint_id,
+            reason = ?event.reason,
+            request_name = ?event.request_name,
+            "audit event"
+        );
     }
 }
 
