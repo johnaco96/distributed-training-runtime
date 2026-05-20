@@ -34,6 +34,9 @@ class RuntimeClient:
 
         self.address = address
         self._runtime_pb2 = runtime_pb2
+        self._tls_ca_cert = tls_ca_cert
+        self._tls_client_cert = tls_client_cert
+        self._tls_client_key = tls_client_key
 
         tls_ca_cert = tls_ca_cert or os.getenv("DTRUNTIME_TLS_CA_CERT")
         tls_client_cert = tls_client_cert or os.getenv("DTRUNTIME_TLS_CLIENT_CERT")
@@ -69,6 +72,31 @@ class RuntimeClient:
         self.stub = self._stub
         self._closed = False
 
+    def with_auth(
+        self,
+        subject: str | None = None,
+        role: str | None = None,
+        worker_id: str | None = None,
+    ) -> "RuntimeClient":
+        """Create a new RuntimeClient sharing connection settings with a different identity."""
+        return RuntimeClient(
+            self.address,
+            tls_ca_cert=self._tls_ca_cert,
+            tls_client_cert=self._tls_client_cert,
+            tls_client_key=self._tls_client_key,
+            auth_subject=subject,
+            auth_role=role,
+            auth_worker_id=worker_id,
+        )
+
+    def for_worker(
+        self,
+        worker_id: str,
+        worker_role: str = "worker",
+        worker_subject: str | None = None,
+    ) -> "RuntimeClient":
+        subject = worker_subject or worker_id
+        return self.with_auth(subject=subject, role=worker_role, worker_id=worker_id)
 
     def rpc_metadata(
         self,

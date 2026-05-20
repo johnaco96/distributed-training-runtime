@@ -71,7 +71,7 @@ kubectl apply -f k8s/local-secure/coordinator-deployment.yaml
 7) If needed, pin image tag built for this step:
 
 ```bash
-kubectl -n dtruntime set image deployment/runtime-coordinator coordinator=distributed-training-runtime:step3-secure
+kubectl -n dtruntime set image deployment/runtime-coordinator coordinator=distributed-training-runtime:local-secure
 ```
 
 8) Wait for coordinator readiness and verify probes:
@@ -109,3 +109,6 @@ curl -fsS http://127.0.0.1:9090/metrics | head
 ```bash
 kubectl delete namespace dtruntime --ignore-not-found
 ```
+
+
+Secure job authorization model: separate admin and worker identities are required. `DTRUNTIME_AUTH_SUBJECT`/`DTRUNTIME_AUTH_ROLE` from `dtruntime-auth` are used only for admin/control-plane RPCs. Worker-scoped RPCs use per-worker identity (`role=worker`, subject defaults to `worker-N`, and `x-dtruntime-worker-id=worker-N`). Admin identity cannot impersonate worker RPCs under metadata auth mode.
