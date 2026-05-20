@@ -60,3 +60,13 @@ Only include badges/placeholders that are already backed by real automation/stat
 - docs updated (README + runbooks + status pages)
 - benchmark results labeled local/environment-specific
 - limitations prominently visible and conservative
+
+
+## Phase 20E extension: local Kubernetes packaging
+
+Phase 20E adds a local/dev-first deployment path:
+- Build image from `Dockerfile`.
+- Apply manifests from `k8s/local/`.
+- Run the `pytorch-coordinator-demo` Job against the in-cluster coordinator Service.
+
+This extends packaging demonstration coverage without claiming production orchestration maturity.

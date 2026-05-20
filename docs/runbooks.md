@@ -101,3 +101,10 @@ Remove-Item -Recurse -Force .dtruntime-pytorch-dist-no-checkpoint -ErrorAction S
 - Project packaging guide: [`docs/project-packaging.md`](project-packaging.md)
 - Coordinator-driven PyTorch example: `python/examples/pytorch_coordinator_train.py`
 - Orchestration benchmark: `python/examples/benchmark_pytorch_orchestration.py`
+
+
+## 7) Local Kubernetes runbook (Phase 20E)
+
+For local cluster demo deployment steps, see [`docs/kubernetes-local.md`](kubernetes-local.md).
+
+Scope is intentionally local/dev only (single coordinator replica, no HA/auth/dashboard).

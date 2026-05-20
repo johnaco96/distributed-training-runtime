@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runtime-coordinator
+  namespace: dtruntime
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: runtime-coordinator
+  template:
+    metadata:
+      labels:
+        app: runtime-coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: distributed-training-runtime:local
+          imagePullPolicy: IfNotPresent
+          args: ["--addr", "0.0.0.0:50051"]
+          ports:
+            - containerPort: 50051
+              name: grpc
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

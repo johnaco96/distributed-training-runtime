@@ -277,4 +277,4 @@ Caveats: this is local-only and environment-specific. Coordinator timings includ
 
 Phase 20D is now complete: packaging/documentation polish aligns README, runbooks, benchmark framing, and demo/release checklists so the repository presents a coherent ML infrastructure prototype story before starting Kubernetes work.
 
-Phases 20E (Kubernetes) and 20F (auth/dashboard/HA/production S3) remain pending by design.
+Phase 20E (Kubernetes local/dev deployment) is now complete. Phase 20F (auth/dashboard/HA/production S3) remains pending by design.

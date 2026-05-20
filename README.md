@@ -92,3 +92,14 @@ Environment dependencies can affect validation:
 - Optional MinIO/S3 checks require environment setup.
 
 When unavailable, those paths should fail clearly or skip; treat that as environment limitation rather than a product-claim change.
+
+
+## Kubernetes local demo (Phase 20E)
+
+A local/dev-first Kubernetes demo path is now available.
+
+- Container image: `Dockerfile`
+- Manifests: `k8s/local/`
+- Runbook: [`docs/kubernetes-local.md`](docs/kubernetes-local.md)
+
+This path demonstrates packaging/deployment for local clusters (kind/minikube) only. It does not claim production Kubernetes readiness, HA, auth, dashboard, or `torch.distributed` execution.

@@ -165,3 +165,12 @@ Caveats: this is local-only and environment-specific. Coordinator timings includ
   - `PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke`
 - Demo checklist: [`docs/demo-checklist.md`](demo-checklist.md)
 - Packaging guide: [`docs/project-packaging.md`](project-packaging.md)
+
+
+## Phase 20E: local Kubernetes demo
+
+Use the local manifests in `k8s/local/` with the runbook at [`docs/kubernetes-local.md`](kubernetes-local.md) to run:
+- one coordinator Deployment
+- one coordinator-driven PyTorch demo Job
+
+This proves local packaging/deployment flow only; it does not prove production Kubernetes behavior or multi-node distributed training.
