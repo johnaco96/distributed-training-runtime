@@ -2,8 +2,9 @@
 
 use clap::{Parser, Subcommand};
 use runtime_bench::{
-    parse_workers_list, run_checkpoint_restore, run_checkpoint_write, run_dataset_read,
-    run_scaling_workers, run_worker_rpc, validate_worker_counts, write_outputs, write_outputs_many,
+    parse_workers_list, run_auth_audit_overhead, run_cache_aware_placement, run_checkpoint_restore,
+    run_checkpoint_write, run_dataset_prefetch, run_dataset_read, run_scaling_workers,
+    run_status_snapshot, run_worker_rpc, validate_worker_counts, write_outputs, write_outputs_many,
     DEFAULT_SCALING_WORKERS, DEFAULT_SIMULATED_SCALING_WORKERS,
 };
 use std::path::PathBuf;
@@ -77,6 +78,45 @@ enum Command {
         addr: Option<String>,
         #[arg(long, default_value_t = true)]
         start_coordinator: bool,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+    },
+
+    DatasetPrefetch {
+        #[arg(long, default_value_t = 32)]
+        requested_shards: usize,
+        #[arg(long, default_value_t = 65536)]
+        payload_bytes: usize,
+        #[arg(long, default_value_t = 8)]
+        concurrency: usize,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+    },
+    CacheAwarePlacement {
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+        #[arg(long, default_value_t = 16)]
+        shards: usize,
+        #[arg(long, default_value_t = 6)]
+        hinted_shards: usize,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+    },
+    AuthAuditOverhead {
+        #[arg(long, default_value_t = 1000)]
+        iterations: usize,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+    },
+    StatusSnapshot {
         #[arg(long)]
         out_csv: Option<PathBuf>,
         #[arg(long)]
@@ -189,6 +229,40 @@ fn main() -> Result<(), String> {
                 out_json,
             )
         }
+        Command::DatasetPrefetch {
+            requested_shards,
+            payload_bytes,
+            concurrency,
+            out_csv,
+            out_json,
+        } => (
+            vec![run_dataset_prefetch(
+                requested_shards,
+                payload_bytes,
+                concurrency,
+            )?],
+            out_csv,
+            out_json,
+        ),
+        Command::CacheAwarePlacement {
+            workers,
+            shards,
+            hinted_shards,
+            out_csv,
+            out_json,
+        } => (
+            run_cache_aware_placement(workers, shards, hinted_shards)?,
+            out_csv,
+            out_json,
+        ),
+        Command::AuthAuditOverhead {
+            iterations,
+            out_csv,
+            out_json,
+        } => (run_auth_audit_overhead(iterations)?, out_csv, out_json),
+        Command::StatusSnapshot { out_csv, out_json } => {
+            (vec![run_status_snapshot()?], out_csv, out_json)
+        }
         Command::WorkerRpc {
             workers,
             heartbeats,
@@ -294,6 +368,40 @@ mod tests {
             "3",
         ]);
         match cli.cmd {
+            Command::DatasetPrefetch {
+                requested_shards,
+                payload_bytes,
+                concurrency,
+                out_csv,
+                out_json,
+            } => (
+                vec![run_dataset_prefetch(
+                    requested_shards,
+                    payload_bytes,
+                    concurrency,
+                )?],
+                out_csv,
+                out_json,
+            ),
+            Command::CacheAwarePlacement {
+                workers,
+                shards,
+                hinted_shards,
+                out_csv,
+                out_json,
+            } => (
+                run_cache_aware_placement(workers, shards, hinted_shards)?,
+                out_csv,
+                out_json,
+            ),
+            Command::AuthAuditOverhead {
+                iterations,
+                out_csv,
+                out_json,
+            } => (run_auth_audit_overhead(iterations)?, out_csv, out_json),
+            Command::StatusSnapshot { out_csv, out_json } => {
+                (vec![run_status_snapshot()?], out_csv, out_json)
+            }
             Command::WorkerRpc {
                 workers,
                 heartbeats,
