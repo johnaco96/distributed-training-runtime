@@ -182,10 +182,24 @@ impl CoordinatorServiceImpl {
                     Ok(())
                 }
                 crate::auth::AuthRole::Worker => {
-                    let provided = c
-                        .worker_id
-                        .clone()
-                        .ok_or(AuthorizationError::MissingIdentity.to_status())?;
+                    let provided = match c.worker_id.clone() {
+                        Some(worker_id) => worker_id,
+                        None => {
+                            self.audit.emit(AuditEvent {
+                                kind: Some(AuditEventKind::AuthorizationDenied),
+                                outcome: Some(AuditOutcome::Rejected),
+                                subject: Some(c.subject),
+                                role: Some("worker".to_string()),
+                                worker_id: None,
+                                run_id: None,
+                                dataset_id: None,
+                                checkpoint_id: None,
+                                reason: Some("missing_identity".to_string()),
+                                request_name: Some(request_name.to_string()),
+                            });
+                            return Err(AuthorizationError::MissingIdentity.to_status());
+                        }
+                    };
                     if provided == worker_id {
                         self.audit.emit(AuditEvent::new(
                             AuditEventKind::AuthorizationAllowed,
@@ -901,6 +915,7 @@ mod tests {
     use crate::state::DatasetPlacementPolicy;
     use runtime_proto::runtime::v1::{AssignmentPolicy, StorageBackendKind};
     use runtime_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR, PROTOCOL_PATCH};
+    use tonic::{Code, Request};
 
     fn register_request(idempotency_key: &str) -> RegisterRunRequest {
         register_request_with_world_size(idempotency_key, 8)
@@ -1008,6 +1023,66 @@ mod tests {
     fn build_service() -> CoordinatorServiceImpl {
         CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()))
     }
+
+    fn build_service_with_metadata_auth() -> CoordinatorServiceImpl {
+        let state = Arc::new(CoordinatorState::default());
+        let audit_sink = Arc::new(crate::audit::InMemoryAuditSink::default());
+        let audit = AuditLogger::new(audit_sink);
+        CoordinatorServiceImpl::with_metrics_and_authorizer(
+            state,
+            Arc::new(RuntimeMetrics::default()),
+            Authorizer::new(crate::auth::AuthMode::Metadata),
+            audit,
+        )
+    }
+
+    fn request_as_admin<T>(inner: T) -> Request<T> {
+        let mut request = Request::new(inner);
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-subject", "admin-user".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-role", "admin".parse().unwrap());
+        request
+    }
+
+    fn request_as_worker<T>(worker_id: &str, inner: T) -> Request<T> {
+        let mut request = Request::new(inner);
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-subject", "worker-user".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-role", "worker".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-worker-id", worker_id.parse().unwrap());
+        request
+    }
+
+    fn request_without_auth<T>(inner: T) -> Request<T> {
+        Request::new(inner)
+    }
+
+    fn request_with_invalid_role<T>(inner: T) -> Request<T> {
+        let mut request = Request::new(inner);
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-subject", "bad-role-subject".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-role", "viewer".parse().unwrap());
+        request
+    }
+
+    fn assert_unauthenticated(status: Status) {
+        assert_eq!(status.code(), Code::Unauthenticated);
+    }
+
+    fn assert_permission_denied(status: Status) {
+        assert_eq!(status.code(), Code::PermissionDenied);
+    }
     fn build_service_cache_aware() -> CoordinatorServiceImpl {
         CoordinatorServiceImpl::new(Arc::new(CoordinatorState::with_placement_policy(
             DatasetPlacementPolicy::CacheAware,
@@ -1048,6 +1123,124 @@ mod tests {
             .collect::<Vec<_>>();
         expected.sort_unstable();
         assert_eq!(features, expected);
+    }
+
+    #[tokio::test]
+    async fn metadata_auth_register_run_authorization_matrix() {
+        let service = build_service_with_metadata_auth();
+        service
+            .register_run(request_as_admin(register_request("admin-key")))
+            .await
+            .expect("admin should register run");
+
+        let worker_error = service
+            .register_run(request_as_worker(
+                "worker-1",
+                register_request("worker-key"),
+            ))
+            .await
+            .expect_err("worker should be denied");
+        assert_permission_denied(worker_error);
+
+        let missing_error = service
+            .register_run(request_without_auth(register_request("missing-key")))
+            .await
+            .expect_err("missing auth should be rejected");
+        assert_unauthenticated(missing_error);
+
+        let invalid_error = service
+            .register_run(request_with_invalid_role(register_request("invalid-key")))
+            .await
+            .expect_err("invalid role should be rejected");
+        assert_unauthenticated(invalid_error);
+    }
+
+    #[tokio::test]
+    async fn metadata_auth_worker_scoped_operations_enforce_worker_self() {
+        let service = build_service_with_metadata_auth();
+        let run_id = service
+            .register_run(request_as_admin(register_request("run-key")))
+            .await
+            .unwrap()
+            .into_inner()
+            .run_id
+            .unwrap();
+        let worker_id = service
+            .register_worker(request_as_worker(
+                "worker-1",
+                worker_request(run_id.clone(), "register-worker"),
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+        let dataset_id = service
+            .register_dataset(request_as_admin(dataset_request(
+                run_id.clone(),
+                "dataset-key",
+                Some("dataset-explicit"),
+                &[Some("shard-a"), Some("shard-b")],
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .dataset_id
+            .unwrap();
+
+        service
+            .heartbeat(request_as_worker(
+                &worker_id.value,
+                HeartbeatRequest {
+                    run_id: Some(run_id.clone()),
+                    worker_id: Some(worker_id.clone()),
+                    idempotency_key: "hb-ok".to_string(),
+                    client_time: None,
+                    active_shard_ids: vec![],
+                },
+            ))
+            .await
+            .expect("worker self heartbeat should pass");
+        let hb_err = service
+            .heartbeat(request_as_worker(
+                "other-worker",
+                HeartbeatRequest {
+                    run_id: Some(run_id.clone()),
+                    worker_id: Some(worker_id.clone()),
+                    idempotency_key: "hb-bad".to_string(),
+                    client_time: None,
+                    active_shard_ids: vec![],
+                },
+            ))
+            .await
+            .expect_err("worker mismatch should be denied");
+        assert_permission_denied(hb_err);
+
+        let missing_worker_id_error = service
+            .heartbeat(request_without_auth(HeartbeatRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(worker_id.clone()),
+                idempotency_key: "hb-missing".to_string(),
+                client_time: None,
+                active_shard_ids: vec![],
+            }))
+            .await
+            .expect_err("missing metadata should reject");
+        assert_unauthenticated(missing_worker_id_error);
+
+        let assignment_err = service
+            .get_shard_assignment(request_as_worker(
+                "other-worker",
+                GetShardAssignmentRequest {
+                    run_id: Some(run_id.clone()),
+                    worker_id: Some(worker_id.clone()),
+                    dataset_id: Some(dataset_id.clone()),
+                    idempotency_key: "assign-bad".to_string(),
+                },
+            ))
+            .await
+            .expect_err("mismatch should deny assignment");
+        assert_permission_denied(assignment_err);
     }
 
     #[tokio::test]
