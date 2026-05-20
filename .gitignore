@@ -68,3 +68,5 @@ aws_credentials
 .dtruntime-pytorch-bench/
 .dtruntime-pytorch-bench-smoke/
 .dtruntime-certs/
+
+.dtruntime-results/
