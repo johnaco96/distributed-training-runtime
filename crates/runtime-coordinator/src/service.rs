@@ -108,7 +108,7 @@ impl CoordinatorServiceImpl {
                     run_id: None,
                     dataset_id: None,
                     checkpoint_id: None,
-                    reason: Some(e.reason_code().to_string()),
+                    reason: Some(e.as_str().to_string()),
                     request_name: Some(request_name.to_string()),
                 });
                 Err(e.to_status())

@@ -367,41 +367,8 @@ mod tests {
             "--heartbeats",
             "3",
         ]);
+
         match cli.cmd {
-            Command::DatasetPrefetch {
-                requested_shards,
-                payload_bytes,
-                concurrency,
-                out_csv,
-                out_json,
-            } => (
-                vec![run_dataset_prefetch(
-                    requested_shards,
-                    payload_bytes,
-                    concurrency,
-                )?],
-                out_csv,
-                out_json,
-            ),
-            Command::CacheAwarePlacement {
-                workers,
-                shards,
-                hinted_shards,
-                out_csv,
-                out_json,
-            } => (
-                run_cache_aware_placement(workers, shards, hinted_shards)?,
-                out_csv,
-                out_json,
-            ),
-            Command::AuthAuditOverhead {
-                iterations,
-                out_csv,
-                out_json,
-            } => (run_auth_audit_overhead(iterations)?, out_csv, out_json),
-            Command::StatusSnapshot { out_csv, out_json } => {
-                (vec![run_status_snapshot()?], out_csv, out_json)
-            }
             Command::WorkerRpc {
                 workers,
                 heartbeats,
