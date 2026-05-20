@@ -8,7 +8,8 @@ use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
-use crate::auth::Authorizer;
+use crate::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome};
+use crate::auth::{AuthorizationError, Authorizer};
 use crate::state::{
     BeginCheckpointError, CommitCheckpointError, CoordinatorState, GetLatestCheckpointError,
     GetShardAssignmentsError, RenewShardLeaseError, ReportCheckpointArtifactError,
@@ -21,11 +22,12 @@ pub struct CoordinatorServiceImpl {
     state: Arc<CoordinatorState>,
     metrics: Arc<RuntimeMetrics>,
     authorizer: Authorizer,
+    audit: AuditLogger,
 }
 
 impl CoordinatorServiceImpl {
     pub fn new(state: Arc<CoordinatorState>) -> Self {
-        Self::with_metrics_and_authorizer(
+        Self::with_metrics_authorizer_and_audit(
             state,
             Arc::new(RuntimeMetrics::default()),
             Authorizer::new(crate::auth::AuthMode::Disabled),
@@ -33,7 +35,7 @@ impl CoordinatorServiceImpl {
     }
 
     pub fn with_metrics(state: Arc<CoordinatorState>, metrics: Arc<RuntimeMetrics>) -> Self {
-        Self::with_metrics_and_authorizer(
+        Self::with_metrics_authorizer_and_audit(
             state,
             metrics,
             Authorizer::new(crate::auth::AuthMode::Disabled),
@@ -41,18 +43,24 @@ impl CoordinatorServiceImpl {
     }
 
     pub fn with_authorizer(state: Arc<CoordinatorState>, authorizer: Authorizer) -> Self {
-        Self::with_metrics_and_authorizer(state, Arc::new(RuntimeMetrics::default()), authorizer)
+        Self::with_metrics_authorizer_and_audit(
+            state,
+            Arc::new(RuntimeMetrics::default()),
+            authorizer,
+        )
     }
 
     pub fn with_metrics_and_authorizer(
         state: Arc<CoordinatorState>,
         metrics: Arc<RuntimeMetrics>,
         authorizer: Authorizer,
+        audit: AuditLogger,
     ) -> Self {
         Self {
             state,
             metrics,
             authorizer,
+            audit,
         }
     }
 
@@ -60,22 +68,150 @@ impl CoordinatorServiceImpl {
         self.metrics.snapshot()
     }
 
-    fn require_admin<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        self.authorizer.require_admin(request.metadata())
+    fn auth_context<T>(
+        &self,
+        request: &Request<T>,
+        request_name: &'static str,
+    ) -> Result<Option<crate::auth::AuthContext>, Status> {
+        match self.authorizer.context(request.metadata()) {
+            Ok(ctx) => {
+                if let Some(c) = &ctx {
+                    let role = match c.role {
+                        crate::auth::AuthRole::Admin => "admin",
+                        crate::auth::AuthRole::Worker => "worker",
+                    };
+                    self.audit.emit(AuditEvent {
+                        kind: Some(AuditEventKind::AuthMetadataAccepted),
+                        outcome: Some(AuditOutcome::Success),
+                        subject: Some(c.subject.clone()),
+                        role: Some(role.to_string()),
+                        worker_id: c.worker_id.clone(),
+                        run_id: None,
+                        dataset_id: None,
+                        checkpoint_id: None,
+                        reason: None,
+                        request_name: Some(request_name.to_string()),
+                    });
+                }
+                Ok(ctx)
+            }
+            Err(e) => {
+                self.audit.emit(AuditEvent {
+                    kind: Some(AuditEventKind::AuthMetadataRejected),
+                    outcome: Some(AuditOutcome::Rejected),
+                    subject: None,
+                    role: None,
+                    worker_id: None,
+                    run_id: None,
+                    dataset_id: None,
+                    checkpoint_id: None,
+                    reason: Some(e.reason_code().to_string()),
+                    request_name: Some(request_name.to_string()),
+                });
+                Err(e.to_status())
+            }
+        }
     }
 
-    fn require_worker_capability<T>(&self, request: &Request<T>) -> Result<(), Status> {
-        self.authorizer
-            .require_worker_capability(request.metadata())
+    fn require_admin<T>(
+        &self,
+        request: &Request<T>,
+        request_name: &'static str,
+    ) -> Result<(), Status> {
+        let ctx = self.auth_context(request, request_name)?;
+        if let Some(c) = ctx {
+            if c.role != crate::auth::AuthRole::Admin {
+                self.audit.emit(AuditEvent::new(
+                    AuditEventKind::AuthorizationDenied,
+                    AuditOutcome::Rejected,
+                ));
+                return Err(AuthorizationError::PermissionDenied.to_status());
+            }
+            self.audit.emit(AuditEvent::new(
+                AuditEventKind::AuthorizationAllowed,
+                AuditOutcome::Success,
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_worker_capability<T>(
+        &self,
+        request: &Request<T>,
+        request_name: &'static str,
+    ) -> Result<(), Status> {
+        let ctx = self.auth_context(request, request_name)?;
+        if let Some(c) = ctx {
+            if c.role != crate::auth::AuthRole::Worker {
+                self.audit.emit(AuditEvent {
+                    kind: Some(AuditEventKind::AuthorizationDenied),
+                    outcome: Some(AuditOutcome::Rejected),
+                    subject: Some(c.subject),
+                    role: Some("admin".to_string()),
+                    worker_id: c.worker_id,
+                    run_id: None,
+                    dataset_id: None,
+                    checkpoint_id: None,
+                    reason: Some("permission_denied".to_string()),
+                    request_name: Some(request_name.to_string()),
+                });
+                return Err(AuthorizationError::PermissionDenied.to_status());
+            }
+            self.audit.emit(AuditEvent::new(
+                AuditEventKind::AuthorizationAllowed,
+                AuditOutcome::Success,
+            ));
+        }
+        Ok(())
     }
 
     fn allow_admin_or_worker_self<T>(
         &self,
         request: &Request<T>,
         worker_id: &str,
+        request_name: &'static str,
     ) -> Result<(), Status> {
-        self.authorizer
-            .allow_admin_or_worker_self(request.metadata(), worker_id)
+        let ctx = self.auth_context(request, request_name)?;
+        if let Some(c) = ctx {
+            match c.role {
+                crate::auth::AuthRole::Admin => {
+                    self.audit.emit(AuditEvent::new(
+                        AuditEventKind::AuthorizationAllowed,
+                        AuditOutcome::Success,
+                    ));
+                    Ok(())
+                }
+                crate::auth::AuthRole::Worker => {
+                    let provided = c
+                        .worker_id
+                        .clone()
+                        .ok_or(AuthorizationError::MissingIdentity.to_status())?;
+                    if provided == worker_id {
+                        self.audit.emit(AuditEvent::new(
+                            AuditEventKind::AuthorizationAllowed,
+                            AuditOutcome::Success,
+                        ));
+                        Ok(())
+                    } else {
+                        self.audit.emit(AuditEvent {
+                            kind: Some(AuditEventKind::AuthorizationDenied),
+                            outcome: Some(AuditOutcome::Rejected),
+                            subject: Some(c.subject),
+                            role: Some("worker".to_string()),
+                            worker_id: Some(provided),
+                            run_id: None,
+                            dataset_id: None,
+                            checkpoint_id: None,
+                            reason: Some("worker_identity_mismatch".to_string()),
+                            request_name: Some(request_name.to_string()),
+                        });
+                        Err(AuthorizationError::WorkerIdentityMismatch.to_status())
+                    }
+                }
+            }
+        } else {
+            Ok(())
+        }
     }
 
     fn update_worker_metrics(&self, run_id: &RunId) {
@@ -126,7 +262,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetRuntimeInfoRequest>,
     ) -> Result<Response<GetRuntimeInfoResponse>, Status> {
-        self.require_admin(&request)?;
+        self.require_admin(&request, "admin_request")?;
         let version = protocol_version();
         let capabilities = RuntimeCapabilities {
             protocol_version: Some(version.clone()),
@@ -146,7 +282,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<RegisterRunRequest>,
     ) -> Result<Response<RegisterRunResponse>, Status> {
-        self.require_admin(&request)?;
+        self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("register_run", &request.idempotency_key)?;
         let registered = self.state.register_run(request);
@@ -157,6 +293,12 @@ impl CoordinatorService for CoordinatorServiceImpl {
             registered_at: Some(registered.registered_at.into()),
         };
 
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunRegistered),
+            outcome: Some(AuditOutcome::Success),
+            run_id: response.run_id.as_ref().map(|r| r.value.clone()),
+            ..AuditEvent::default()
+        });
         Ok(Response::new(response))
     }
 
@@ -164,7 +306,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
-        self.require_worker_capability(&request)?;
+        self.require_worker_capability(&request, "worker_request")?;
         let request = request.into_inner();
         validate_idempotency_key("register_worker", &request.idempotency_key)?;
         let run_id = request
@@ -187,6 +329,13 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.update_worker_metrics(&run_id);
         info!(run_id = %run_id.value, worker_id = %worker_id_value, active_workers = self.metrics_snapshot().active_workers, "worker registered");
 
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::WorkerRegistered),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            worker_id: Some(worker_id_value),
+            ..AuditEvent::default()
+        });
         Ok(Response::new(response))
     }
 
@@ -201,7 +350,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
 
         let heartbeat = self
             .state
@@ -222,6 +371,13 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.update_worker_metrics(&run_id);
         info!(run_id = %run_id.value, worker_id = %worker_id.value, "heartbeat accepted");
 
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::WorkerHeartbeat),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            worker_id: Some(worker_id.value.clone()),
+            ..AuditEvent::default()
+        });
         Ok(Response::new(response))
     }
 
@@ -229,7 +385,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<RegisterDatasetRequest>,
     ) -> Result<Response<RegisterDatasetResponse>, Status> {
-        self.require_admin(&request)?;
+        self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("register_dataset", &request.idempotency_key)?;
         let run_id = request
@@ -262,7 +418,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
         let dataset_id = request
             .dataset_id
             .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
@@ -333,7 +489,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
         let shard_id = request
             .shard_id
             .ok_or_else(|| Status::invalid_argument("shard_id is required"))?;
@@ -393,7 +549,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
         let dataset_id = request
             .dataset_id
             .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
@@ -467,7 +623,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
 
         let checkpoint = self
             .state
@@ -568,7 +724,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<CommitCheckpointRequest>,
     ) -> Result<Response<CommitCheckpointResponse>, Status> {
-        self.require_admin(&request)?;
+        self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("commit_checkpoint", &request.idempotency_key)?;
         let run_id = request
@@ -613,7 +769,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetLatestCheckpointRequest>,
     ) -> Result<Response<GetLatestCheckpointResponse>, Status> {
-        self.require_admin(&request)?;
+        self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -678,7 +834,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetRunStatusRequest>,
     ) -> Result<Response<GetRunStatusResponse>, Status> {
-        self.require_admin(&request)?;
+        self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
