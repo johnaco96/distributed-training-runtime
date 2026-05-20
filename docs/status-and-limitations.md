@@ -130,3 +130,9 @@ Observability update: Step 1 Prometheus/Grafana is implemented. See `docs/observ
 ## Step 2 update (health probes)
 
 Coordinator health endpoints and Kubernetes startup/readiness/liveness probes are now implemented for local manifests. This improves pod lifecycle safety, but does not by itself claim full production readiness.
+
+
+### Benchmark claim boundaries
+
+Linux scaling/checkpoint outputs support host-scoped evidence for coordinator latency/throughput and checkpoint stall behavior.
+They do not imply hyperscale or vendor-infrastructure superiority claims.

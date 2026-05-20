@@ -129,3 +129,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_k8s_secure_validation.ps1
 
 Artifacts: `summary.json`, `summary.csv`, `metrics.prom`, coordinator/job logs, and kubectl describe/get outputs.
 This is production-style validation evidence (secure runtime behavior and metrics), not a production-scale throughput claim.
+
+
+## Phase: Linux scaling/profiling benchmark
+
+This phase adds:
+- coordinator worker-scaling emulation (1..1024 where feasible)
+- checkpoint stall baseline vs coordinator-managed async path
+- interoperability overhead summary
+- Linux profiling tool detection (perf/pidstat/mpstat/iostat/sar/ss/free/df/uname/lscpu/ps/top)
+
+Do not use Docker Desktop numbers as production scaling claims; run on Ubuntu/Linux.
