@@ -31,6 +31,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv-out", type=Path, default=None)
     parser.add_argument("--skip-resume", action="store_true")
     parser.add_argument("--python", dest="python_executable", default=sys.executable)
+    parser.add_argument("--environment", default="local")
+    parser.add_argument("--secure-mode", action="store_true")
+    parser.add_argument("--minio-enabled", action="store_true")
     return parser.parse_args()
 
 
@@ -223,11 +226,14 @@ def main() -> None:
     )
 
     summary = {
+        "environment_label": args.environment,
+        "surface_labels": ["local", "docker", "kubernetes", "secure-mode", "minio-gated"],
         "description": "Local benchmark of standalone PyTorch vs coordinator-driven orchestration.",
         "caveats": [
             "Environment-specific local measurements; results vary across machines.",
             "Coordinator timings include coordinator startup because benchmark uses local started coordinator mode.",
             "Not evidence of distributed multi-node scaling, Kubernetes performance, or production throughput.",
+            "Secure-mode and MinIO labels are declarative unless corresponding services/certs are provided.",
         ],
         "settings": json_safe(vars(args)),
         "successful_runs": successful_runs,
@@ -241,6 +247,12 @@ def main() -> None:
         "resume_overhead_seconds": _stats([r["resume_overhead_seconds"] for r in run_results if r["resume_overhead_seconds"] is not None]),
         "resume_overhead_percent": _stats([r["resume_overhead_percent"] for r in run_results if r["resume_overhead_percent"] is not None]),
         "runs": run_results,
+        "optional_surfaces": {
+            "secure_mode_enabled": bool(args.secure_mode),
+            "minio_enabled": bool(args.minio_enabled),
+            "dataset_prefetch_summary_benchmark": "skipped: requires runtime-bench dataset prefetch benchmark command",
+            "auth_audit_microbenchmark": "skipped: requires runtime-bench auth/audit microbenchmark command",
+        },
     }
 
     json_path = args.json_out or (out_dir / "benchmark-summary.json")
