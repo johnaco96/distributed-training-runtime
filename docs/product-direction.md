@@ -271,3 +271,10 @@ Smoke:
 `PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke`
 
 Caveats: this is local-only and environment-specific. Coordinator timings include coordinator startup in the current implementation (no warmed/external coordinator benchmark mode yet). These numbers do **not** prove distributed multi-node scaling, Kubernetes performance, or production throughput.
+
+
+## Phase 20D status
+
+Phase 20D is now complete: packaging/documentation polish aligns README, runbooks, benchmark framing, and demo/release checklists so the repository presents a coherent ML infrastructure prototype story before starting Kubernetes work.
+
+Phases 20E (Kubernetes) and 20F (auth/dashboard/HA/production S3) remain pending by design.

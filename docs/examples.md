@@ -155,3 +155,13 @@ Smoke:
 `PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke`
 
 Caveats: this is local-only and environment-specific. Coordinator timings include coordinator startup in the current implementation (no warmed/external coordinator benchmark mode yet). These numbers do **not** prove distributed multi-node scaling, Kubernetes performance, or production throughput.
+
+
+## Phase 20D reviewer-oriented examples
+
+- Coordinator-driven PyTorch demo:
+  - `PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator`
+- Orchestration benchmark smoke:
+  - `PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke`
+- Demo checklist: [`docs/demo-checklist.md`](demo-checklist.md)
+- Packaging guide: [`docs/project-packaging.md`](project-packaging.md)
