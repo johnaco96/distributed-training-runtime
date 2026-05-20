@@ -59,3 +59,8 @@ secrets/
 credentials/
 aws_credentials
 .env
+.dtruntime-pytorch-smoke/
+.dtruntime-pytorch-no-checkpoint/
+.dtruntime-pytorch-dist-smoke/
+.dtruntime-pytorch-dist-no-checkpoint/
+.dtruntime-demo/

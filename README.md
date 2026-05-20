@@ -157,13 +157,21 @@ See `docs/retry-idempotency.md` for current retry/idempotency guarantees and lim
 See `docs/checkpoint-cleanup.md` for cleanup policy and safety behavior.
 
 
-### Phase 18 — Real ML Integration (started)
+### Phase 18 — Real ML Integration (complete)
 
 - [x] Phase 18A minimal local PyTorch example complete (`python/examples/pytorch_train.py`).
 - [x] Phase 18B checkpointed model/optimizer/scheduler state + restore latest checkpoint integration.
 - [x] Phase 18C distributed-style simulated training example (`python/examples/pytorch_simulated_distributed.py`).
-- Scope note: current ML example is local/CPU-only and does not claim distributed execution.
+- Scope note: current ML examples are local/CPU-only, include simulated distributed-style behavior only, and do not claim real distributed execution.
 
-- [ ] Phase 18D docs/runbook/final validation pass pending.
+- [x] Phase 18D docs/runbook/final validation pass complete.
 
 See `docs/ml-integration.md` for details and current limitations.
+See `docs/ml-runbook.md` for runnable commands, validation checklist, and cleanup steps.
+- [x] Phase 18 complete: PyTorch example + training loop + model/optimizer/scheduler checkpoint save + latest restore + simulated distributed-style example + docs/runbook/final validation cleanup.
+- [ ] Future: real `torch.distributed` integration.
+- [ ] Future: real multi-node training orchestration.
+- [ ] Future: coordinator-driven ML orchestration.
+- [ ] Future: cloud/S3-backed ML example checkpoint path.
+- [ ] Future: production scheduling integration.
+
