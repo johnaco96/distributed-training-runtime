@@ -86,8 +86,7 @@ def test_one_run_outputs_json_and_csv(tmp_path: Path) -> None:
     assert json_out.exists()
     assert csv_out.exists()
 
-    summary_text = json_out.read_text(encoding="utf-8")
-    payload = json.loads(summary_text)
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
     run0 = payload["runs"][0]
     assert "standalone_fresh_seconds" in run0
     assert "coordinator_fresh_seconds" in run0
@@ -127,8 +126,7 @@ def test_skip_resume_omits_resume_times(tmp_path: Path) -> None:
     ]
     result = subprocess.run(cmd, env={**os.environ, "PYTHONPATH": "python"}, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
-    summary_text = json_out.read_text(encoding="utf-8")
-    payload = json.loads(summary_text)
+    payload = json.loads(json_out.read_text(encoding="utf-8"))
     run0 = payload["runs"][0]
     assert run0["standalone_resume_seconds"] is None
     assert run0["coordinator_resume_seconds"] is None
