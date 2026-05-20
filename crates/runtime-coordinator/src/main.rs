@@ -521,7 +521,7 @@ mod metrics_http_tests {
     fn test_service_and_audit() -> (CoordinatorServiceImpl, AuditLogger) {
         (
             CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default())),
-            AuditLogger::buffered(),
+            AuditLogger::tracing(),
         )
     }
 
