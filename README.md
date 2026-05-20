@@ -21,7 +21,7 @@ Distributed Training Runtime is a **local-first prototype** for coordinating ML-
 
 ## Current status (Phases 10–18 complete)
 
-This repository is currently at **Phase 19A (README and quickstart cleanup)**, with Phases 10 through 18 completed.
+This repository is currently at **Phase 19D (documentation polish complete)**, with Phases 10 through 18 completed.
 
 Highlights from completed phases:
 - Benchmark harness foundations and scaling simulation paths.
@@ -108,8 +108,13 @@ PYTHONPATH=python python python/examples/pytorch_simulated_distributed.py --work
 - [Checkpoint protocol](docs/checkpoint-protocol.md)
 - [ML integration](docs/ml-integration.md)
 - [ML runbook](docs/ml-runbook.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Status and limitations](docs/status-and-limitations.md)
 
 ## Limitations and non-goals (current)
+
+For a consolidated status/limitations view, see [Status and limitations](docs/status-and-limitations.md).
+
 
 - Coordinator behavior is still MVP-oriented and local-development focused.
 - Persistence and object-storage paths exist, but production hardening/operations posture is not claimed here.

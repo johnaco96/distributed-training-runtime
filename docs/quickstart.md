@@ -4,6 +4,8 @@ This quickstart gives a concise local setup and validation path for the Distribu
 
 For a system-level map of components and flows, see [Architecture Overview](architecture.md).
 
+For common setup/runtime issues, see [Troubleshooting](troubleshooting.md). For current project boundaries, see [Status and limitations](status-and-limitations.md).
+
 ## Prerequisites
 
 Required:
