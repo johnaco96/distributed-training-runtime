@@ -102,6 +102,7 @@ This path is local/dev only and not a production claim.
 
 1. Generate local dev certs (ignored output under `.dtruntime-certs/`):
    - `pwsh -File scripts/generate_dev_certs.ps1`
+   - The generated server certificate includes SANs for `localhost`, `127.0.0.1`, `runtime-coordinator`, `runtime-coordinator.dtruntime`, `runtime-coordinator.dtruntime.svc`, and `runtime-coordinator.dtruntime.svc.cluster.local`.
 2. Create namespace: `kubectl apply -f k8s/local-secure/namespace.yaml`
 3. Create TLS Secret from generated local files (example names):
    - `kubectl -n dtruntime create secret tls dtruntime-tls --cert=.dtruntime-certs/server.crt --key=.dtruntime-certs/server.key --dry-run=client -o yaml | kubectl apply -f -`
@@ -128,3 +129,5 @@ This prevents routing traffic before readiness and allows Kubernetes to restart 
 
 ## Step 3 secure deployment validation
 For secure local validation, follow `k8s/local-secure/README.md` and apply manifests in order (service, deployment, job). Do not use placeholder YAML secrets as runtime inputs; create real Secrets with `kubectl create secret tls` / `kubectl create secret generic` from `.dtruntime-certs/`.
+For secure local validation, the job endpoint is `runtime-coordinator.dtruntime.svc.cluster.local:50051` and TLS hostname verification remains enabled (no `ssl_target_name_override`). Never commit generated cert/key/CA files from `.dtruntime-certs/`.
+
