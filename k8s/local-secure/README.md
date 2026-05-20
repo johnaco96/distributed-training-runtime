@@ -3,12 +3,15 @@
 This directory is the validated secure local/dev path for Step 3 production readiness.
 It deploys the coordinator with TLS and mTLS enabled from Kubernetes Secrets and runs
 a secure PyTorch smoke job against `runtime-coordinator.dtruntime.svc.cluster.local:50051`.
+The secure job connects to `runtime-coordinator.dtruntime.svc.cluster.local:50051`, and TLS hostname verification remains enabled (no override).
+Do not commit generated cert/key/CA material under `.dtruntime-certs/`.
+
 
 ## Prerequisites
 
 - Docker image available in your cluster nodes (for local clusters, build/tag locally).
 - `kubectl` access to a development cluster.
-- `openssl` and PowerShell available to run `scripts/generate_dev_certs.ps1`.
+- `openssl` and PowerShell available to run `scripts/generate_dev_certs.ps1` (Git for Windows often installs OpenSSL at `C:\Program Files\Git\usr\bin\openssl.exe`).
 
 ## Deterministic runbook
 
@@ -18,7 +21,7 @@ a secure PyTorch smoke job against `runtime-coordinator.dtruntime.svc.cluster.lo
 kubectl delete namespace dtruntime --ignore-not-found
 ```
 
-2) Generate local/dev certificates (writes to ignored `.dtruntime-certs/`):
+2) Generate local/dev certificates (writes to ignored `.dtruntime-certs/`; server cert SANs include localhost and Kubernetes service DNS names used by the secure job):
 
 ```bash
 pwsh ./scripts/generate_dev_certs.ps1
