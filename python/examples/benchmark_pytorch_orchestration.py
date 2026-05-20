@@ -43,6 +43,18 @@ def _deps_check(skip_resume: bool) -> None:
         )
 
 
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [json_safe(v) for v in value]
+    return value
+
+
 def _stats(values: list[float]) -> dict[str, float | None]:
     if not values:
         return {"mean": None, "median": None, "min": None, "max": None}
@@ -217,7 +229,7 @@ def main() -> None:
             "Coordinator timings include coordinator startup because benchmark uses local started coordinator mode.",
             "Not evidence of distributed multi-node scaling, Kubernetes performance, or production throughput.",
         ],
-        "settings": vars(args),
+        "settings": json_safe(vars(args)),
         "successful_runs": successful_runs,
         "failed_runs": args.runs - successful_runs,
         "standalone_fresh_seconds": _stats([r["standalone_fresh_seconds"] for r in run_results]),
@@ -235,7 +247,7 @@ def main() -> None:
     csv_path = args.csv_out or (out_dir / "benchmark-results.csv")
     json_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    json_path.write_text(json.dumps(json_safe(summary), indent=2), encoding="utf-8")
 
     fieldnames = [
         "run_index",

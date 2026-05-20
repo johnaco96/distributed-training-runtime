@@ -92,6 +92,11 @@ def test_one_run_outputs_json_and_csv(tmp_path: Path) -> None:
     assert "coordinator_fresh_seconds" in run0
     assert "fresh_overhead_seconds" in run0
     assert payload["successful_runs"] == 1
+    assert isinstance(payload["settings"]["out_dir"], str)
+    if payload["settings"].get("json_out") is not None:
+        assert isinstance(payload["settings"]["json_out"], str)
+    if payload["settings"].get("csv_out") is not None:
+        assert isinstance(payload["settings"]["csv_out"], str)
 
 
 @requires_deps
