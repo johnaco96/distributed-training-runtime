@@ -640,8 +640,11 @@ mod tests {
 
     #[test]
     fn validate_worker_count_guardrail() {
-        assert!(validate_worker_counts(&[32, 64, 128]).is_ok());
-        assert!(validate_worker_counts(&[1025]).is_err());
+        assert!(
+            validate_worker_counts(&[1, 100, 1_000, 2_000, MAX_WORKER_COUNT_GUARDRAIL]).is_ok()
+        );
+        assert!(validate_worker_counts(&[0]).is_err());
+        assert!(validate_worker_counts(&[MAX_WORKER_COUNT_GUARDRAIL + 1]).is_err());
     }
 
     #[test]
@@ -867,7 +870,7 @@ async fn run_logical_workers_async(
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
 
-    let run_t0 = Instant::now();
+    // let run_t0 = Instant::now();
     let run_resp = client
         .register_run(Request::new(RegisterRunRequest {
             idempotency_key: format!("{bench_id}-run"),

@@ -416,7 +416,7 @@ mod tests {
                 assert!(simulate_large);
                 assert!(workers_list.is_none());
                 let parsed = parse_workers_list(DEFAULT_SIMULATED_SCALING_WORKERS).unwrap();
-                assert_eq!(parsed, vec![32, 64, 128]);
+                assert_eq!(parsed, vec![1000, 2000, 5000]);
             }
             _ => panic!("expected scaling-workers subcommand"),
         }
