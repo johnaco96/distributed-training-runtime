@@ -206,3 +206,6 @@ This architecture currently targets local/MVP development workflows:
 - No real `torch.distributed` integration yet.
 
 Use this document as the “today view” for Phase 19B; future phases should update it as real runtime capabilities expand.
+
+
+- Local Kubernetes manifests now exist for Phase 20E under `k8s/local/` (single coordinator Deployment + demo Job). This is packaging/orchestration scaffolding for local clusters, not production control-plane maturity.

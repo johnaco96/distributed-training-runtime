@@ -1,8 +1,9 @@
-# Status and Limitations (Phase 20D)
+# Status and Limitations (Phase 20E)
 
 ## Completion status
 
 - Phase **20D** (project packaging/documentation polish) is complete.
+- Phase **20E** (local/dev Kubernetes deployment path) is complete.
 - Demo/release checklist: [`docs/demo-checklist.md`](demo-checklist.md).
 - Packaging/positioning guide: [`docs/project-packaging.md`](project-packaging.md).
 
@@ -29,7 +30,7 @@ Implemented capabilities today include:
 This project currently does **not** claim:
 
 - Production scheduler integration.
-- Kubernetes deployment/orchestration support.
+- Production Kubernetes deployment/orchestration support (beyond local/dev manifests).
 - Prometheus/Grafana exporter integration.
 - Real `torch.distributed` execution.
 - Real multi-node ML orchestration.
@@ -67,3 +68,6 @@ Before external demo/release checkpoints, re-run the full local validation set i
 Phase 19 ends with docs polish and conservative status framing.
 
 **Phase 20 should be selected explicitly after this point.** It is intentionally not started in Phase 19D.
+
+
+Local Kubernetes deployment manifests exist in `k8s/local/` and are documented in `docs/kubernetes-local.md`. This is intentionally not a production Kubernetes platform.

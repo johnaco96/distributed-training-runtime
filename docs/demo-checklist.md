@@ -86,3 +86,13 @@ rm -rf .dtruntime-pytorch-dist-smoke
 - PyTorch orchestration here is **not** real `torch.distributed`.
 - Kubernetes deployment is intentionally deferred to Phase 20E.
 - Production HA/auth/dashboard posture is intentionally deferred to later phases.
+
+
+## Phase 20E local Kubernetes checklist
+
+- Build image: `docker build -t distributed-training-runtime:local .`
+- Load into kind (if used): `kind load docker-image distributed-training-runtime:local --name dtruntime`
+- Apply: `kubectl apply -f k8s/local/`
+- Verify coordinator logs: `kubectl logs deployment/runtime-coordinator -n dtruntime`
+- Verify demo job logs: `kubectl logs job/pytorch-coordinator-demo -n dtruntime`
+- Cleanup: `kubectl delete -f k8s/local/`

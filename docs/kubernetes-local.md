@@ -1,0 +1,75 @@
+# Local Kubernetes Runbook (Phase 20E)
+
+## Scope and non-goals
+
+This runbook provides a **local/dev-first** Kubernetes demonstration path for distributed-training-runtime.
+
+What this covers:
+- Deploying a single runtime coordinator pod.
+- Running a coordinator-driven PyTorch demo job against that service.
+
+What this does **not** cover:
+- Production Kubernetes readiness.
+- HA/replicated coordinators.
+- Authentication/authorization.
+- Dashboard/UX.
+- Production scheduler integrations and autoscaling.
+- `torch.distributed` multi-node execution.
+- Production S3 hardening.
+
+## Prerequisites
+
+- Docker
+- kubectl
+- kind or minikube
+
+## Build local image
+
+```bash
+docker build -t distributed-training-runtime:local .
+```
+
+## Create local cluster (kind example)
+
+```bash
+kind create cluster --name dtruntime
+kind load docker-image distributed-training-runtime:local --name dtruntime
+```
+
+## Apply manifests
+
+```bash
+kubectl apply -f k8s/local/
+```
+
+## Check coordinator
+
+```bash
+kubectl get pods -n dtruntime
+kubectl logs deployment/runtime-coordinator -n dtruntime
+```
+
+## Run/check PyTorch coordinator demo job
+
+```bash
+kubectl get jobs -n dtruntime
+kubectl logs job/pytorch-coordinator-demo -n dtruntime
+```
+
+## Cleanup
+
+```bash
+kubectl delete -f k8s/local/
+kind delete cluster --name dtruntime
+```
+
+## Caveats
+
+- Local/dev only.
+- No HA.
+- No auth.
+- No dashboard.
+- No production scheduler.
+- Not `torch.distributed`.
+- Not proof of multi-node benchmark scaling.
+- Benchmark results measured in local Kubernetes should be tracked separately from local subprocess benchmarks.
