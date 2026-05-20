@@ -170,3 +170,8 @@ Use `k8s/local-secure/` as the runnable secure deployment path. Generate local/d
 ### Step 4 production-style Kubernetes validation benchmark
 
 Use `scripts/run_k8s_secure_validation.ps1` to run secure coordinator rollout + secure PyTorch job + metrics artifact capture. The benchmark is evidence of secure runtime correctness in Kubernetes, not a production-scale throughput benchmark.
+
+## Linux scaling and checkpoint profiling suite
+
+Use `scripts/run_linux_scaling_benchmark.sh` for Linux-only scaling plus checkpoint-stall summary artifacts under `.dtruntime-results/`.
+This benchmark is separate from secure Kubernetes validation and focuses on control-plane throughput, latency percentiles, and checkpoint stall percent.

@@ -116,3 +116,9 @@ Implemented and validated in `k8s/local-secure/` with secret-backed TLS/mTLS mou
 
 Implemented by `scripts/run_k8s_secure_validation.ps1` with timestamped output, unique image-tag support, secure rollout checks, secure job completion checks, and metrics capture (`/metrics` required, Prometheus optional).
 This validates production-style secure behavior in Kubernetes and records reproducible evidence; it does not claim production-scale throughput.
+
+
+### Linux profiling benchmark status
+
+A Linux-only benchmark suite is available through `scripts/run_linux_scaling_benchmark.sh` and `scripts/collect_linux_profile.sh`.
+Results are scoped to host/workload tested and must be interpreted with caveats.
