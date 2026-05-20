@@ -76,7 +76,7 @@ enum Command {
         heartbeats: usize,
         #[arg(long)]
         addr: Option<String>,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = false)]
         start_coordinator: bool,
         #[arg(long)]
         out_csv: Option<PathBuf>,
@@ -146,7 +146,7 @@ enum Command {
         failure_rate: f64,
         #[arg(long, default_value_t = false)]
         recover_failed_workers: bool,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = false)]
         start_coordinator: bool,
         #[arg(long)]
         out_csv: Option<PathBuf>,
@@ -443,6 +443,50 @@ mod tests {
                 assert_eq!(heartbeats, 3);
             }
             _ => panic!("expected worker-rpc subcommand"),
+        }
+    }
+
+    #[test]
+    fn logical_workers_subcommand_external_mode_parses() {
+        let cli = Cli::parse_from([
+            "runtime-bench",
+            "logical-workers",
+            "--target",
+            "http://127.0.0.1:50051",
+            "--workers",
+            "100",
+        ]);
+        match cli.cmd {
+            Command::LogicalWorkers {
+                target,
+                workers,
+                start_coordinator,
+                ..
+            } => {
+                assert_eq!(target.as_deref(), Some("http://127.0.0.1:50051"));
+                assert_eq!(workers, 100);
+                assert!(!start_coordinator);
+            }
+            _ => panic!("expected logical-workers subcommand"),
+        }
+    }
+
+    #[test]
+    fn logical_workers_subcommand_spawned_mode_parses() {
+        let cli = Cli::parse_from([
+            "runtime-bench",
+            "logical-workers",
+            "--start-coordinator",
+            "--target",
+            "http://127.0.0.1:50051",
+        ]);
+        match cli.cmd {
+            Command::LogicalWorkers {
+                start_coordinator, ..
+            } => {
+                assert!(start_coordinator);
+            }
+            _ => panic!("expected logical-workers subcommand"),
         }
     }
 }
