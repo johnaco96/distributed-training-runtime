@@ -112,3 +112,15 @@ kubectl delete namespace dtruntime --ignore-not-found
 
 
 Secure job authorization model: separate admin and worker identities are required. `DTRUNTIME_AUTH_SUBJECT`/`DTRUNTIME_AUTH_ROLE` from `dtruntime-auth` are used only for admin/control-plane RPCs. Worker-scoped RPCs use per-worker identity (`role=worker`, subject defaults to `worker-N`, and `x-dtruntime-worker-id=worker-N`). Admin identity cannot impersonate worker RPCs under metadata auth mode.
+
+## Step 4 secure benchmark command
+
+Preferred command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_k8s_secure_validation.ps1 `
+  -ImageTag distributed-training-runtime:step4-$(Get-Date -Format yyyyMMddHHmmss) `
+  -OutputDir .dtruntime-results\step4-secure
+```
+
+The script templates the job manifest with the same image tag used by the coordinator deployment to prevent stale-image validation errors.

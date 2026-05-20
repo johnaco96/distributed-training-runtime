@@ -111,3 +111,8 @@ Health endpoints are intentionally low-cost and do not expose secrets.
 
 ## Step 3 status: Secure TLS/mTLS deployment validation
 Implemented and validated in `k8s/local-secure/` with secret-backed TLS/mTLS mounts and secure Python job connectivity to `runtime-coordinator.dtruntime.svc.cluster.local:50051`. Runbook includes deterministic namespace cleanup, cert generation (including Kubernetes service DNS SANs), secret creation, ordered applies, readiness/probe checks, secure job completion, and cleanup. Hostname verification remains enabled; no generated cert/key material should be committed.
+
+## Step 4 — Real Kubernetes benchmark/validation run
+
+Implemented by `scripts/run_k8s_secure_validation.ps1` with timestamped output, unique image-tag support, secure rollout checks, secure job completion checks, and metrics capture (`/metrics` required, Prometheus optional).
+This validates production-style secure behavior in Kubernetes and records reproducible evidence; it does not claim production-scale throughput.
