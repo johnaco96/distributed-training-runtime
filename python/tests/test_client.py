@@ -593,6 +593,29 @@ def test_auth_metadata_from_env(monkeypatch):
     assert stub.GetLatestCheckpoint.call_args.kwargs["metadata"] == [("x-dtruntime-subject", "admin"), ("x-dtruntime-role", "admin")]
 
 
+
+
+def test_for_worker_builds_worker_identity_metadata(monkeypatch):
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    admin_client = RuntimeClient("127.0.0.1:50051", auth_subject="admin-local", auth_role="admin")
+    worker_client = admin_client.for_worker("worker-0")
+
+    worker_client.register_worker(run_id="run-1", worker_id="worker-0")
+    assert stub.RegisterWorker.call_args.kwargs["metadata"] == [
+        ("x-dtruntime-subject", "worker-0"),
+        ("x-dtruntime-role", "worker"),
+        ("x-dtruntime-worker-id", "worker-0"),
+    ]
+
+
+def test_admin_metadata_does_not_include_worker_id(monkeypatch):
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    client = RuntimeClient("127.0.0.1:50051", auth_subject="admin-local", auth_role="admin")
+    client.register_run(run_name="r", world_size=1, assignment_policy=1, storage_backend_kind=1)
+    assert stub.RegisterRun.call_args.kwargs["metadata"] == [
+        ("x-dtruntime-subject", "admin-local"),
+        ("x-dtruntime-role", "admin"),
+    ]
 def test_register_run_builds_request_and_calls_stub(monkeypatch):
     _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
     response = RegisterRunResponse(run_id=RunId(value="run-1"))

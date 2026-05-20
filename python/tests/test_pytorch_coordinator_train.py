@@ -107,7 +107,10 @@ def test_resume(tmp_path: Path) -> None:
     assert metrics["resumed_from_checkpoint"] is True
 
 
-def test_example_uses_runtime_client_register_run_wrapper() -> None:
+def test_example_uses_separate_admin_and_worker_identity_paths() -> None:
     source = Path(MODULE).read_text(encoding="utf-8")
-    assert "client.register_run(" in source
-    assert "client.stub.RegisterRun(" not in source
+    assert "admin_client.register_run(" in source
+    assert "worker_clients[worker_id].register_worker(" in source
+    assert "worker_clients[worker_id].request_shard(" in source
+    assert "worker_clients[worker_id].heartbeat(" in source
+    assert "admin_client.commit_checkpoint(" in source

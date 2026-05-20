@@ -13,7 +13,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: pytorch-demo
-          image: distributed-training-runtime:local
+          image: distributed-training-runtime:local-secure
           imagePullPolicy: IfNotPresent
           env:
             - name: PYTHONPATH

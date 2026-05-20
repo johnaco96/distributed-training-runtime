@@ -26,7 +26,7 @@ What this does **not** cover:
 ## Build local image
 
 ```bash
-docker build -t distributed-training-runtime:local .
+docker build -t distributed-training-runtime:local-secure .
 ```
 
 ## Create local cluster (kind example)

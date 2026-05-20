@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import socket
 import subprocess
 import time
@@ -229,8 +230,27 @@ def main() -> None:
     latest_checkpoint_metadata: dict[str, Any] | None = None
 
     with maybe_start_coordinator(args) as (coordinator_addr, _proc):
-        with connect(coordinator_addr) as client:
-            run_response = client.register_run(
+        with connect(coordinator_addr) as base_client:
+            admin_client = base_client
+            auth_active = bool(os.getenv("DTRUNTIME_AUTH_SUBJECT") and os.getenv("DTRUNTIME_AUTH_ROLE"))
+            worker_role = os.getenv("DTRUNTIME_WORKER_AUTH_ROLE", "worker")
+            worker_subject_prefix = os.getenv("DTRUNTIME_WORKER_SUBJECT_PREFIX", "worker")
+
+            worker_clients = {}
+            if auth_active:
+                for worker_id in logical_worker_ids:
+                    default_subject = worker_id
+                    configured_subject = f"{worker_subject_prefix}-{worker_id.split('-')[-1]}" if worker_subject_prefix != "worker" else default_subject
+                    worker_clients[worker_id] = admin_client.for_worker(
+                        worker_id=worker_id,
+                        worker_role=worker_role,
+                        worker_subject=configured_subject,
+                    )
+            else:
+                for worker_id in logical_worker_ids:
+                    worker_clients[worker_id] = admin_client
+
+            run_response = admin_client.register_run(
                 idempotency_key=f"pt-register-run-{idempotency_suffix}",
                 run_name=run_name,
                 assignment_policy=client._runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
@@ -239,9 +259,9 @@ def main() -> None:
                 run_version="phase-20b",
             )
             run_id = run_response.run_id.value
-            client.register_dataset(run_id=run_id, name="synthetic", uri="synthetic://dataset", format="tensor", shards=shard_payload(shard_map), dataset_id=dataset_id)
+            admin_client.register_dataset(run_id=run_id, name="synthetic", uri="synthetic://dataset", format="tensor", shards=shard_payload(shard_map), dataset_id=dataset_id)
             for rank, worker_id in enumerate(logical_worker_ids):
-                registered = client.register_worker(
+                registered = worker_clients[worker_id].register_worker(
                     run_id=run_id,
                     worker_id=worker_id,
                     rank=rank,
@@ -253,7 +273,7 @@ def main() -> None:
 
             for epoch in range(start_epoch, args.epochs + 1):
                 for worker_id in worker_ids:
-                    assignment = client.request_shard(run_id=run_id, worker_id=worker_id, dataset_id=dataset_id, idempotency_key=f"pt-request-shard-{worker_id}-{epoch}-{idempotency_suffix}")
+                    assignment = worker_clients[worker_id].request_shard(run_id=run_id, worker_id=worker_id, dataset_id=dataset_id, idempotency_key=f"pt-request-shard-{worker_id}-{epoch}-{idempotency_suffix}")
                     assigned = [item.shard_id.value for item in assignment.assignments]
                     assignment_map[worker_id] = assigned
                     rpc_summary["shard_assignment_requests"] += 1
@@ -265,7 +285,7 @@ def main() -> None:
                     loss, acc, steps = train_worker_epoch(model, dataset, all_indices, args.batch_size, optimizer, criterion)
                     global_step += steps
                     worker_metrics[worker_id] = {"loss": loss, "accuracy": acc, "steps": steps, "epoch": epoch}
-                    client.heartbeat(run_id=run_id, worker_id=worker_id, active_shard_ids=assigned, idempotency_key=f"pt-heartbeat-{worker_id}-{epoch}-{idempotency_suffix}")
+                    worker_clients[worker_id].heartbeat(run_id=run_id, worker_id=worker_id, active_shard_ids=assigned, idempotency_key=f"pt-heartbeat-{worker_id}-{epoch}-{idempotency_suffix}")
                     rpc_summary["heartbeat_count"] += 1
 
                 final_loss, final_accuracy = evaluate(model, dataset, args.batch_size)
@@ -286,9 +306,9 @@ def main() -> None:
                         "final_accuracy": final_accuracy,
                     }
                     torch.save(state, ckpt_file)
-                    begin = client.begin_checkpoint(run_id=run_id, worker_id=worker_ids[0], step=global_step, idempotency_key=f"pt-begin-ckpt-{epoch}-{idempotency_suffix}")
+                    begin = worker_clients[worker_ids[0]].begin_checkpoint(run_id=run_id, worker_id=worker_ids[0], step=global_step, idempotency_key=f"pt-begin-ckpt-{epoch}-{idempotency_suffix}")
                     checkpoint_id = begin.checkpoint_id.value
-                    client.report_checkpoint_artifact(
+                    worker_clients[worker_ids[0]].report_checkpoint_artifact(
                         run_id=run_id,
                         worker_id=worker_ids[0],
                         checkpoint_id=checkpoint_id,
@@ -299,9 +319,9 @@ def main() -> None:
                         checksum_algorithm="sha256",
                         idempotency_key=f"pt-report-ckpt-{epoch}-{idempotency_suffix}",
                     )
-                    client.commit_checkpoint(run_id=run_id, checkpoint_id=checkpoint_id, idempotency_key=f"pt-commit-ckpt-{epoch}-{idempotency_suffix}")
+                    admin_client.commit_checkpoint(run_id=run_id, checkpoint_id=checkpoint_id, idempotency_key=f"pt-commit-ckpt-{epoch}-{idempotency_suffix}")
                     rpc_summary["checkpoints_committed"] += 1
-                    latest = client.restore_latest(run_id=run_id)
+                    latest = admin_client.restore_latest(run_id=run_id)
                     latest_checkpoint_metadata = {
                         "checkpoint_id": latest.manifest.checkpoint_id.value,
                         "step": latest.manifest.step,
