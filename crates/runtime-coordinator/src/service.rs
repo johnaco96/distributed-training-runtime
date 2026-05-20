@@ -222,6 +222,19 @@ impl CoordinatorServiceImpl {
     }
 }
 
+fn cached_shard_hints(metadata: &tonic::metadata::MetadataMap) -> Option<Vec<String>> {
+    metadata
+        .get("x-dtruntime-cached-shards")
+        .and_then(|v| v.to_str().ok())
+        .map(|raw| {
+            raw.split(',')
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+        })
+}
+
 fn invalid_argument(message: impl Into<String>) -> Status {
     Status::invalid_argument(message.into())
 }
@@ -411,6 +424,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetShardAssignmentRequest>,
     ) -> Result<Response<GetShardAssignmentResponse>, Status> {
+        let cached_hints = cached_shard_hints(request.metadata());
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -425,7 +439,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
         let shard_assignments = self
             .state
-            .get_shard_assignments(&run_id, &worker_id, &dataset_id)
+            .get_shard_assignments(&run_id, &worker_id, &dataset_id, cached_hints.as_deref())
             .map_err(|error| match error {
                 GetShardAssignmentsError::RunNotFound => {
                     not_found(format!("run {} was not found", run_id.value))
@@ -884,6 +898,7 @@ fn millis_to_timestamp(millis: u64) -> prost_types::Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::DatasetPlacementPolicy;
     use runtime_proto::runtime::v1::{AssignmentPolicy, StorageBackendKind};
     use runtime_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR, PROTOCOL_PATCH};
 
@@ -992,6 +1007,11 @@ mod tests {
 
     fn build_service() -> CoordinatorServiceImpl {
         CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()))
+    }
+    fn build_service_cache_aware() -> CoordinatorServiceImpl {
+        CoordinatorServiceImpl::new(Arc::new(CoordinatorState::with_placement_policy(
+            DatasetPlacementPolicy::CacheAware,
+        )))
     }
 
     #[tokio::test]
@@ -2638,5 +2658,35 @@ mod tests {
             .await
             .expect_err("overlong key should be rejected");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn cache_aware_assignment_prefers_cached_hint_order() {
+        let service = build_service_cache_aware();
+        let run_id = create_run_with_world_size(&service, 1).await;
+        let worker_id = register_worker_for_assignment(&service, run_id.clone(), 0, "worker").await;
+        let dataset_id = register_dataset_for_assignment(&service, run_id.clone()).await;
+        let mut request = Request::new(GetShardAssignmentRequest {
+            run_id: Some(run_id),
+            worker_id: Some(worker_id),
+            dataset_id: Some(dataset_id),
+            idempotency_key: "cache-hint".to_string(),
+        });
+        request.metadata_mut().insert(
+            "x-dtruntime-cached-shards",
+            "shard-3,missing".parse().expect("metadata"),
+        );
+        let response = service
+            .get_shard_assignment(request)
+            .await
+            .expect("shard assignment")
+            .into_inner();
+        let first = response.assignments[0]
+            .shard_id
+            .as_ref()
+            .expect("shard id")
+            .value
+            .clone();
+        assert_eq!(first, "shard-3");
     }
 }

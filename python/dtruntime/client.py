@@ -144,6 +144,7 @@ class RuntimeClient:
         worker_id: str,
         dataset_id: str,
         idempotency_key: str = "",
+        cached_shard_ids: Optional[list[str]] = None,
     ) -> "runtime_pb2.GetShardAssignmentResponse":
         """Request shard assignments from the coordinator and return its response."""
         request = self._runtime_pb2.GetShardAssignmentRequest(
@@ -152,7 +153,10 @@ class RuntimeClient:
             dataset_id=self._runtime_pb2.DatasetId(value=dataset_id),
             idempotency_key=idempotency_key,
         )
-        return self._stub.GetShardAssignment(request, metadata=self._auth_metadata)
+        metadata = list(self._auth_metadata)
+        if cached_shard_ids:
+            metadata.append(("x-dtruntime-cached-shards", ",".join(cached_shard_ids)))
+        return self._stub.GetShardAssignment(request, metadata=metadata)
 
     def begin_checkpoint(
         self,
