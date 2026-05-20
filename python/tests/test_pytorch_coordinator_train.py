@@ -105,3 +105,9 @@ def test_resume(tmp_path: Path) -> None:
     metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["final_epoch"] == 2
     assert metrics["resumed_from_checkpoint"] is True
+
+
+def test_example_uses_runtime_client_register_run_wrapper() -> None:
+    source = Path(MODULE).read_text(encoding="utf-8")
+    assert "client.register_run(" in source
+    assert "client.stub.RegisterRun(" not in source

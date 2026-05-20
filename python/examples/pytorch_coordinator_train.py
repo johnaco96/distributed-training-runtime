@@ -230,15 +230,13 @@ def main() -> None:
 
     with maybe_start_coordinator(args) as (coordinator_addr, _proc):
         with connect(coordinator_addr) as client:
-            run_response = client.stub.RegisterRun(
-                client._runtime_pb2.RegisterRunRequest(
-                    idempotency_key=f"pt-register-run-{idempotency_suffix}",
-                    run_name=run_name,
-                    assignment_policy=client._runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
-                    storage_backend_kind=client._runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
-                    world_size=args.workers,
-                    run_version="phase-20b",
-                )
+            run_response = client.register_run(
+                idempotency_key=f"pt-register-run-{idempotency_suffix}",
+                run_name=run_name,
+                assignment_policy=client._runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
+                storage_backend_kind=client._runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
+                world_size=args.workers,
+                run_version="phase-20b",
             )
             run_id = run_response.run_id.value
             client.register_dataset(run_id=run_id, name="synthetic", uri="synthetic://dataset", format="tensor", shards=shard_payload(shard_map), dataset_id=dataset_id)

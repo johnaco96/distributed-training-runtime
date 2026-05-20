@@ -75,6 +75,22 @@ class RegisterDatasetResponse:
     accepted_shard_count: int = 0
 
 
+
+
+@dataclass
+class RegisterRunRequest:
+    idempotency_key: str = ""
+    run_name: str = ""
+    assignment_policy: int = 0
+    storage_backend_kind: int = 0
+    world_size: int = 0
+    run_version: str = ""
+
+
+@dataclass
+class RegisterRunResponse:
+    run_id: Optional[RunId] = None
+
 @dataclass
 class RegisterWorkerRequest:
     idempotency_key: str = ""
@@ -194,6 +210,8 @@ def install_fake_generated_modules(monkeypatch):
         ShardMetadata=ShardMetadata,
         RegisterDatasetRequest=RegisterDatasetRequest,
         RegisterDatasetResponse=RegisterDatasetResponse,
+        RegisterRunRequest=RegisterRunRequest,
+        RegisterRunResponse=RegisterRunResponse,
         RegisterWorkerRequest=RegisterWorkerRequest,
         RegisterWorkerResponse=RegisterWorkerResponse,
         HeartbeatRequest=HeartbeatRequest,
@@ -573,3 +591,40 @@ def test_auth_metadata_from_env(monkeypatch):
     client = RuntimeClient("127.0.0.1:50051")
     client.restore_latest("r")
     assert stub.GetLatestCheckpoint.call_args.kwargs["metadata"] == [("x-dtruntime-subject", "admin"), ("x-dtruntime-role", "admin")]
+
+
+def test_register_run_builds_request_and_calls_stub(monkeypatch):
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    response = RegisterRunResponse(run_id=RunId(value="run-1"))
+    stub.RegisterRun.return_value = response
+
+    client = RuntimeClient("127.0.0.1:50051")
+    result = client.register_run(
+        idempotency_key="idem-run-1",
+        run_name="pt-coordinator",
+        assignment_policy=1,
+        storage_backend_kind=2,
+        world_size=4,
+        run_version="phase-20b",
+    )
+
+    stub.RegisterRun.assert_called_once_with(
+        RegisterRunRequest(
+            idempotency_key="idem-run-1",
+            run_name="pt-coordinator",
+            assignment_policy=1,
+            storage_backend_kind=2,
+            world_size=4,
+            run_version="phase-20b",
+        ),
+        metadata=[]
+    )
+    assert result == response
+
+
+def test_worker_rpc_adds_worker_metadata_when_identity_present(monkeypatch):
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    client = RuntimeClient("127.0.0.1:50051", auth_subject="admin", auth_role="admin")
+    client.heartbeat(run_id="run-1", worker_id="worker-1")
+    assert ("x-dtruntime-worker-id", "worker-1") in stub.Heartbeat.call_args.kwargs["metadata"]
+
