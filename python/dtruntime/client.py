@@ -20,7 +20,7 @@ class RuntimeClient:
     available for low-level use.
     """
 
-    def __init__(self, address: str, tls_ca_cert: str | Path | None = None, tls_client_cert: str | Path | None = None, tls_client_key: str | Path | None = None) -> None:
+    def __init__(self, address: str, tls_ca_cert: str | Path | None = None, tls_client_cert: str | Path | None = None, tls_client_key: str | Path | None = None, auth_subject: str | None = None, auth_role: str | None = None, auth_worker_id: str | None = None) -> None:
         """Create a client connected to a coordinator gRPC address."""
         try:
             import grpc
@@ -38,6 +38,17 @@ class RuntimeClient:
         tls_ca_cert = tls_ca_cert or os.getenv("DTRUNTIME_TLS_CA_CERT")
         tls_client_cert = tls_client_cert or os.getenv("DTRUNTIME_TLS_CLIENT_CERT")
         tls_client_key = tls_client_key or os.getenv("DTRUNTIME_TLS_CLIENT_KEY")
+
+        auth_subject = auth_subject or os.getenv("DTRUNTIME_AUTH_SUBJECT")
+        auth_role = auth_role or os.getenv("DTRUNTIME_AUTH_ROLE")
+        auth_worker_id = auth_worker_id or os.getenv("DTRUNTIME_AUTH_WORKER_ID")
+        self._auth_metadata: list[tuple[str, str]] = []
+        if auth_subject:
+            self._auth_metadata.append(("x-dtruntime-subject", auth_subject))
+        if auth_role:
+            self._auth_metadata.append(("x-dtruntime-role", auth_role))
+        if auth_worker_id:
+            self._auth_metadata.append(("x-dtruntime-worker-id", auth_worker_id))
 
         if (tls_client_cert is None) != (tls_client_key is None):
             raise ValueError("tls_client_cert and tls_client_key must be provided together")
@@ -78,7 +89,7 @@ class RuntimeClient:
             sdk_version=sdk_version,
             protocol_version=protocol_version,
         )
-        return self._stub.RegisterWorker(request)
+        return self._stub.RegisterWorker(request, metadata=self._auth_metadata)
 
     def register_dataset(
         self,
@@ -110,7 +121,7 @@ class RuntimeClient:
             ),
             shards=shard_metadata,
         )
-        return self._stub.RegisterDataset(request)
+        return self._stub.RegisterDataset(request, metadata=self._auth_metadata)
 
     def _shard_metadata_from_dict(
         self, shard: dict[str, Any], dataset_id: str
@@ -141,7 +152,7 @@ class RuntimeClient:
             dataset_id=self._runtime_pb2.DatasetId(value=dataset_id),
             idempotency_key=idempotency_key,
         )
-        return self._stub.GetShardAssignment(request)
+        return self._stub.GetShardAssignment(request, metadata=self._auth_metadata)
 
     def begin_checkpoint(
         self,
@@ -159,7 +170,7 @@ class RuntimeClient:
             step=step,
             idempotency_key=idempotency_key,
         )
-        return self._stub.BeginCheckpoint(request)
+        return self._stub.BeginCheckpoint(request, metadata=self._auth_metadata)
 
 
     def report_checkpoint_artifact(
@@ -188,7 +199,7 @@ class RuntimeClient:
             ),
             idempotency_key=idempotency_key,
         )
-        return self._stub.ReportCheckpointArtifact(request)
+        return self._stub.ReportCheckpointArtifact(request, metadata=self._auth_metadata)
 
     def commit_checkpoint(
         self,
@@ -202,7 +213,7 @@ class RuntimeClient:
             checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
             idempotency_key=idempotency_key,
         )
-        return self._stub.CommitCheckpoint(request)
+        return self._stub.CommitCheckpoint(request, metadata=self._auth_metadata)
 
     def restore_latest(
         self,
@@ -212,7 +223,7 @@ class RuntimeClient:
         request = self._runtime_pb2.GetLatestCheckpointRequest(
             run_id=self._runtime_pb2.RunId(value=run_id),
         )
-        return self._stub.GetLatestCheckpoint(request)
+        return self._stub.GetLatestCheckpoint(request, metadata=self._auth_metadata)
 
     def heartbeat(
         self,
@@ -231,7 +242,7 @@ class RuntimeClient:
                 for shard_id in active_shard_ids or []
             ],
         )
-        return self._stub.Heartbeat(request)
+        return self._stub.Heartbeat(request, metadata=self._auth_metadata)
 
     def close(self) -> None:
         """Close the underlying gRPC channel."""

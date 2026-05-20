@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use runtime_coordinator::auth::{AuthMode, Authorizer};
 use runtime_coordinator::init_tracing_from_env;
 use runtime_coordinator::persistence::SqliteMetadataStore;
 use runtime_coordinator::service::CoordinatorServiceImpl;
@@ -22,6 +23,7 @@ struct CoordinatorCliArgs {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     tls_client_ca: Option<PathBuf>,
+    auth_mode: AuthMode,
     show_help: bool,
 }
 
@@ -46,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Arc::new(CoordinatorState::default())
     };
-    let service = CoordinatorServiceImpl::new(state);
+    let service = CoordinatorServiceImpl::with_authorizer(state, Authorizer::new(args.auth_mode));
 
     info!(%addr, "starting runtime-coordinator gRPC server");
 
@@ -110,10 +112,11 @@ fn load_tls_config(
 }
 
 fn print_usage() {
-    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--help|-h]");
+    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--help|-h]");
     println!("\nOptions:");
     println!("  --addr <ADDR>           Coordinator listen address (default: {DEFAULT_ADDR})");
     println!("  --metadata-db <PATH>    Enable SQLite metadata persistence at PATH");
+    println!("  --auth-mode <MODE>      Authorization mode: disabled|metadata (env: DTRUNTIME_AUTH_MODE)");
     println!("  --tls-cert <PATH>       Enable TLS with certificate chain PEM at PATH (requires --tls-key)");
     println!(
         "  --tls-key <PATH>        Enable TLS with private key PEM at PATH (requires --tls-cert)"
@@ -132,6 +135,12 @@ fn coordinator_args(
         tls_cert: None,
         tls_key: None,
         tls_client_ca: None,
+        auth_mode: std::env::var("DTRUNTIME_AUTH_MODE")
+            .ok()
+            .as_deref()
+            .unwrap_or("disabled")
+            .parse()
+            .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
         show_help: false,
     };
 
@@ -140,6 +149,12 @@ fn coordinator_args(
             parsed.addr = args.next().ok_or("--addr requires an address")?;
         } else if arg == "--metadata-db" {
             parsed.metadata_db = Some(args.next().ok_or("--metadata-db requires a path")?);
+        } else if arg == "--auth-mode" {
+            parsed.auth_mode = args
+                .next()
+                .ok_or("--auth-mode requires a value")?
+                .parse()
+                .map_err(|e: String| format!("invalid --auth-mode value: {e}"))?;
         } else if arg == "--tls-cert" {
             parsed.tls_cert = Some(PathBuf::from(
                 args.next().ok_or("--tls-cert requires a path")?,
@@ -177,6 +192,12 @@ mod tests {
                 tls_cert: None,
                 tls_key: None,
                 tls_client_ca: None,
+                auth_mode: std::env::var("DTRUNTIME_AUTH_MODE")
+                    .ok()
+                    .as_deref()
+                    .unwrap_or("disabled")
+                    .parse()
+                    .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
                 show_help: false,
             }
         );
@@ -255,6 +276,12 @@ mod tests {
         assert!(parsed.show_help);
     }
 
+    #[test]
+    fn auth_mode_parse() {
+        let parsed = coordinator_args(vec!["--auth-mode".to_string(), "metadata".to_string()])
+            .expect("auth mode should parse");
+        assert_eq!(parsed.auth_mode, AuthMode::Metadata);
+    }
     #[test]
     fn unknown_arg_errors() {
         let err = coordinator_args(vec!["--wat".to_string()]).expect_err("should error");

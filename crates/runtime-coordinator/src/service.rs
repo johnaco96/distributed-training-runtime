@@ -8,6 +8,7 @@ use runtime_proto::runtime::v1::*;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
+use crate::auth::Authorizer;
 use crate::state::{
     BeginCheckpointError, CommitCheckpointError, CoordinatorState, GetLatestCheckpointError,
     GetShardAssignmentsError, RenewShardLeaseError, ReportCheckpointArtifactError,
@@ -19,19 +20,62 @@ use crate::{RuntimeMetrics, RuntimeMetricsSnapshot};
 pub struct CoordinatorServiceImpl {
     state: Arc<CoordinatorState>,
     metrics: Arc<RuntimeMetrics>,
+    authorizer: Authorizer,
 }
 
 impl CoordinatorServiceImpl {
     pub fn new(state: Arc<CoordinatorState>) -> Self {
-        Self::with_metrics(state, Arc::new(RuntimeMetrics::default()))
+        Self::with_metrics_and_authorizer(
+            state,
+            Arc::new(RuntimeMetrics::default()),
+            Authorizer::new(crate::auth::AuthMode::Disabled),
+        )
     }
 
     pub fn with_metrics(state: Arc<CoordinatorState>, metrics: Arc<RuntimeMetrics>) -> Self {
-        Self { state, metrics }
+        Self::with_metrics_and_authorizer(
+            state,
+            metrics,
+            Authorizer::new(crate::auth::AuthMode::Disabled),
+        )
+    }
+
+    pub fn with_authorizer(state: Arc<CoordinatorState>, authorizer: Authorizer) -> Self {
+        Self::with_metrics_and_authorizer(state, Arc::new(RuntimeMetrics::default()), authorizer)
+    }
+
+    pub fn with_metrics_and_authorizer(
+        state: Arc<CoordinatorState>,
+        metrics: Arc<RuntimeMetrics>,
+        authorizer: Authorizer,
+    ) -> Self {
+        Self {
+            state,
+            metrics,
+            authorizer,
+        }
     }
 
     pub fn metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    fn require_admin<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        self.authorizer.require_admin(request.metadata())
+    }
+
+    fn require_worker_capability<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        self.authorizer
+            .require_worker_capability(request.metadata())
+    }
+
+    fn allow_admin_or_worker_self<T>(
+        &self,
+        request: &Request<T>,
+        worker_id: &str,
+    ) -> Result<(), Status> {
+        self.authorizer
+            .allow_admin_or_worker_self(request.metadata(), worker_id)
     }
 
     fn update_worker_metrics(&self, run_id: &RunId) {
@@ -80,8 +124,9 @@ fn validate_idempotency_key(operation: &str, idempotency_key: &str) -> Result<()
 impl CoordinatorService for CoordinatorServiceImpl {
     async fn get_runtime_info(
         &self,
-        _request: Request<GetRuntimeInfoRequest>,
+        request: Request<GetRuntimeInfoRequest>,
     ) -> Result<Response<GetRuntimeInfoResponse>, Status> {
+        self.require_admin(&request)?;
         let version = protocol_version();
         let capabilities = RuntimeCapabilities {
             protocol_version: Some(version.clone()),
@@ -101,6 +146,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<RegisterRunRequest>,
     ) -> Result<Response<RegisterRunResponse>, Status> {
+        self.require_admin(&request)?;
         let request = request.into_inner();
         validate_idempotency_key("register_run", &request.idempotency_key)?;
         let registered = self.state.register_run(request);
@@ -118,6 +164,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<RegisterWorkerRequest>,
     ) -> Result<Response<RegisterWorkerResponse>, Status> {
+        self.require_worker_capability(&request)?;
         let request = request.into_inner();
         validate_idempotency_key("register_worker", &request.idempotency_key)?;
         let run_id = request
@@ -154,6 +201,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
 
         let heartbeat = self
             .state
@@ -181,6 +229,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<RegisterDatasetRequest>,
     ) -> Result<Response<RegisterDatasetResponse>, Status> {
+        self.require_admin(&request)?;
         let request = request.into_inner();
         validate_idempotency_key("register_dataset", &request.idempotency_key)?;
         let run_id = request
@@ -213,6 +262,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
         let dataset_id = request
             .dataset_id
             .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
@@ -283,6 +333,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
         let shard_id = request
             .shard_id
             .ok_or_else(|| Status::invalid_argument("shard_id is required"))?;
@@ -342,6 +393,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
         let dataset_id = request
             .dataset_id
             .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
@@ -415,6 +467,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        self.allow_admin_or_worker_self(&request, &worker_id.value)?;
 
         let checkpoint = self
             .state
@@ -515,6 +568,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<CommitCheckpointRequest>,
     ) -> Result<Response<CommitCheckpointResponse>, Status> {
+        self.require_admin(&request)?;
         let request = request.into_inner();
         validate_idempotency_key("commit_checkpoint", &request.idempotency_key)?;
         let run_id = request
@@ -559,6 +613,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetLatestCheckpointRequest>,
     ) -> Result<Response<GetLatestCheckpointResponse>, Status> {
+        self.require_admin(&request)?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -623,6 +678,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetRunStatusRequest>,
     ) -> Result<Response<GetRunStatusResponse>, Status> {
+        self.require_admin(&request)?;
         let request = request.into_inner();
         let run_id = request
             .run_id
