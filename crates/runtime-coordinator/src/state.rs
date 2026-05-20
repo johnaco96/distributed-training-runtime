@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
@@ -21,6 +21,12 @@ const SHARD_LEASE_DURATION: Duration = Duration::from_secs(30);
 
 use crate::persistence::SqliteMetadataStore;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatasetPlacementPolicy {
+    Deterministic,
+    CacheAware,
+}
+
 /// Shared coordinator state.
 ///
 /// This is intentionally in-memory only for the MVP coordinator. It is not
@@ -28,6 +34,7 @@ use crate::persistence::SqliteMetadataStore;
 #[derive(Debug)]
 pub struct CoordinatorState {
     inner: RwLock<CoordinatorStateInner>,
+    placement_policy: DatasetPlacementPolicy,
     metadata_store: Option<SqliteMetadataStore>,
     next_run_id: AtomicU64,
     next_worker_id: AtomicU64,
@@ -280,11 +287,19 @@ impl Default for CoordinatorState {
             next_dataset_id: AtomicU64::new(0),
             next_shard_id: AtomicU64::new(0),
             next_checkpoint_id: AtomicU64::new(0),
+            placement_policy: DatasetPlacementPolicy::Deterministic,
         }
     }
 }
 
 impl CoordinatorState {
+    pub fn with_placement_policy(placement_policy: DatasetPlacementPolicy) -> Self {
+        Self {
+            placement_policy,
+            ..Self::default()
+        }
+    }
+
     fn ensure_worker_active_for_lease_actions(worker: &WorkerRecord) -> Result<(), WorkerState> {
         if worker.state == WorkerState::Active as i32 {
             return Ok(());
@@ -833,6 +848,7 @@ impl CoordinatorState {
         run_id: &RunId,
         worker_id: &WorkerId,
         dataset_id: &DatasetId,
+        cached_shard_hints: Option<&[String]>,
     ) -> Result<ShardAssignments, GetShardAssignmentsError> {
         let inner = self.inner.read().expect("coordinator state lock poisoned");
         let run = inner
@@ -859,12 +875,32 @@ impl CoordinatorState {
         let lease_expires_at = server_time + SHARD_LEASE_DURATION;
         let world_size = run.world_size as usize;
         let worker_rank = worker.rank as usize;
-        let assignments = dataset
+        let mut candidate_shards: Vec<&ShardRecord> = dataset
             .shards
             .iter()
             .enumerate()
             .filter(|(shard_index, _)| *shard_index % world_size == worker_rank)
-            .map(|(_, shard)| ShardAssignmentRecord {
+            .map(|(_, shard)| shard)
+            .collect();
+
+        if self.placement_policy == DatasetPlacementPolicy::CacheAware {
+            let hint_set: HashSet<&str> = cached_shard_hints
+                .unwrap_or(&[])
+                .iter()
+                .map(String::as_str)
+                .collect();
+            candidate_shards.sort_by_key(|shard| {
+                if hint_set.contains(shard.shard_id.as_str()) {
+                    0
+                } else {
+                    1
+                }
+            });
+        }
+
+        let assignments = candidate_shards
+            .into_iter()
+            .map(|shard| ShardAssignmentRecord {
                 run_id: run.run_id.clone(),
                 dataset_id: dataset.dataset_id.clone(),
                 shard_id: shard.shard_id.clone(),

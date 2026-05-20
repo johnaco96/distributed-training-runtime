@@ -436,6 +436,24 @@ def test_request_shard_builds_request_and_calls_stub(monkeypatch):
     assert result == response
 
 
+def test_request_shard_includes_cached_shard_metadata_when_provided(monkeypatch):
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    response = GetShardAssignmentResponse(assignments=[object()])
+    stub.GetShardAssignment.return_value = response
+    client = RuntimeClient("127.0.0.1:50051")
+
+    client.request_shard(
+        run_id="run-1",
+        worker_id="worker-1",
+        dataset_id="dataset-1",
+        cached_shard_ids=["shard-a", "shard-b"],
+    )
+
+    assert stub.GetShardAssignment.call_args.kwargs["metadata"] == [
+        ("x-dtruntime-cached-shards", "shard-a,shard-b")
+    ]
+
+
 def test_begin_checkpoint_builds_request_and_calls_stub(monkeypatch):
     _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
     response = BeginCheckpointResponse(checkpoint_id=CheckpointId(value="ckpt-1"))
