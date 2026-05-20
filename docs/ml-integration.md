@@ -1,5 +1,7 @@
 # ML Integration (Phase 18)
 
+For end-to-end component and flow context, see [Architecture Overview](architecture.md).
+
 ## Goal
 
 Phase 18 introduces real ML-facing examples that can be connected to runtime checkpointing flows.
