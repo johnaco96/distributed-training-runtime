@@ -131,3 +131,12 @@ Generated output cleanup:
 ```bash
 rm -rf .dtruntime-demo .dtruntime-pytorch-smoke .dtruntime-pytorch-no-checkpoint .dtruntime-pytorch-dist-smoke .dtruntime-pytorch-dist-no-checkpoint
 ```
+
+
+Coordinator-driven PyTorch orchestration (Phase 20B):
+
+```bash
+PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator
+PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 2 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator --resume
+PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator-no-checkpoint --no-checkpoint
+```

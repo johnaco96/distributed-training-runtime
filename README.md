@@ -138,3 +138,13 @@ Recent local validation scope (environment-dependent):
 - local integration tests
 
 If your environment is missing optional dependencies/services (for example, crates index access, `google.protobuf`, PyTorch, or Docker/MinIO), see the quickstart and runbook notes for expected behavior and workarounds.
+
+
+### PyTorch coordinator-driven orchestration example (Phase 20B)
+
+```bash
+PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator
+PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 2 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator --resume
+```
+
+This example uses the coordinator for run/worker/dataset/shard/checkpoint flows while keeping execution local and single-process.

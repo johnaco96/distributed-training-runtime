@@ -138,3 +138,24 @@ Phase 18 does **not** prove:
 - production orchestration/scheduling
 - coordinator-driven ML training orchestration (future work)
 - cloud/S3 checkpoint restore flows for ML examples (future work)
+
+
+## Coordinator-driven PyTorch example (Phase 20B)
+
+Fresh run:
+
+```bash
+PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator
+```
+
+Resume:
+
+```bash
+PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 2 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator --resume
+```
+
+No checkpoint:
+
+```bash
+PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator-no-checkpoint --no-checkpoint
+```
