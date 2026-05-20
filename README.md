@@ -79,6 +79,7 @@ PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --ru
 - [ML runbook](docs/ml-runbook.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Status and limitations](docs/status-and-limitations.md)
+- [Observability](docs/observability.md)
 - [Product direction](docs/product-direction.md)
 - [Demo checklist](docs/demo-checklist.md)
 - [Project packaging](docs/project-packaging.md)
@@ -150,3 +151,7 @@ See:
 
 ## Phase 20 benchmark surface expansion
 Added runtime-bench subcommands: `dataset-prefetch`, `cache-aware-placement`, `auth-audit-overhead`, and `status-snapshot`. Outputs now include `environment`, `surface`, `mode`, `caveats`, `timestamp_utc`, duration/latency fields, plus JSON/CSV outputs. MinIO-gated paths remain optional and must be enabled via `DTRUNTIME_RUN_MINIO_TESTS=1`; otherwise they should skip cleanly with caveats.
+
+
+## Step 1 production observability
+Prometheus /metrics is available via `--metrics-addr` and Grafana dashboard assets are under `observability/`.

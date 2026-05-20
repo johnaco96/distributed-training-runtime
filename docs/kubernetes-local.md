@@ -114,3 +114,6 @@ This path is local/dev only and not a production claim.
 9. Cleanup: `kubectl delete -f k8s/local-secure/`
 
 No cert/key/token material is committed in-repo.
+
+
+Observability update: Step 1 Prometheus/Grafana is implemented. See `docs/observability.md`, `observability/prometheus/prometheus.yml`, and `observability/grafana/dtruntime-dashboard.json`.
