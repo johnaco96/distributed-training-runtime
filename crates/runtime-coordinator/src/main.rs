@@ -475,34 +475,111 @@ fn serve_metrics_endpoint(
         let mut buf = [0_u8; 1024];
         let read = stream.read(&mut buf).unwrap_or(0);
         let req = String::from_utf8_lossy(&buf[..read]);
-        let is_get_metrics = req.starts_with("GET /metrics ");
-        let (status, content_type, body) = if is_get_metrics {
-            (
-                "200 OK",
-                "text/plain; version=0.0.4",
-                render_prometheus_metrics(&service.metrics_snapshot(), audit.emitted_count()),
-            )
-        } else if req.starts_with("GET ") {
-            ("404 Not Found", "text/plain", String::from("not found"))
-        } else {
-            (
-                "405 Method Not Allowed",
-                "text/plain",
-                String::from("method not allowed"),
-            )
-        };
-        let header = format!(
-            "HTTP/1.1 {}
-content-type: {}
-content-length: {}
-
-",
-            status,
-            content_type,
-            body.len()
-        );
-        let _ = stream.write_all(header.as_bytes());
-        let _ = stream.write_all(body.as_bytes());
+        let response = build_metrics_http_response(&req, &service, &audit);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
     }
     Ok(())
+}
+
+fn build_metrics_http_response(
+    request: &str,
+    service: &CoordinatorServiceImpl,
+    audit: &AuditLogger,
+) -> String {
+    let is_get_metrics = request.starts_with("GET /metrics ");
+    let (status, content_type, body) = if is_get_metrics {
+        (
+            "200 OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            render_prometheus_metrics(&service.metrics_snapshot(), audit.emitted_count()),
+        )
+    } else if request.starts_with("GET ") {
+        (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            String::from("not found"),
+        )
+    } else {
+        (
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            String::from("method not allowed"),
+        )
+    };
+
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.as_bytes().len()
+    )
+}
+
+#[cfg(test)]
+mod metrics_http_tests {
+    use super::*;
+
+    fn test_service_and_audit() -> (CoordinatorServiceImpl, AuditLogger) {
+        (
+            CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default())),
+            AuditLogger::buffered(),
+        )
+    }
+
+    #[test]
+    fn metrics_http_response_is_strict_http_11() {
+        let (service, audit) = test_service_and_audit();
+        let response =
+            build_metrics_http_response("GET /metrics HTTP/1.1\r\n\r\n", &service, &audit);
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
+        assert!(response.contains("Connection: close\r\n"));
+        assert!(response.contains("# HELP dtruntime_runs_total"));
+        assert!(response.contains("# TYPE dtruntime_runs_total counter"));
+    }
+
+    #[test]
+    fn unknown_path_returns_404() {
+        let (service, audit) = test_service_and_audit();
+        let response = build_metrics_http_response("GET /wat HTTP/1.1\r\n\r\n", &service, &audit);
+
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    }
+
+    #[test]
+    fn unsupported_method_returns_405() {
+        let (service, audit) = test_service_and_audit();
+        let response =
+            build_metrics_http_response("POST /metrics HTTP/1.1\r\n\r\n", &service, &audit);
+
+        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+    }
+
+    #[test]
+    fn metrics_output_does_not_contain_secret_markers() {
+        let (service, audit) = test_service_and_audit();
+        let response =
+            build_metrics_http_response("GET /metrics HTTP/1.1\r\n\r\n", &service, &audit);
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default();
+
+        for marker in [
+            "PRIVATE KEY",
+            "BEGIN RSA",
+            "BEGIN EC",
+            "BEGIN OPENSSH",
+            "AKIA",
+            "xoxb-",
+            "password=",
+            "secret=",
+            "token=",
+        ] {
+            assert!(
+                !body.contains(marker),
+                "metrics body leaked marker: {marker}"
+            );
+        }
+    }
 }
