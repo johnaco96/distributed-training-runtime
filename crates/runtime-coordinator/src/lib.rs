@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod audit;
 pub mod auth;
+pub mod ha_lock;
 pub mod persistence;
 pub mod service;
 pub mod state;
