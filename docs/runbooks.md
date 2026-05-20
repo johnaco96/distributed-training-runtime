@@ -153,3 +153,11 @@ mTLS coordinator:
 ```bash
 cargo run -p runtime-coordinator -- --addr 127.0.0.1:50051 --tls-cert .dtruntime-certs/server.crt --tls-key .dtruntime-certs/server.key --tls-client-ca .dtruntime-certs/ca.crt
 ```
+
+
+## Phase 20 hardening update (in progress)
+
+- Added stricter env-gated MinIO/S3 integration-test behavior with explicit skip messaging.
+- Expanded benchmark/runbook documentation labels and caveats for local/dev versus secure/minio optional surfaces.
+- Secure Kubernetes runbook depth expanded for local certificate/secret creation flow.
+- Production readiness is still not claimed; remaining gaps are tracked in status/production docs.

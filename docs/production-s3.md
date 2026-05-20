@@ -68,3 +68,17 @@ This phase does **not** implement:
 - Production cloud-provider S3 deployment.
 - Automatic IAM provisioning.
 - Full production S3 tuning in runtime code.
+
+
+## Local/dev MinIO validation environment variables
+
+- `DTRUNTIME_RUN_MINIO_TESTS=1` to enable env-gated MinIO tests.
+- `DTRUNTIME_S3_ENDPOINT_URL` S3-compatible endpoint (for example local MinIO).
+- `DTRUNTIME_S3_REGION` logical region string.
+- `DTRUNTIME_S3_BUCKET` target bucket for test data.
+- `DTRUNTIME_S3_ACCESS_KEY_ID` access key id for local/dev test user.
+- `DTRUNTIME_S3_SECRET_ACCESS_KEY` secret key for local/dev test user.
+- `DTRUNTIME_S3_FORCE_PATH_STYLE` optional (`true`/`1`) for MinIO style addressing.
+- `DTRUNTIME_S3_KEY_PREFIX` optional test key prefix root.
+
+These are local/dev validation inputs only and must not be committed.

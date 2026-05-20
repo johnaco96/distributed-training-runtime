@@ -300,3 +300,11 @@ Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit 
 
 Phase 20 is complete as a local-first packaging + security-foundation milestone. Dashboard implementation, HA coordinator replication semantics, and production S3 hardening are still planned implementation tracks documented in Phase 20F-5 design docs.
 
+
+
+## Phase 20 hardening update (in progress)
+
+- Added stricter env-gated MinIO/S3 integration-test behavior with explicit skip messaging.
+- Expanded benchmark/runbook documentation labels and caveats for local/dev versus secure/minio optional surfaces.
+- Secure Kubernetes runbook depth expanded for local certificate/secret creation flow.
+- Production readiness is still not claimed; remaining gaps are tracked in status/production docs.

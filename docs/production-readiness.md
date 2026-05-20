@@ -87,3 +87,11 @@ Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit 
 
 Production readiness claims must now satisfy the explicit gates in [production-gates.md](production-gates.md). Phase 20 completion is documented as a security/product-direction milestone, not full production readiness.
 
+
+
+## Phase 20 hardening update (in progress)
+
+- Added stricter env-gated MinIO/S3 integration-test behavior with explicit skip messaging.
+- Expanded benchmark/runbook documentation labels and caveats for local/dev versus secure/minio optional surfaces.
+- Secure Kubernetes runbook depth expanded for local certificate/secret creation flow.
+- Production readiness is still not claimed; remaining gaps are tracked in status/production docs.
