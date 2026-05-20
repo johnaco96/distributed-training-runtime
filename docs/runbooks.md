@@ -133,3 +133,23 @@ Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit 
 
 Runbooks currently cover local/dev flows. Future runbooks should implement the production gates in [production-gates.md](production-gates.md), including dashboard auth, HA failover drills, and production S3 restore/retention validation.
 
+
+## Local TLS/mTLS smoke
+
+Generate local development certificates (PowerShell):
+
+```powershell
+pwsh -File scripts/generate_dev_certs.ps1
+```
+
+TLS coordinator:
+
+```bash
+cargo run -p runtime-coordinator -- --addr 127.0.0.1:50051 --tls-cert .dtruntime-certs/server.crt --tls-key .dtruntime-certs/server.key
+```
+
+mTLS coordinator:
+
+```bash
+cargo run -p runtime-coordinator -- --addr 127.0.0.1:50051 --tls-cert .dtruntime-certs/server.crt --tls-key .dtruntime-certs/server.key --tls-client-ca .dtruntime-certs/ca.crt
+```

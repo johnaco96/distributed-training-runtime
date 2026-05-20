@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use runtime_coordinator::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome};
 use runtime_coordinator::auth::{AuthMode, Authorizer};
+use runtime_coordinator::ha_lock::CoordinatorLockGuard;
 use runtime_coordinator::init_tracing_from_env;
 use runtime_coordinator::persistence::SqliteMetadataStore;
 use runtime_coordinator::service::CoordinatorServiceImpl;
@@ -41,6 +42,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audit = AuditLogger::tracing();
     let addr: SocketAddr = args.addr.parse()?;
     info!(%addr, "runtime-coordinator configured listen address");
+
+    let _lock_guard = if let Some(path) = &args.metadata_db {
+        Some(CoordinatorLockGuard::acquire(std::path::Path::new(path))?)
+    } else {
+        None
+    };
 
     let state = if let Some(path) = args.metadata_db {
         info!(metadata_db_path = %path, "runtime-coordinator using sqlite metadata store");
@@ -320,5 +327,19 @@ mod tests {
     fn unknown_arg_errors() {
         let err = coordinator_args(vec!["--wat".to_string()]).expect_err("should error");
         assert_eq!(err.to_string(), "unexpected argument: --wat");
+    }
+}
+
+#[cfg(test)]
+mod ha_lock_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_lock_prevents_second_coordinator() {
+        let base = std::env::temp_dir().join(format!("dtruntime_lock_test_{}", std::process::id()));
+        let db = base.join("coordinator.db");
+        let _first = CoordinatorLockGuard::acquire(&db).expect("first lock");
+        let second = CoordinatorLockGuard::acquire(&db);
+        assert!(second.is_err());
     }
 }
