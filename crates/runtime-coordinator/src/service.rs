@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
+use runtime_proto::{protocol_version, PROTOCOL_MAJOR, PROTOCOL_MINOR, PROTOCOL_PATCH};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
@@ -58,6 +59,13 @@ fn already_exists(message: impl Into<String>) -> Status {
 }
 
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
+const RUNTIME_CAPABILITIES: [&str; 5] = [
+    "checkpoint-cleanup-library",
+    "idempotency-key-validation",
+    "lease-active-worker-gate",
+    "local-scaling-benchmarks",
+    "s3-storage",
+];
 
 fn validate_idempotency_key(operation: &str, idempotency_key: &str) -> Result<(), Status> {
     if !idempotency_key.is_empty() && idempotency_key.len() > MAX_IDEMPOTENCY_KEY_LEN {
@@ -70,6 +78,25 @@ fn validate_idempotency_key(operation: &str, idempotency_key: &str) -> Result<()
 
 #[tonic::async_trait]
 impl CoordinatorService for CoordinatorServiceImpl {
+    async fn get_runtime_info(
+        &self,
+        _request: Request<GetRuntimeInfoRequest>,
+    ) -> Result<Response<GetRuntimeInfoResponse>, Status> {
+        let version = protocol_version();
+        let capabilities = RuntimeCapabilities {
+            protocol_version: Some(version.clone()),
+            features: RUNTIME_CAPABILITIES
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect(),
+        };
+
+        Ok(Response::new(GetRuntimeInfoResponse {
+            protocol_version: Some(version),
+            capabilities: Some(capabilities),
+        }))
+    }
+
     async fn register_run(
         &self,
         request: Request<RegisterRunRequest>,
@@ -748,6 +775,42 @@ mod tests {
             }),
             shards,
         }
+    }
+
+    #[tokio::test]
+    async fn get_runtime_info_returns_protocol_version_and_capabilities() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let response = service
+            .get_runtime_info(Request::new(GetRuntimeInfoRequest {}))
+            .await
+            .expect("get_runtime_info should succeed")
+            .into_inner();
+
+        let version = response
+            .protocol_version
+            .expect("runtime info must include protocol version");
+        assert_eq!(version.major, PROTOCOL_MAJOR);
+        assert_eq!(version.minor, PROTOCOL_MINOR);
+        assert_eq!(version.patch, PROTOCOL_PATCH);
+
+        let capabilities = response
+            .capabilities
+            .expect("runtime info must include capabilities");
+        assert_eq!(
+            capabilities
+                .protocol_version
+                .expect("capabilities should include version"),
+            version
+        );
+
+        let mut features = capabilities.features;
+        features.sort_unstable();
+        let mut expected = RUNTIME_CAPABILITIES
+            .iter()
+            .map(|feature| (*feature).to_string())
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(features, expected);
     }
 
     #[tokio::test]
