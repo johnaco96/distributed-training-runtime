@@ -1,165 +1,94 @@
 # Distributed Training Runtime
 
-Distributed Training Runtime is a **local-first prototype** for coordinating ML-oriented runtime tasks with a Rust coordinator and a Python SDK. It focuses on dataset sharding, worker coordination, checkpoint metadata/artifact flows, and local validation workflows that are useful for development and experimentation.
+Distributed Training Runtime is a **local-first ML runtime control-plane prototype**. It is a **Rust/Python runtime for worker coordination, dataset shard assignment, checkpoint metadata, and training recovery experiments**.
 
-## What this project currently does
+This repository is positioned as a **serious ML infrastructure prototype/research project**: it demonstrates practical control-plane concepts and reproducible local validation flows without claiming production-scale deployment readiness.
 
-- Provides a Rust gRPC coordinator and Python client SDK for local runtime experiments.
-- Supports dataset registration, shard assignment, worker heartbeats, and lease-aware coordination.
-- Supports checkpoint metadata flows plus local/object-storage artifact paths (including MinIO/S3-compatible backend support).
-- Includes local benchmark harnesses for coordinator/worker RPC and scaling-oriented simulations.
-- Includes PyTorch examples for single-worker training and a **simulated** distributed-style workflow with checkpoint resume.
+## What is this project?
 
-## What this project does **not** claim yet
+A local runtime stack with:
+- Rust coordinator services (gRPC control-plane surface)
+- Python SDK and runnable examples
+- Coordinator-backed worker/dataset/shard/checkpoint flows
+- Local benchmark surfaces for orchestration overhead exploration
 
-- Not production distributed training orchestration.
-- Not real multi-node scheduler-backed ML execution.
-- Not `torch.distributed` integration.
-- Not Kubernetes deployment support.
-- Not Prometheus/Grafana exporter integration (current observability is structured logs + in-process metrics).
-- Not a fully validated cloud-production S3 path by default (must be explicitly validated in your environment).
+## What problem does it explore?
 
-## Current status
+How to make ML training control-plane behaviors explicit and testable in a local-first environment:
+- deterministic shard assignment
+- worker registration/heartbeat lifecycle
+- checkpoint metadata + artifact lifecycle
+- recovery/resume experiments
+- overhead trade-offs between standalone training and coordinator-driven orchestration
 
-This repository is currently at **Phase 20A (product direction documentation complete)**, with Phases 10 through 19 completed and the Phase 20 roadmap explicitly selected.
+## What works today?
 
-Highlights from completed phases:
-- Benchmark harness foundations and scaling simulation paths.
-- Observability foundations (structured logs + in-process metrics).
-- Hardening work for retries/idempotency, lease behavior, and checkpoint cleanup helpers.
-- PyTorch integration examples (single-worker and simulated distributed-style) with checkpoint save/restore.
+- Workspace Rust crates build/test locally (when Cargo dependency access is available).
+- Python SDK tests run locally.
+- Local demo (`local_demo.py`) exercises coordinator + SDK plumbing.
+- Coordinator-driven PyTorch example (`pytorch_coordinator_train.py`) runs local-first orchestration flow.
+- Benchmark harness (`benchmark_pytorch_orchestration.py`) compares standalone vs coordinator-driven local training and emits JSON/CSV outputs.
 
-## Architecture overview (concise)
+## Core demo path
 
-```text
-Python training / demo scripts
-            |
-            v
-       Python SDK
-            |
-            v
-            gRPC
-            |
-            v
-     Rust coordinator (MVP)
-            |
-            +--> Worker lifecycle + leasing
-            +--> Dataset/shard coordination
-            +--> Checkpoint metadata + artifact storage backends
-```
+1. Run Rust + Python validation checks.
+2. Run `python/examples/local_demo.py` to confirm end-to-end local coordinator interaction.
+3. Run `python/examples/pytorch_coordinator_train.py` with a small workload.
+4. Inspect produced metrics/checkpoint outputs.
 
-For deeper architecture details, see [`docs/architecture.md`](docs/architecture.md).
+## Benchmark path
 
-## Quickstart
+Run `python/examples/benchmark_pytorch_orchestration.py` in smoke mode, then inspect:
+- `benchmark-summary.json`
+- `benchmark-results.csv`
 
-Start here: **[`docs/quickstart.md`](docs/quickstart.md)**
+This benchmark compares local standalone training vs local coordinator-driven training. Current timings include coordinator startup overhead unless/ until a warmed external-coordinator mode is used.
 
-The quickstart covers prerequisites, setup (PowerShell-first), fast validation commands, example runs, and cleanup.
+## What is **not** claimed yet?
 
-## Core commands
+This project does **not** currently claim:
+- production replacement for Ray, Kubeflow, or TorchElastic
+- Kubernetes-native training operator behavior
+- production cloud scheduler functionality
+- proven multi-node distributed training performance
+- `torch.distributed` integration
+- production HA coordinator replication
+- production auth/dashboard stack
+
+## Reviewer quick path
+
+Run these first from repository root:
 
 ```bash
 cargo check --workspace
 cargo test --workspace
 PYTHONPATH=python python -m pytest python/tests
-```
-
-## Examples
-
-### Local demo
-
-```bash
 PYTHONPATH=python python python/examples/local_demo.py
+PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator
+PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke
 ```
 
-### Benchmark harness smoke
-
-```bash
-cargo run -p runtime-bench -- worker-rpc --workers 2 --heartbeats 2
-cargo run -p runtime-bench -- scaling-workers --workers-list 1,2 --heartbeats 2
-```
-
-### PyTorch single-worker example
-
-```bash
-PYTHONPATH=python python python/examples/pytorch_train.py --epochs 1 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-smoke
-PYTHONPATH=python python python/examples/pytorch_train.py --epochs 2 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-smoke --resume
-```
-
-### PyTorch simulated distributed-style example
-
-```bash
-PYTHONPATH=python python python/examples/pytorch_simulated_distributed.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-dist-smoke
-PYTHONPATH=python python python/examples/pytorch_simulated_distributed.py --workers 2 --epochs 2 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-dist-smoke --resume
-```
-
-## Documentation index
+## Documentation map
 
 - [Quickstart](docs/quickstart.md)
-- [Runbooks](docs/runbooks.md)
-- [Example commands](docs/examples.md)
 - [Architecture](docs/architecture.md)
+- [Runbooks](docs/runbooks.md)
+- [Examples](docs/examples.md)
 - [Benchmarks](docs/benchmarks.md)
-- [Scaling tests](docs/scaling-tests.md)
-- [Observability](docs/observability.md)
-- [Protocol compatibility](docs/protocol-compatibility.md)
-- [Retry and idempotency](docs/retry-idempotency.md)
-- [Leases](docs/leases.md)
-- [Checkpoint cleanup](docs/checkpoint-cleanup.md)
-- [Object storage](docs/object-storage.md)
-- [Checkpoint protocol](docs/checkpoint-protocol.md)
 - [ML integration](docs/ml-integration.md)
 - [ML runbook](docs/ml-runbook.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Status and limitations](docs/status-and-limitations.md)
-- [Product direction (Phase 20)](docs/product-direction.md)
+- [Product direction](docs/product-direction.md)
+- [Demo checklist](docs/demo-checklist.md)
+- [Project packaging](docs/project-packaging.md)
 
-## Limitations and non-goals (current)
+## Validation notes
 
-For a consolidated status/limitations view, see [Status and limitations](docs/status-and-limitations.md).
+Environment dependencies can affect validation:
+- Cargo checks/tests require crates.io access.
+- PyTorch examples require `torch`.
+- `local_demo.py` requires `google.protobuf`.
+- Optional MinIO/S3 checks require environment setup.
 
-
-- Coordinator behavior is still MVP-oriented and local-development focused.
-- Persistence and object-storage paths exist, but production hardening/operations posture is not claimed here.
-- Distributed PyTorch workflow is intentionally simulated and does not use real `torch.distributed` primitives.
-- No production scheduler integration.
-- No Kubernetes deployment path.
-- No Prometheus/Grafana exporter integration yet.
-- Performance expectations should come from your own local benchmark runs in this repo; no external scaling guarantees are claimed.
-
-## Validation status
-
-Recent local validation scope (environment-dependent):
-- `cargo fmt`
-- `cargo check --workspace`
-- `cargo test --workspace`
-- `PYTHONPATH=python python -m pytest python/tests`
-- `PYTHONPATH=python python python/examples/local_demo.py`
-- local integration tests
-
-If your environment is missing optional dependencies/services (for example, crates index access, `google.protobuf`, PyTorch, or Docker/MinIO), see the quickstart and runbook notes for expected behavior and workarounds.
-
-
-### PyTorch coordinator-driven orchestration example (Phase 20B)
-
-```bash
-PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator
-PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 2 --epochs 2 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-coordinator --resume
-```
-
-This example uses the coordinator for run/worker/dataset/shard/checkpoint flows while keeping execution local and single-process.
-
-
-## Phase 20C: Local PyTorch orchestration benchmark
-
-Use `python/examples/benchmark_pytorch_orchestration.py` to compare local standalone training (`pytorch_train.py`) versus local coordinator-driven training (`pytorch_coordinator_train.py`). It records wall-clock timings, overhead (seconds and percent), final loss/accuracy, checkpoint/resume status, and coordinator RPC summary when available. Results are emitted as JSON and CSV for reproducibility and automation.
-
-Example:
-
-`PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 3 --epochs 2 --samples 128 --batch-size 16 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench`
-
-Smoke:
-
-`PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke`
-
-Caveats: this is local-only and environment-specific. Coordinator timings include coordinator startup in the current implementation (no warmed/external coordinator benchmark mode yet). These numbers do **not** prove distributed multi-node scaling, Kubernetes performance, or production throughput.
+When unavailable, those paths should fail clearly or skip; treat that as environment limitation rather than a product-claim change.

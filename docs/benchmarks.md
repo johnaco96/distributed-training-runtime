@@ -96,3 +96,10 @@ Smoke:
 `PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke`
 
 Caveats: this is local-only and environment-specific. Coordinator timings include coordinator startup in the current implementation (no warmed/external coordinator benchmark mode yet). These numbers do **not** prove distributed multi-node scaling, Kubernetes performance, or production throughput.
+
+
+## Phase 20D benchmark interpretation reminder
+
+- `benchmark_pytorch_orchestration.py` compares **local standalone** vs **local coordinator-driven** training only.
+- Current coordinator timings include startup cost unless a warmed/external coordinator mode is implemented and used.
+- These results are **not** proof of Kubernetes readiness or multi-node scaling performance.

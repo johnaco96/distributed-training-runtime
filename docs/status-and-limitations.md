@@ -1,6 +1,10 @@
-# Status and Limitations (Phase 19D)
+# Status and Limitations (Phase 20D)
 
 ## Completion status
+
+- Phase **20D** (project packaging/documentation polish) is complete.
+- Demo/release checklist: [`docs/demo-checklist.md`](demo-checklist.md).
+- Packaging/positioning guide: [`docs/project-packaging.md`](project-packaging.md).
 
 - Phases **10 through 18** are complete and locally validated.
 - Phase **19A** (README + quickstart), **19B** (architecture diagrams/overview), and **19C** (runbooks/examples indexing) are complete.
