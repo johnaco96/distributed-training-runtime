@@ -717,6 +717,32 @@ impl CoordinatorState {
         Some((active, stale))
     }
 
+    pub fn status_snapshot(&self) -> CoordinatorStatusSnapshot {
+        let inner = self.inner.read().expect("coordinator state lock poisoned");
+        let run_count = inner.runs.len();
+        let worker_count = inner.workers_by_run.values().map(HashMap::len).sum();
+        let active_worker_count = inner
+            .workers_by_run
+            .values()
+            .flat_map(|workers| workers.values())
+            .filter(|worker| worker.state == WorkerState::Active as i32)
+            .count() as u64;
+        let checkpoint_count = inner.checkpoints_by_run.values().map(HashMap::len).sum();
+        let latest_checkpoint_id = inner
+            .runs
+            .values()
+            .filter_map(|run| run.latest_checkpoint_id.as_ref().map(|id| id.value.clone()))
+            .max();
+
+        CoordinatorStatusSnapshot {
+            run_count,
+            worker_count,
+            active_worker_count,
+            checkpoint_count,
+            latest_checkpoint_id,
+        }
+    }
+
     /// Reconciles in-memory worker liveness against the current server time.
     ///
     /// The MVP coordinator marks active workers stale when heartbeat deadlines
