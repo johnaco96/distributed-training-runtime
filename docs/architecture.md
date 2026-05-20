@@ -209,3 +209,12 @@ Use this document as the “today view” for Phase 19B; future phases should up
 
 
 - Local Kubernetes manifests now exist for Phase 20E under `k8s/local/` (single coordinator Deployment + demo Job). This is packaging/orchestration scaffolding for local clusters, not production control-plane maturity.
+
+## Security architecture companion docs (Phase 20F-1)
+
+For the security target model and trust boundaries, see:
+- [Security architecture](security-architecture.md)
+- [Threat model](threat-model.md)
+- [Production readiness](production-readiness.md)
+
+Auth/dashboard/HA/production S3 hardening are intentionally tracked as future phases and are not complete in current runtime behavior.

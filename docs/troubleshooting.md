@@ -160,3 +160,10 @@ Remove-Item -Recurse -Force .dtruntime-pytorch-no-checkpoint -ErrorAction Silent
 Remove-Item -Recurse -Force .dtruntime-pytorch-dist-smoke -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force .dtruntime-pytorch-dist-no-checkpoint -ErrorAction SilentlyContinue
 ```
+
+## Security documentation boundary checks
+
+If reviewing Phase 20F-1 work, confirm that:
+- no real secrets/tokens were committed,
+- local placeholder values are clearly marked example-only,
+- docs do not claim production auth/dashboard/HA readiness.

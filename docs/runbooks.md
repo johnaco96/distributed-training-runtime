@@ -108,3 +108,15 @@ Remove-Item -Recurse -Force .dtruntime-pytorch-dist-no-checkpoint -ErrorAction S
 For local cluster demo deployment steps, see [`docs/kubernetes-local.md`](kubernetes-local.md).
 
 Scope is intentionally local/dev only (single coordinator replica, no HA/auth/dashboard).
+
+## Security runbook references (Phase 20F-1)
+
+- [Security architecture](security-architecture.md)
+- [Threat model](threat-model.md)
+- [Production readiness](production-readiness.md)
+- [Security auth plan](security-auth.md)
+- [High availability plan](high-availability.md)
+- [Dashboard plan](dashboard-plan.md)
+- [Production S3 plan](production-s3.md)
+
+Next implementation step is 20F-2 (optional TLS/mTLS foundation).

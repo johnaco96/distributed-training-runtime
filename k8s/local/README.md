@@ -13,3 +13,11 @@ Included resources:
 - `coordinator-deployment.yaml`: single-replica coordinator Deployment.
 - `coordinator-service.yaml`: ClusterIP service exposing gRPC on 50051.
 - `pytorch-coordinator-job.yaml`: one-shot demo training Job that uses the coordinator service.
+
+
+Security planning references:
+- `docs/security-architecture.md`
+- `docs/threat-model.md`
+- `docs/production-readiness.md`
+
+`auth-secret.example.yaml` is a placeholder-only local/dev example and is not required by current manifests.

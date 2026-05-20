@@ -73,3 +73,14 @@ kind delete cluster --name dtruntime
 - Not `torch.distributed`.
 - Not proof of multi-node benchmark scaling.
 - Benchmark results measured in local Kubernetes should be tracked separately from local subprocess benchmarks.
+
+## Security note (Phase 20F-1)
+
+The manifests under `k8s/local/` are local/dev only. They do not yet implement production authn/authz or mTLS.
+
+A placeholder secret example exists at `k8s/local/auth-secret.example.yaml` for future local/dev experiments only; it is not wired into current deployment flow.
+
+See:
+- [Security architecture](security-architecture.md)
+- [Threat model](threat-model.md)
+- [Production readiness](production-readiness.md)
