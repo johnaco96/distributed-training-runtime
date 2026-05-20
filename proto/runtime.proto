@@ -8,6 +8,7 @@ import "google/protobuf/timestamp.proto";
 // helpers to coordinate runs, workers, shard leases, and checkpoints.
 // Large dataset/checkpoint payload bytes stay on the data plane.
 service CoordinatorService {
+  rpc GetRuntimeInfo(GetRuntimeInfoRequest) returns (GetRuntimeInfoResponse);
   rpc RegisterRun(RegisterRunRequest) returns (RegisterRunResponse);
   rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
@@ -23,6 +24,24 @@ service CoordinatorService {
   rpc GetLatestCheckpoint(GetLatestCheckpointRequest) returns (GetLatestCheckpointResponse);
 
   rpc GetRunStatus(GetRunStatusRequest) returns (GetRunStatusResponse);
+}
+
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+}
+
+message RuntimeCapabilities {
+  ProtocolVersion protocol_version = 1;
+  repeated string features = 2;
+}
+
+message GetRuntimeInfoRequest {}
+
+message GetRuntimeInfoResponse {
+  ProtocolVersion protocol_version = 1;
+  RuntimeCapabilities capabilities = 2;
 }
 
 // Identifier wrappers keep message signatures explicit while using MVP string IDs.

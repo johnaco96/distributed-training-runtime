@@ -140,14 +140,15 @@ See `docs/observability.md` for current scope and usage.
 - Next planned step: **Phase 17 hardening**.
 
 
-### Phase 17 — Hardening (started)
+### Phase 17 — Hardening (complete)
 
 - [x] Phase 17A coordinator error handling consistency + compatibility/version notes documentation complete.
 - [x] Phase 17B retry/idempotency hardening documentation + tests complete.
 - [x] Phase 17C lease hardening complete (ownership/epoch/worker-state checks + lease docs).
 - [x] Phase 17D checkpoint cleanup helper/policy complete (explicit helper, no background scheduler/RPC).
-- [ ] Versioned protocol messages and negotiation pending.
-- Scope note: protocol compatibility guidance is documented; runtime negotiation is not implemented yet.
+- [x] Phase 17E version metadata + compatibility final pass complete (`GetRuntimeInfo`, protocol metadata constants/helpers, compatibility docs updates).
+- Scope note: full runtime negotiation is still not implemented; version metadata is informational.
+- Prometheus/Grafana integration remains optional future work and is not part of Phase 17 completion.
 
 
 See `docs/retry-idempotency.md` for current retry/idempotency guarantees and limitations.
