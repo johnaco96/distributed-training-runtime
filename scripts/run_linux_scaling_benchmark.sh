@@ -6,6 +6,12 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 1
 fi
 
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "PYTHON_BIN '$PYTHON_BIN' not found. Set PYTHON_BIN=/path/to/python3" >&2
+  exit 1
+fi
+
 OUT_DIR=""
 ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -21,12 +27,8 @@ if [[ -z "$OUT_DIR" ]]; then
 fi
 mkdir -p "$OUT_DIR/system" "$OUT_DIR/perf" "$OUT_DIR/runs"
 
-python python/examples/linux_scaling_benchmark.py --output-dir "$OUT_DIR" "${ARGS[@]}"
+"$PYTHON_BIN" python/examples/linux_scaling_benchmark.py --output-dir "$OUT_DIR" "${ARGS[@]}"
 
-uname -a > "$OUT_DIR/system/uname.txt" || true
-lscpu > "$OUT_DIR/system/lscpu.txt" || true
-free -h > "$OUT_DIR/system/free.txt" || true
-df -h > "$OUT_DIR/system/df.txt" || true
-ss -s > "$OUT_DIR/system/ss.txt" || true
+bash scripts/collect_linux_profile.sh "$OUT_DIR"
 
 echo "completed: $OUT_DIR"

@@ -14,111 +14,167 @@ from pathlib import Path
 from statistics import median
 
 OVERCLAIM_TERMS = ("OpenAI", "Anthropic", "beats Ray")
+MIN_VALID_DURATION_SECONDS = 1e-4
 
 
 @dataclass
 class RunResult:
     worker_count: int
-    rpc_throughput_ops_sec: float
+    total_duration_seconds: float
+    total_operations: int
+    throughput_ops_sec: float | None
     register_worker_p50_ms: float
     register_worker_p99_ms: float
     heartbeat_p50_ms: float
     heartbeat_p99_ms: float
+    shard_assignment_p50_ms: float
+    shard_assignment_p99_ms: float
     checkpoint_commit_p50_ms: float
     checkpoint_commit_p99_ms: float
-    total_duration_seconds: float
     checkpoint_count: int
     checkpoint_bytes: int
+    checkpoint_write_seconds: float
+    checkpoint_throughput_mb_s: float | None
     training_stall_seconds: float
+    stall_percent: float | None
     mode: str
     caveats: str
+    measured_duration: bool
+    coordinator_attached: bool
+    real_grpc_calls: bool
+    real_checkpoint_writes: bool
+    coordinator_cpu_avg_percent: float | None
+    coordinator_rss_mb: float | None
+    disk_write_mb_s: float | None
+    network_tx_mb_s: float | None
+    measurement_status: dict[str, str]
+    invalid_metrics: list[str]
 
 
 def parse_workers(raw: str) -> list[int]:
     return [int(v.strip()) for v in raw.split(",") if v.strip()]
 
 
-def _latency_ms(samples: int, base: float) -> list[float]:
-    return [base + ((i % 19) * 0.03) for i in range(samples)]
-
-
 def _p99(values: list[float]) -> float:
     if not values:
         return 0.0
-    idx = int(max(0, min(len(values) - 1, round(len(values) * 0.99) - 1)))
+    idx = max(0, min(len(values) - 1, int(len(values) * 0.99) - 1))
     return sorted(values)[idx]
 
 
-def benchmark_worker_count(workers: int, samples: int, checkpoint_bytes: int, checkpoint_every_steps: int) -> RunResult:
+def _measure_op(fn) -> float:
     start = time.perf_counter()
-    reg = _latency_ms(samples, 0.35 + workers * 0.002)
-    hb = _latency_ms(samples, 0.2 + workers * 0.001)
-    cmt = _latency_ms(max(1, samples // max(checkpoint_every_steps, 1)), 0.9 + workers * 0.004)
-    elapsed = time.perf_counter() - start
-    total_rpc = samples * 3
-    throughput = total_rpc / max(elapsed, 1e-9)
-    ckpt_count = len(cmt)
-    stall = sum(cmt) / 1000.0
+    fn()
+    return (time.perf_counter() - start) * 1000.0
+
+
+def _stream_write(path: Path, total_bytes: int, chunk_size: int = 1024 * 1024, fsync: bool = True) -> float:
+    payload = b"D" * min(chunk_size, total_bytes)
+    remaining = total_bytes
+    start = time.perf_counter()
+    with path.open("wb") as f:
+        while remaining > 0:
+            chunk = payload[: min(len(payload), remaining)]
+            f.write(chunk)
+            remaining -= len(chunk)
+        f.flush()
+        if fsync:
+            os.fsync(f.fileno())
+    return time.perf_counter() - start
+
+
+def _proc_net_totals() -> tuple[int, int] | None:
+    p = Path("/proc/net/dev")
+    if not p.exists():
+        return None
+    rx = tx = 0
+    for line in p.read_text(encoding="utf-8").splitlines()[2:]:
+        parts = line.replace(":", " ").split()
+        if len(parts) >= 17:
+            rx += int(parts[1])
+            tx += int(parts[9])
+    return rx, tx
+
+
+def benchmark_worker_count(workers: int, samples: int, checkpoint_bytes: int, checkpoint_every_steps: int, work_dir: Path, mode: str) -> RunResult:
+    if mode == "coordinator-grpc":
+        raise NotImplementedError("real coordinator mode not implemented")
+    reg: list[float] = []
+    hb: list[float] = []
+    shard: list[float] = []
+    cmt: list[float] = []
+    total_ops = 0
+    total_stall = 0.0
+    ckpt_count = 0
+
+    net_start = _proc_net_totals()
+    run_start = time.perf_counter()
+    for i in range(samples):
+        reg.append(_measure_op(lambda: sum(range(max(2, workers)))))
+        hb.append(_measure_op(lambda: hash((workers, i))))
+        shard.append(_measure_op(lambda: [j % max(1, workers) for j in range(32)]))
+        total_ops += 3
+        if checkpoint_every_steps > 0 and (i + 1) % checkpoint_every_steps == 0:
+            ckpt_count += 1
+            ckpt_path = work_dir / f"w{workers}_ckpt_{ckpt_count}.bin"
+            write_s = _stream_write(ckpt_path, checkpoint_bytes)
+            total_stall += write_s
+            cmt.append(write_s * 1000.0)
+            total_ops += 1
+    elapsed = time.perf_counter() - run_start
+    net_end = _proc_net_totals()
+
+    invalid: list[str] = []
+    measured_duration = elapsed > MIN_VALID_DURATION_SECONDS
+    if not measured_duration:
+        invalid.append("total_duration_seconds")
+
+    throughput = (total_ops / elapsed) if measured_duration else None
+    ckpt_tp = ((checkpoint_bytes * ckpt_count) / (1024 * 1024) / total_stall) if total_stall > 0 else None
+    stall_percent = ((total_stall / elapsed) * 100.0) if measured_duration and elapsed > 0 else None
+    if stall_percent is not None and not (0.0 <= stall_percent <= 100.0):
+        invalid.append("stall_percent")
+
+    net_tx_mb_s = None
+    if net_start and net_end and elapsed > 0:
+        net_tx_mb_s = (net_end[1] - net_start[1]) / (1024 * 1024) / elapsed
+
     return RunResult(
         worker_count=workers,
-        rpc_throughput_ops_sec=throughput,
-        register_worker_p50_ms=median(reg),
-        register_worker_p99_ms=_p99(reg),
-        heartbeat_p50_ms=median(hb),
-        heartbeat_p99_ms=_p99(hb),
-        checkpoint_commit_p50_ms=median(cmt),
-        checkpoint_commit_p99_ms=_p99(cmt),
         total_duration_seconds=elapsed,
+        total_operations=total_ops,
+        throughput_ops_sec=throughput,
+        register_worker_p50_ms=median(reg) if reg else 0.0,
+        register_worker_p99_ms=_p99(reg),
+        heartbeat_p50_ms=median(hb) if hb else 0.0,
+        heartbeat_p99_ms=_p99(hb),
+        shard_assignment_p50_ms=median(shard) if shard else 0.0,
+        shard_assignment_p99_ms=_p99(shard),
+        checkpoint_commit_p50_ms=median(cmt) if cmt else 0.0,
+        checkpoint_commit_p99_ms=_p99(cmt),
         checkpoint_count=ckpt_count,
         checkpoint_bytes=checkpoint_bytes,
-        training_stall_seconds=stall,
-        mode="dtruntime-coordinator",
-        caveats="synthetic worker emulation on a single Linux host",
+        checkpoint_write_seconds=total_stall,
+        checkpoint_throughput_mb_s=ckpt_tp,
+        training_stall_seconds=total_stall,
+        stall_percent=stall_percent,
+        mode=mode,
+        caveats="Measured local emulation; values are not coordinator gRPC throughput.",
+        measured_duration=measured_duration,
+        coordinator_attached=False,
+        real_grpc_calls=False,
+        real_checkpoint_writes=True,
+        coordinator_cpu_avg_percent=None,
+        coordinator_rss_mb=None,
+        disk_write_mb_s=ckpt_tp,
+        network_tx_mb_s=net_tx_mb_s,
+        measurement_status={
+            "coordinator": "unavailable: coordinator-grpc mode not used",
+            "coordinator_cpu": "unavailable: no coordinator process attached",
+            "coordinator_rss": "unavailable: no coordinator process attached",
+        },
+        invalid_metrics=invalid,
     )
-
-
-def build_summary(worker_results: list[RunResult], args: argparse.Namespace, tools: dict[str, bool]) -> dict:
-    skipped = [name for name, available in tools.items() if not available]
-    return {
-        "schema_version": "v1",
-        "benchmark_name": "linux-scaling-checkpoint-suite",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "git_commit": _git_commit(),
-        "host": {
-            "hostname": platform.node(),
-            "kernel": platform.release(),
-            "cpu": platform.processor(),
-            "platform": platform.platform(),
-        },
-        "benchmark_parameters": {
-            "workers": args.workers,
-            "samples": args.samples,
-            "batch_size": args.batch_size,
-            "shards": args.shards,
-            "checkpoint_bytes": args.checkpoint_bytes,
-            "checkpoint_every_steps": args.checkpoint_every_steps,
-        },
-        "worker_counts_tested": [r.worker_count for r in worker_results],
-        "security_mode": {"tls_enabled": False, "mtls_enabled": False, "auth_enabled": False},
-        "storage_backend": "localfs",
-        "profiling_tools_available": [name for name, ok in tools.items() if ok],
-        "profiling_tools_skipped": skipped,
-        "per_worker_count_results": [asdict(r) for r in worker_results],
-        "checkpoint_stall_results": {
-            "baseline_blocking": {"stall_percent": 12.0, "mode": "python-blocking"},
-            "dtruntime_async": {"stall_percent": 4.0, "mode": "dtruntime-coordinator"},
-            "caveat": "Percentages come from synthetic local training loop simulation, not GPU training.",
-        },
-        "interop_overhead_results": {
-            "python_noop_p50_ms": 0.01,
-            "python_grpc_rust_p50_ms": 0.24,
-            "payload_sizes": [128, 1024, 65536, 1048576],
-        },
-        "caveats": [
-            "No fake cluster or GPU claims.",
-            "Use Ubuntu/Linux host profiling results for production-facing conclusions.",
-        ],
-    }
 
 
 def _git_commit() -> str:
@@ -129,38 +185,79 @@ def _git_commit() -> str:
 
 
 def detect_tools() -> dict[str, bool]:
-    names = ["perf", "pidstat", "mpstat", "iostat", "sar", "ss", "free", "df", "uname", "lscpu", "ps", "top", "kubectl", "py-spy"]
+    names = ["perf", "pidstat", "mpstat", "iostat", "sar", "ss", "free", "df", "uname", "lscpu", "ps", "top", "py-spy"]
     return {name: shutil.which(name) is not None for name in names}
 
 
+def build_summary(worker_results: list[RunResult], args: argparse.Namespace, tools: dict[str, bool], tool_errors: list[str]) -> dict:
+    return {
+        "schema_version": "v2",
+        "benchmark_name": "linux-scaling-checkpoint-suite",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git_commit(),
+        "benchmark_parameters": vars(args),
+        "measured_duration": all(r.measured_duration for r in worker_results),
+        "coordinator_attached": any(r.coordinator_attached for r in worker_results),
+        "real_grpc_calls": any(r.real_grpc_calls for r in worker_results),
+        "real_checkpoint_writes": all(r.real_checkpoint_writes for r in worker_results),
+        "profiling_tools_available": [k for k, v in tools.items() if v],
+        "profiling_tools_skipped": [k for k, v in tools.items() if not v],
+        "profiling_tool_errors": tool_errors,
+        "invalid_metrics": sorted({m for r in worker_results for m in r.invalid_metrics}),
+        "per_worker_count_results": [asdict(r) for r in worker_results],
+        "checkpoint_stall_results": {
+            "baseline_blocking": {
+                "checkpoint_write_seconds": sum(r.checkpoint_write_seconds for r in worker_results),
+                "stall_percent": max((r.stall_percent or 0.0) for r in worker_results),
+                "fsync_used": True,
+            },
+            "dtruntime_async": None,
+            "async_checkpoint_supported": False,
+            "caveat": "async out-of-band checkpoint writing not implemented in this benchmark path",
+        },
+        "interop_overhead_results": {"mode": args.mode, "coordinator_rpc_measured": args.mode == "coordinator-grpc"},
+        "host": {"hostname": platform.node(), "kernel": platform.release(), "platform": platform.platform()},
+    }
+
+
 def write_comparison_csv(path: Path, rows: list[RunResult], args: argparse.Namespace) -> None:
-    fields = [
-        "benchmark_name","mode","backend","worker_count","concurrency","samples","batch_size","shards","checkpoint_bytes","checkpoint_count",
-        "total_duration_seconds","training_stall_seconds","stall_percent","checkpoint_throughput_mb_s","rpc_throughput_ops_sec",
-        "register_worker_p50_ms","register_worker_p99_ms","heartbeat_p50_ms","heartbeat_p99_ms","shard_assignment_p50_ms","shard_assignment_p99_ms",
-        "checkpoint_commit_p50_ms","checkpoint_commit_p99_ms","coordinator_cpu_avg_percent","coordinator_rss_mb","disk_write_mb_s","network_tx_mb_s",
-        "tls_enabled","mtls_enabled","auth_enabled","caveats",
-    ]
+    fields = ["worker_count", "total_duration_seconds", "throughput_ops_sec", "stall_percent", "checkpoint_throughput_mb_s", "coordinator_cpu_avg_percent", "coordinator_rss_mb", "disk_write_mb_s", "network_tx_mb_s", "caveats"]
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in rows:
-            w.writerow({
-                "benchmark_name": "linux-scaling-checkpoint-suite", "mode": r.mode, "backend": "localfs", "worker_count": r.worker_count,
-                "concurrency": args.batch_size, "samples": args.samples, "batch_size": args.batch_size, "shards": args.shards,
-                "checkpoint_bytes": r.checkpoint_bytes, "checkpoint_count": r.checkpoint_count, "total_duration_seconds": f"{r.total_duration_seconds:.6f}",
-                "training_stall_seconds": f"{r.training_stall_seconds:.6f}", "stall_percent": f"{(r.training_stall_seconds/max(r.total_duration_seconds,1e-9))*100:.4f}",
-                "checkpoint_throughput_mb_s": f"{((r.checkpoint_bytes*r.checkpoint_count)/(1024*1024))/max(r.total_duration_seconds,1e-9):.4f}", "rpc_throughput_ops_sec": f"{r.rpc_throughput_ops_sec:.4f}",
-                "register_worker_p50_ms": f"{r.register_worker_p50_ms:.4f}", "register_worker_p99_ms": f"{r.register_worker_p99_ms:.4f}", "heartbeat_p50_ms": f"{r.heartbeat_p50_ms:.4f}",
-                "heartbeat_p99_ms": f"{r.heartbeat_p99_ms:.4f}", "shard_assignment_p50_ms": f"{r.heartbeat_p50_ms:.4f}", "shard_assignment_p99_ms": f"{r.heartbeat_p99_ms:.4f}",
-                "checkpoint_commit_p50_ms": f"{r.checkpoint_commit_p50_ms:.4f}", "checkpoint_commit_p99_ms": f"{r.checkpoint_commit_p99_ms:.4f}", "coordinator_cpu_avg_percent": "0", "coordinator_rss_mb": "0",
-                "disk_write_mb_s": "0", "network_tx_mb_s": "0", "tls_enabled": "false", "mtls_enabled": "false", "auth_enabled": "false", "caveats": r.caveats,
-            })
+            w.writerow({k: ("" if getattr(r, k) is None else getattr(r, k)) for k in fields if k != "caveats"} | {"caveats": r.caveats})
 
 
 def write_report(path: Path, summary: dict) -> None:
-    report = "# Linux Scaling Benchmark Report\n\n"
-    report += "This report contains local Linux benchmark evidence without overclaiming distributed production scale.\n"
+    lines = [
+        "# Linux Scaling Benchmark Report",
+        "## Environment",
+        json.dumps(summary.get("host", {}), indent=2),
+        "## Benchmark parameters",
+        json.dumps(summary.get("benchmark_parameters", {}), indent=2),
+        "## Worker scaling table",
+        "| workers | duration_s | throughput_ops_s | stall_percent |",
+        "|---:|---:|---:|---:|",
+    ]
+    for r in summary["per_worker_count_results"]:
+        lines.append(f"| {r['worker_count']} | {r['total_duration_seconds']:.6f} | {r['throughput_ops_sec'] or 'unavailable'} | {r['stall_percent'] or 'unavailable'} |")
+    lines += [
+        "## Checkpoint stall results",
+        json.dumps(summary.get("checkpoint_stall_results", {}), indent=2),
+        "## Interop overhead results",
+        json.dumps(summary.get("interop_overhead_results", {}), indent=2),
+        "## Profiling tools collected/skipped",
+        f"available: {', '.join(summary.get('profiling_tools_available', []))}",
+        f"skipped: {', '.join(summary.get('profiling_tools_skipped', []))}",
+        "## Caveats",
+        "Measured synthetic-local mode does not represent real coordinator gRPC throughput.",
+        "## What conclusions are supported",
+        "Local checkpoint write behavior and in-process operation timing.",
+        "## What conclusions are not supported",
+        "Cross-host coordinator scalability without coordinator-grpc mode.",
+    ]
+    report = "\n\n".join(lines) + "\n"
     for banned in OVERCLAIM_TERMS:
         assert banned not in report
     path.write_text(report, encoding="utf-8")
@@ -168,13 +265,15 @@ def write_report(path: Path, summary: dict) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--workers", default="1,2,4,8,16,32,64,128")
+    p.add_argument("--workers", default="1,2,4")
     p.add_argument("--samples", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--shards", type=int, default=8)
     p.add_argument("--checkpoint-bytes", type=int, default=16 * 1024 * 1024)
     p.add_argument("--checkpoint-every-steps", type=int, default=100)
     p.add_argument("--output-dir", required=True)
+    p.add_argument("--mode", choices=["synthetic-local", "coordinator-grpc"], default="synthetic-local")
+    p.add_argument("--allow-invalid", action="store_true")
     return p.parse_args()
 
 
@@ -183,9 +282,13 @@ def main() -> int:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     workers = parse_workers(args.workers)
-    results = [benchmark_worker_count(w, args.samples, args.checkpoint_bytes, args.checkpoint_every_steps) for w in workers]
+    work_dir = out / "runs"
+    work_dir.mkdir(exist_ok=True)
+    results = [benchmark_worker_count(w, args.samples, args.checkpoint_bytes, args.checkpoint_every_steps, work_dir, args.mode) for w in workers]
     tools = detect_tools()
-    summary = build_summary(results, args, tools)
+    summary = build_summary(results, args, tools, [])
+    if summary["invalid_metrics"] and not args.allow_invalid:
+        raise SystemExit(f"invalid metrics detected: {summary['invalid_metrics']}")
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     write_comparison_csv(out / "comparison.csv", results, args)
     write_report(out / "report.md", summary)
