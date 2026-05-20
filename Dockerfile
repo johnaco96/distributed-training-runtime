@@ -1,8 +1,19 @@
 # Local/dev container image for distributed-training-runtime Phase 20E.
 FROM rust:1.89-bookworm AS rust-builder
 WORKDIR /build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        libprotobuf-dev \
+        pkg-config \
+        libsqlite3-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ENV PROTOC=/usr/bin/protoc
+ENV PROTOC_INCLUDE=/usr/include
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY proto ./proto
 RUN cargo build --release -p runtime-coordinator
 
 FROM python:3.12-slim-bookworm AS runtime
