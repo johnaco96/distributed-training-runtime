@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dtruntime-coordinator
+  namespace: dtruntime-local
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dtruntime-coordinator
+  template:
+    metadata:
+      labels:
+        app: dtruntime-coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: distributed-training-runtime:local
+          imagePullPolicy: IfNotPresent
+          command: ["runtime-coordinator"]
+          args:
+            - "--addr"
+            - "0.0.0.0:50051"
+            - "--auth-mode"
+            - "metadata"
+            - "--tls-cert"
+            - "/etc/dtruntime/tls/tls.crt"
+            - "--tls-key"
+            - "/etc/dtruntime/tls/tls.key"
+            - "--tls-client-ca"
+            - "/etc/dtruntime/tls/ca.crt"
+          env:
+            - name: DTRUNTIME_AUTH_SUBJECT
+              value: "admin-local-placeholder"
+            - name: DTRUNTIME_AUTH_ROLE
+              value: "admin"
+          ports:
+            - containerPort: 50051
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/dtruntime/tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: dtruntime-tls
+            optional: true

@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pytorch-coordinator-demo
+  namespace: dtruntime
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: pytorch-coordinator-demo
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: pytorch-demo
+          image: distributed-training-runtime:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PYTHONPATH
+              value: /app/python
+          command: ["python", "python/examples/pytorch_coordinator_train.py"]
+          args:
+            - "--addr"
+            - "runtime-coordinator.dtruntime.svc.cluster.local:50051"
+            - "--workers"
+            - "2"
+            - "--epochs"
+            - "1"
+            - "--samples"
+            - "32"
+            - "--batch-size"
+            - "8"
+            - "--shards"
+            - "4"
+            - "--out-dir"
+            - "/tmp/dtruntime-pytorch-coordinator"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
