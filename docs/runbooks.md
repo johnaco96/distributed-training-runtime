@@ -161,3 +161,4 @@ cargo run -p runtime-coordinator -- --addr 127.0.0.1:50051 --tls-cert .dtruntime
 - Expanded benchmark/runbook documentation labels and caveats for local/dev versus secure/minio optional surfaces.
 - Secure Kubernetes runbook depth expanded for local certificate/secret creation flow.
 - Production readiness is still not claimed; remaining gaps are tracked in status/production docs.
+\n- Phase 20 update: benchmark expansion and MinIO/S3 validation are environment-gated; no production-readiness claim.
