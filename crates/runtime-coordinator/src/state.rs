@@ -1356,6 +1356,37 @@ mod tests {
         }
     }
 
+    fn dataset_request(run_id: RunId, idempotency_key: &str) -> RegisterDatasetRequest {
+        RegisterDatasetRequest {
+            idempotency_key: idempotency_key.to_string(),
+            run_id: Some(run_id),
+            dataset: Some(DatasetMetadata {
+                dataset_id: Some(DatasetId {
+                    value: "dataset-test".to_string(),
+                }),
+                name: "training-data".to_string(),
+                dataset_uri: "s3://bucket/dataset".to_string(),
+                format: "jsonl".to_string(),
+                shard_count: 1,
+                dataset_version: "v1".to_string(),
+                labels: std::collections::HashMap::new(),
+                registered_at: None,
+            }),
+            shards: vec![ShardMetadata {
+                shard_id: Some(ShardId {
+                    value: "shard-test-0".to_string(),
+                }),
+                dataset_id: None,
+                shard_uri: "s3://bucket/dataset/shard-0.jsonl".to_string(),
+                byte_range_start: 0,
+                byte_range_end: 99,
+                size_bytes: 100,
+                checksum: "checksum-0".to_string(),
+                checksum_algorithm: "sha256".to_string(),
+            }],
+        }
+    }
+
     #[test]
     fn active_worker_count_is_unchanged_before_heartbeat_deadline() {
         let state = CoordinatorState::default();
@@ -1695,7 +1726,7 @@ mod tests {
                 &run_id,
                 &worker_id,
                 &ShardId {
-                    value: dataset.shard_ids[0].value.clone(),
+                    value: "shard-test-0".to_string(),
                 },
                 1,
             )
@@ -1727,7 +1758,9 @@ mod tests {
         ));
         state.reconcile_worker_liveness();
         let dataset_id = dataset.dataset_id;
-        let shard_id = dataset.shard_ids[0].clone();
+        let shard_id = ShardId {
+            value: "shard-test-0".to_string(),
+        };
         let error = state
             .report_shard_progress(&run_id, &worker_id, &dataset_id, &shard_id, 1, 42, false)
             .expect_err("failed worker should not report progress");

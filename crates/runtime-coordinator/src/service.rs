@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
+use runtime_proto::protocol_version;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
-use runtime_proto::{protocol_version, PROTOCOL_MAJOR, PROTOCOL_MINOR, PROTOCOL_PATCH};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
@@ -775,6 +775,10 @@ mod tests {
             }),
             shards,
         }
+    }
+
+    fn build_service() -> CoordinatorServiceImpl {
+        CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()))
     }
 
     #[tokio::test]
