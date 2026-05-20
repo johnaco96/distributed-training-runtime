@@ -141,3 +141,26 @@ When `--resume` is set:
 4. continue from `restored_epoch + 1`
 
 If checkpoint metadata or referenced checkpoint file is missing, the script exits with a clear error.
+
+
+## Phase 18D (complete)
+
+Phase 18D finalizes documentation and validation workflow:
+
+- adds a dedicated runbook: `docs/ml-runbook.md`
+- consolidates smoke/resume/no-checkpoint commands for both examples
+- adds final validation checklist and cleanup guidance
+- clarifies explicit non-goals and current limitations
+
+## Phase 18 summary
+
+- **18A**: single-worker deterministic PyTorch training example with `metrics.json`.
+- **18B**: local checkpoint save/restore for model, optimizer, scheduler, plus `latest.json` pointer.
+- **18C**: single-process simulated distributed-style training with deterministic shard assignment and FedAvg-style parameter averaging.
+- **18D**: runbook + final validation cleanup/documentation pass.
+
+Single-worker and simulated-distributed examples are intentionally different: the former validates a local training/checkpoint loop, while the latter validates local simulation of worker/shard behavior and aggregation semantics in one process.
+
+Checkpoint state currently includes model state and progress/metrics metadata, and resume behavior starts from `restored_epoch + 1` using `checkpoints/latest.json` as the required pointer file.
+
+For command-level usage and cleanup steps, see `docs/ml-runbook.md`.
