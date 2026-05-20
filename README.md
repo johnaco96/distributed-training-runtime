@@ -96,6 +96,8 @@ PYTHONPATH=python python python/examples/pytorch_simulated_distributed.py --work
 ## Documentation index
 
 - [Quickstart](docs/quickstart.md)
+- [Runbooks](docs/runbooks.md)
+- [Example commands](docs/examples.md)
 - [Architecture](docs/architecture.md)
 - [Benchmarks](docs/benchmarks.md)
 - [Scaling tests](docs/scaling-tests.md)
