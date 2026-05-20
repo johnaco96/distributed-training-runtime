@@ -64,3 +64,6 @@ aws_credentials
 .dtruntime-pytorch-dist-smoke/
 .dtruntime-pytorch-dist-no-checkpoint/
 .dtruntime-demo/
+
+.dtruntime-pytorch-bench/
+.dtruntime-pytorch-bench-smoke/
