@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let state = if let Some(path) = args.metadata_db {
+    let state = if let Some(ref path) = args.metadata_db {
         info!(metadata_db_path = %path, "runtime-coordinator using sqlite metadata store");
         let store = SqliteMetadataStore::open(path)?;
         store.init_schema()?;
@@ -398,10 +398,21 @@ fn serve_status_endpoint(
         let is_get_status = req.starts_with("GET /status ");
         let response = if is_get_status {
             let snapshot = state.status_snapshot();
-            let uptime = started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-            format!("{{"health":"ok","auth_mode":"{:?}","tls_enabled":{},"mtls_enabled":{},"run_count":{},"worker_count":{},"active_worker_count":{},"checkpoint_count":{},"latest_checkpoint_id":{},"audit_event_count":{},"uptime_seconds":{}}}",
-                auth_mode, tls_enabled, mtls_enabled, snapshot.run_count, snapshot.worker_count, snapshot.active_worker_count, snapshot.checkpoint_count,
-                snapshot.latest_checkpoint_id.as_ref().map(|v| format!(""{}"", v)).unwrap_or_else(||"null".to_string()), audit.emitted_count(), uptime)
+            let uptime_secs = started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+            serde_json::to_string(&serde_json::json!({
+                "health": "ok",
+                "auth_mode": format!("{:?}", auth_mode).to_ascii_lowercase(),
+                "tls_enabled": tls_enabled,
+                "mtls_enabled": mtls_enabled,
+                "run_count": snapshot.run_count,
+                "worker_count": snapshot.worker_count,
+                "active_worker_count": snapshot.active_worker_count,
+                "checkpoint_count": snapshot.checkpoint_count,
+                "latest_checkpoint_id": snapshot.latest_checkpoint_id,
+                "audit_event_count": audit.emitted_count(),
+                "uptime_secs": uptime_secs
+            }))
+            .unwrap_or_else(|_| String::from("{\"health\":\"error\"}"))
         } else {
             String::from("method not allowed")
         };

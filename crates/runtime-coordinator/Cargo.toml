@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tonic = { version = "0.12", default-features = false, features = ["transport", "tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
