@@ -174,3 +174,10 @@ Use the local manifests in `k8s/local/` with the runbook at [`docs/kubernetes-lo
 - one coordinator-driven PyTorch demo Job
 
 This proves local packaging/deployment flow only; it does not prove production Kubernetes behavior or multi-node distributed training.
+
+## Security planning references (Phase 20F-1)
+
+When demonstrating examples, keep claims aligned with current scope and limitations:
+- [Security architecture](security-architecture.md)
+- [Threat model](threat-model.md)
+- [Production readiness](production-readiness.md)

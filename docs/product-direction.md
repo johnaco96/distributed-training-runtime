@@ -278,3 +278,12 @@ Caveats: this is local-only and environment-specific. Coordinator timings includ
 Phase 20D is now complete: packaging/documentation polish aligns README, runbooks, benchmark framing, and demo/release checklists so the repository presents a coherent ML infrastructure prototype story before starting Kubernetes work.
 
 Phase 20E (Kubernetes local/dev deployment) is now complete. Phase 20F (auth/dashboard/HA/production S3) remains pending by design.
+
+## Phase 20F split (security-focused track)
+
+Phase 20F is now split into sub-phases:
+- **20F-1**: security architecture + threat model + production-readiness docs foundation (complete in docs).
+- **20F-2**: optional TLS/mTLS foundation (next implementation step).
+- **20F-3**: workload identity and authorization model.
+- **20F-4**: audit logging/security events.
+- **20F-5**: dashboard/HA/production S3 hardening tracks.

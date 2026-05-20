@@ -103,3 +103,18 @@ A local/dev-first Kubernetes demo path is now available.
 - Runbook: [`docs/kubernetes-local.md`](docs/kubernetes-local.md)
 
 This path demonstrates packaging/deployment for local clusters (kind/minikube) only. It does not claim production Kubernetes readiness, HA, auth, dashboard, or `torch.distributed` execution.
+
+## Phase 20F-1 security foundation
+
+Phase **20F-1** (security architecture/threat-model foundation) is now documented.
+
+New security docs:
+- [Security architecture](docs/security-architecture.md)
+- [Threat model](docs/threat-model.md)
+- [Production readiness](docs/production-readiness.md)
+- [Security auth plan](docs/security-auth.md)
+- [High availability plan](docs/high-availability.md)
+- [Dashboard plan](docs/dashboard-plan.md)
+- [Production S3 plan](docs/production-s3.md)
+
+Important: auth/mTLS, dashboard, HA replication, and production S3 hardening are **not** fully implemented in 20F-1. The next implementation step is **20F-2** (optional TLS/mTLS foundation).

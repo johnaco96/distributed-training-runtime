@@ -71,3 +71,19 @@ Phase 19 ends with docs polish and conservative status framing.
 
 
 Local Kubernetes deployment manifests exist in `k8s/local/` and are documented in `docs/kubernetes-local.md`. This is intentionally not a production Kubernetes platform.
+
+## Phase 20F-1 status update
+
+- Phase **20F-1** documentation foundation is complete.
+- Phase **20F-2** through **20F-5** remain pending.
+
+Security-related references:
+- [Security architecture](security-architecture.md)
+- [Threat model](threat-model.md)
+- [Production readiness](production-readiness.md)
+- [Security auth plan](security-auth.md)
+- [High availability plan](high-availability.md)
+- [Dashboard plan](dashboard-plan.md)
+- [Production S3 plan](production-s3.md)
+
+Local Kubernetes remains local/dev only and is not a production security posture.

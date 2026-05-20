@@ -70,3 +70,12 @@ Phase 20E adds a local/dev-first deployment path:
 - Run the `pytorch-coordinator-demo` Job against the in-cluster coordinator Service.
 
 This extends packaging demonstration coverage without claiming production orchestration maturity.
+
+## Phase 20F-1 packaging/security posture notes
+
+For reviewer-facing clarity, include links to the security foundation docs and avoid production-security claims:
+- [Security architecture](security-architecture.md)
+- [Threat model](threat-model.md)
+- [Production readiness](production-readiness.md)
+
+Do not claim full auth/dashboard/HA/production S3 readiness. 20F-2 is the next implementation step for TLS/mTLS.
