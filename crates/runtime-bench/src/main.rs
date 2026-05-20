@@ -3,9 +3,9 @@
 use clap::{Parser, Subcommand};
 use runtime_bench::{
     parse_workers_list, run_auth_audit_overhead, run_cache_aware_placement, run_checkpoint_restore,
-    run_checkpoint_write, run_dataset_prefetch, run_dataset_read, run_scaling_workers,
-    run_status_snapshot, run_worker_rpc, validate_worker_counts, write_outputs, write_outputs_many,
-    DEFAULT_SCALING_WORKERS, DEFAULT_SIMULATED_SCALING_WORKERS,
+    run_checkpoint_write, run_dataset_prefetch, run_dataset_read, run_logical_workers,
+    run_scaling_workers, run_status_snapshot, run_worker_rpc, validate_worker_counts,
+    write_outputs, write_outputs_many, DEFAULT_SCALING_WORKERS, DEFAULT_SIMULATED_SCALING_WORKERS,
 };
 use std::path::PathBuf;
 
@@ -122,6 +122,38 @@ enum Command {
         #[arg(long)]
         out_json: Option<PathBuf>,
     },
+
+    LogicalWorkers {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value_t = 1000)]
+        workers: usize,
+        #[arg(long, default_value_t = 30)]
+        duration_secs: u64,
+        #[arg(long, default_value_t = 64)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 1000)]
+        heartbeat_interval_ms: u64,
+        #[arg(long, default_value_t = 1000)]
+        shards: usize,
+        #[arg(long, default_value_t = 0)]
+        checkpoint_every_secs: u64,
+        #[arg(long, default_value_t = 2)]
+        checkpoint_artifacts_per_checkpoint: usize,
+        #[arg(long, default_value_t = 1048576)]
+        checkpoint_bytes: usize,
+        #[arg(long, default_value_t = 0.0)]
+        failure_rate: f64,
+        #[arg(long, default_value_t = false)]
+        recover_failed_workers: bool,
+        #[arg(long, default_value_t = true)]
+        start_coordinator: bool,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+    },
+
     WorkerRpc {
         #[arg(long, default_value_t = 8)]
         workers: usize,
@@ -263,6 +295,39 @@ fn main() -> Result<(), String> {
         Command::StatusSnapshot { out_csv, out_json } => {
             (vec![run_status_snapshot()?], out_csv, out_json)
         }
+        Command::LogicalWorkers {
+            target,
+            workers,
+            duration_secs,
+            concurrency,
+            heartbeat_interval_ms,
+            shards,
+            checkpoint_every_secs,
+            checkpoint_artifacts_per_checkpoint,
+            checkpoint_bytes,
+            failure_rate,
+            recover_failed_workers,
+            start_coordinator,
+            out_csv,
+            out_json,
+        } => (
+            vec![run_logical_workers(
+                target,
+                workers,
+                duration_secs,
+                concurrency,
+                heartbeat_interval_ms,
+                shards,
+                checkpoint_every_secs,
+                checkpoint_artifacts_per_checkpoint,
+                checkpoint_bytes,
+                failure_rate,
+                recover_failed_workers,
+                start_coordinator,
+            )?],
+            out_csv,
+            out_json,
+        ),
         Command::WorkerRpc {
             workers,
             heartbeats,

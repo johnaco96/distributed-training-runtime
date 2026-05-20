@@ -175,3 +175,12 @@ Use `scripts/run_k8s_secure_validation.ps1` to run secure coordinator rollout + 
 
 Use `scripts/run_linux_scaling_benchmark.sh` for Linux-only scaling plus checkpoint-stall summary artifacts under `.dtruntime-results/`.
 This benchmark is separate from secure Kubernetes validation and focuses on control-plane throughput, latency percentiles, and checkpoint stall percent.
+
+
+### High-scale logical-worker benchmarking
+The runtime now includes a `runtime-bench logical-workers` mode that emulates hundreds to thousands of logical workers from one or more benchmark processes while issuing real coordinator gRPC control-plane RPCs (register worker, shard assignment, heartbeat, checkpoint metadata lifecycle, and restore-latest checks). This is the recommended way to benchmark control-plane scalability to 100/250/500/1000/2000+ workers without requiring thousands of physical GPUs or pods.
+
+Use:
+`cargo run -p runtime-bench -- logical-workers --workers 1000 --duration-secs 60 --concurrency 128 --heartbeat-interval-ms 1000 --shards 10000 --checkpoint-every-secs 30 --checkpoint-artifacts-per-checkpoint 4 --checkpoint-bytes 67108864 --out-json logical-workers.json --out-csv logical-workers.csv`
+
+Interpretation guidance: use p50/p95/p99 latencies together with coordinator CPU/RSS and disk/network metrics from Linux profiling outputs. Claims about cluster-scale behavior must be based on measured runs and reported caveats; unavailable metrics are recorded as unavailable/null rather than zero.
