@@ -30,4 +30,5 @@ RUN pip install --no-cache-dir --upgrade pip \
 ENV PYTHONPATH=/app/python
 EXPOSE 50051
 
-CMD ["runtime-coordinator", "--addr", "0.0.0.0:50051"]
+ENTRYPOINT ["runtime-coordinator"]
+CMD ["--addr", "0.0.0.0:50051"]

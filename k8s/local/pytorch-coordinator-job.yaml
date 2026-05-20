@@ -20,7 +20,7 @@ spec:
               value: /app/python
           command: ["python", "python/examples/pytorch_coordinator_train.py"]
           args:
-            - "--coordinator"
+            - "--addr"
             - "runtime-coordinator.dtruntime.svc.cluster.local:50051"
             - "--workers"
             - "2"
