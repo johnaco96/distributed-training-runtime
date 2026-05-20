@@ -212,9 +212,12 @@ def main() -> None:
         resumed_from_checkpoint = True
         restored_checkpoint_id = latest.get("checkpoint_id")
 
-    run_id = f"pt-coordinator-{args.seed}-{int(time.time())}"
+    run_name = f"pt-coordinator-{args.seed}"
     dataset_id = f"dataset-{args.seed}"
-    worker_ids = [f"worker-{i}" for i in range(args.workers)]
+    logical_worker_ids = [f"worker-{i}" for i in range(args.workers)]
+    worker_ids: list[str] = []
+    run_id = ""
+    idempotency_suffix = f"{args.seed}-{args.workers}-{args.samples}-{args.epochs}"
 
     checkpoint_id: str | None = None
     checkpoint_path: str | None = None
@@ -223,18 +226,37 @@ def main() -> None:
     assignment_map: dict[str, list[str]] = {}
     worker_metrics: dict[str, dict[str, float | int]] = {}
     rpc_summary = {"registered_workers": 0, "heartbeat_count": 0, "shard_assignment_requests": 0, "checkpoints_committed": 0}
+    latest_checkpoint_metadata: dict[str, Any] | None = None
 
     with maybe_start_coordinator(args) as (coordinator_addr, _proc):
         with connect(coordinator_addr) as client:
+            run_response = client.stub.RegisterRun(
+                client._runtime_pb2.RegisterRunRequest(
+                    idempotency_key=f"pt-register-run-{idempotency_suffix}",
+                    run_name=run_name,
+                    assignment_policy=client._runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
+                    storage_backend_kind=client._runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
+                    world_size=args.workers,
+                    run_version="phase-20b",
+                )
+            )
+            run_id = run_response.run_id.value
             client.register_dataset(run_id=run_id, name="synthetic", uri="synthetic://dataset", format="tensor", shards=shard_payload(shard_map), dataset_id=dataset_id)
-            for rank, worker_id in enumerate(worker_ids):
-                client.register_worker(run_id=run_id, worker_id=worker_id, rank=rank, host="localhost")
+            for rank, worker_id in enumerate(logical_worker_ids):
+                registered = client.register_worker(
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    rank=rank,
+                    host="localhost",
+                    idempotency_key=f"pt-register-worker-{rank}-{idempotency_suffix}",
+                )
+                worker_ids.append(registered.worker_id.value or worker_id)
                 rpc_summary["registered_workers"] += 1
 
             for epoch in range(start_epoch, args.epochs + 1):
                 for worker_id in worker_ids:
-                    assignment = client.request_shard(run_id=run_id, worker_id=worker_id, dataset_id=dataset_id)
-                    assigned = [item.value for item in assignment.shard_ids]
+                    assignment = client.request_shard(run_id=run_id, worker_id=worker_id, dataset_id=dataset_id, idempotency_key=f"pt-request-shard-{worker_id}-{epoch}-{idempotency_suffix}")
+                    assigned = [item.shard_id.value for item in assignment.assignments]
                     assignment_map[worker_id] = assigned
                     rpc_summary["shard_assignment_requests"] += 1
                     all_indices: list[int] = []
@@ -245,7 +267,7 @@ def main() -> None:
                     loss, acc, steps = train_worker_epoch(model, dataset, all_indices, args.batch_size, optimizer, criterion)
                     global_step += steps
                     worker_metrics[worker_id] = {"loss": loss, "accuracy": acc, "steps": steps, "epoch": epoch}
-                    client.heartbeat(run_id=run_id, worker_id=worker_id, active_shard_ids=assigned)
+                    client.heartbeat(run_id=run_id, worker_id=worker_id, active_shard_ids=assigned, idempotency_key=f"pt-heartbeat-{worker_id}-{epoch}-{idempotency_suffix}")
                     rpc_summary["heartbeat_count"] += 1
 
                 final_loss, final_accuracy = evaluate(model, dataset, args.batch_size)
@@ -266,7 +288,7 @@ def main() -> None:
                         "final_accuracy": final_accuracy,
                     }
                     torch.save(state, ckpt_file)
-                    begin = client.begin_checkpoint(run_id=run_id, worker_id=worker_ids[0], step=global_step)
+                    begin = client.begin_checkpoint(run_id=run_id, worker_id=worker_ids[0], step=global_step, idempotency_key=f"pt-begin-ckpt-{epoch}-{idempotency_suffix}")
                     checkpoint_id = begin.checkpoint_id.value
                     client.report_checkpoint_artifact(
                         run_id=run_id,
@@ -277,17 +299,24 @@ def main() -> None:
                         size_bytes=ckpt_file.stat().st_size,
                         checksum=sha256_file(ckpt_file),
                         checksum_algorithm="sha256",
+                        idempotency_key=f"pt-report-ckpt-{epoch}-{idempotency_suffix}",
                     )
-                    client.commit_checkpoint(run_id=run_id, checkpoint_id=checkpoint_id)
+                    client.commit_checkpoint(run_id=run_id, checkpoint_id=checkpoint_id, idempotency_key=f"pt-commit-ckpt-{epoch}-{idempotency_suffix}")
                     rpc_summary["checkpoints_committed"] += 1
                     latest = client.restore_latest(run_id=run_id)
+                    latest_checkpoint_metadata = {
+                        "checkpoint_id": latest.manifest.checkpoint_id.value,
+                        "step": latest.manifest.step,
+                        "state": int(latest.manifest.state),
+                        "artifact_count": len(latest.manifest.artifacts),
+                    }
                     latest_local.write_text(
                         json.dumps(
                             {
                                 "checkpoint_path": ckpt_file.name,
                                 "epoch": epoch,
                                 "global_step": global_step,
-                                "checkpoint_id": latest.checkpoint_id.value or checkpoint_id,
+                                "checkpoint_id": latest.manifest.checkpoint_id.value or checkpoint_id,
                                 "created_at": datetime.now(UTC).isoformat(),
                             },
                             indent=2,
@@ -295,7 +324,7 @@ def main() -> None:
                         encoding="utf-8",
                     )
                     checkpoint_path = str(ckpt_file)
-                    restored_checkpoint_id = latest.checkpoint_id.value or checkpoint_id
+                    restored_checkpoint_id = latest.manifest.checkpoint_id.value or checkpoint_id
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     metrics = {
@@ -313,9 +342,11 @@ def main() -> None:
         "checkpoint_path": checkpoint_path,
         "global_step": global_step,
         "coordinator_addr": args.addr or "local-subprocess",
+        "run_id": run_id,
         "worker_metrics": worker_metrics,
         "shard_assignments": assignment_map,
         "coordinator_rpc_summary": rpc_summary,
+        "latest_checkpoint_metadata": latest_checkpoint_metadata,
     }
     (args.out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
