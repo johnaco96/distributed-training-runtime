@@ -91,7 +91,11 @@ def test_resume_continues_to_next_epoch(tmp_path: Path) -> None:
     metrics = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["final_epoch"] == 2
     assert metrics["resumed_from_checkpoint"] is True
-    assert (output_dir / "checkpoints" / "epoch-0002.pt").exists()
+    checkpoints_dir = output_dir / "checkpoints"
+    assert (checkpoints_dir / "epoch-0002.pt").exists()
+    latest = json.loads((checkpoints_dir / "latest.json").read_text(encoding="utf-8"))
+    assert latest["checkpoint_path"] == "epoch-0002.pt"
+    assert latest["epoch"] == 2
 
 
 @pytest.mark.skipif(not _torch_installed(), reason="torch is not installed")

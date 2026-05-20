@@ -113,6 +113,22 @@ def checkpoint_path_for_epoch(checkpoints_dir: Path, epoch: int) -> Path:
     return checkpoints_dir / f"epoch-{epoch:04d}.pt"
 
 
+def serializable_config(args: argparse.Namespace) -> dict[str, int | float | bool | str | None]:
+    return {
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "lr": args.lr,
+        "seed": args.seed,
+        "samples": args.samples,
+        "input_dim": args.input_dim,
+        "num_classes": args.num_classes,
+        "out_dir": str(args.out_dir),
+        "checkpoint_every": args.checkpoint_every,
+        "resume": args.resume,
+        "no_checkpoint": args.no_checkpoint,
+    }
+
+
 def write_checkpoint(
     *,
     checkpoints_dir: Path,
@@ -135,7 +151,7 @@ def write_checkpoint(
         "epoch": epoch,
         "global_step": global_step,
         "seed": args.seed,
-        "config": vars(args),
+        "config": serializable_config(args),
         "train_loss": train_loss,
         "eval_loss": eval_loss,
         "eval_accuracy": eval_accuracy,
@@ -169,7 +185,10 @@ def restore_latest(
     if not ckpt_path.exists():
         raise RuntimeError(f"--resume requested but checkpoint file is missing: {ckpt_path}")
 
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
