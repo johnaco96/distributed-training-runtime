@@ -1,177 +1,132 @@
 # Distributed Training Runtime
 
-A Rust and Python runtime for distributed ML dataset loading, checkpointing, worker coordination, and recovery.
+Distributed Training Runtime is a **local-first prototype** for coordinating ML-oriented runtime tasks with a Rust coordinator and a Python SDK. It focuses on dataset sharding, worker coordination, checkpoint metadata/artifact flows, and local validation workflows that are useful for development and experimentation.
 
-## Goal
+## What this project currently does
 
-Provide a simple Python API for ML training jobs while a Rust backend coordinates:
+- Provides a Rust gRPC coordinator and Python client SDK for local runtime experiments.
+- Supports dataset registration, shard assignment, worker heartbeats, and lease-aware coordination.
+- Supports checkpoint metadata flows plus local/object-storage artifact paths (including MinIO/S3-compatible backend support).
+- Includes local benchmark harnesses for coordinator/worker RPC and scaling-oriented simulations.
+- Includes PyTorch examples for single-worker training and a **simulated** distributed-style workflow with checkpoint resume.
 
-- distributed dataset registration
-- sharded dataset access
-- async I/O
-- fault-tolerant checkpoint writes
-- worker heartbeats
-- recovery from node failure
-- local and object-storage-backed persistence
+## What this project does **not** claim yet
 
-## Architecture
+- Not production distributed training orchestration.
+- Not real multi-node scheduler-backed ML execution.
+- Not `torch.distributed` integration.
+- Not Kubernetes deployment support.
+- Not Prometheus/Grafana exporter integration (current observability is structured logs + in-process metrics).
+- Not a fully validated cloud-production S3 path by default (must be explicitly validated in your environment).
 
-Python SDK talks to a Rust coordinator over gRPC.
+## Current status (Phases 10–18 complete)
+
+This repository is currently at **Phase 19A (README and quickstart cleanup)**, with Phases 10 through 18 completed.
+
+Highlights from completed phases:
+- Benchmark harness foundations and scaling simulation paths.
+- Observability foundations (structured logs + in-process metrics).
+- Hardening work for retries/idempotency, lease behavior, and checkpoint cleanup helpers.
+- PyTorch integration examples (single-worker and simulated distributed-style) with checkpoint save/restore.
+
+## Architecture overview (concise)
 
 ```text
-Python Training Script
-        |
-        v
-Python SDK
-        |
-        v
-gRPC
-        |
-        v
-Rust Coordinator
-        |
-        v
-Storage / Workers / Checkpoints
+Python training / demo scripts
+            |
+            v
+       Python SDK
+            |
+            v
+            gRPC
+            |
+            v
+     Rust coordinator (MVP)
+            |
+            +--> Worker lifecycle + leasing
+            +--> Dataset/shard coordination
+            +--> Checkpoint metadata + artifact storage backends
+```
 
-## Project status and roadmap
+For deeper architecture details, see [`docs/architecture.md`](docs/architecture.md).
 
-Completed through **Phase 12.5 — Checkpoint Artifact Data Plane foundation**:
+## Quickstart
 
-- [x] Add object storage abstraction implementation.
-- [x] Support MinIO locally.
-- [x] Add S3-compatible checkpoint writes.
-- [x] Add S3-compatible checkpoint restore.
-- [x] Test local MinIO before real cloud storage.
-- [x] Document object key layout.
+Start here: **[`docs/quickstart.md`](docs/quickstart.md)**
 
-### Phase 12.5 — Checkpoint Artifact Data Plane
+The quickstart covers prerequisites, setup (PowerShell-first), fast validation commands, example runs, and cleanup.
 
-Phase 12.5A foundation status:
+## Core commands
 
-- [x] Add reusable checksum algorithm abstraction (`sha256` currently supported).
-- [x] Add reusable backend-neutral artifact integrity validation helpers.
-- [x] Enforce artifact validation in commit path (Phase 12.5B).
+```bash
+cargo check --workspace
+cargo test --workspace
+PYTHONPATH=python python -m pytest python/tests
+```
 
-- Wire real checkpoint artifact bytes into the checkpoint flow.
-- Support worker-side artifact upload to the configured storage backend.
-- Support LocalStorage and S3Storage/MinIO backends.
-- Ensure ReportCheckpointArtifact metadata matches the actual stored object.
-- Validate:
-  - artifact exists
-  - size matches
-  - checksum matches
-  - checksum algorithm matches
-  - URI/key is backend-neutral
-- Reject CommitCheckpoint if required artifacts are missing or invalid.
-- Add LocalStorage artifact-byte roundtrip tests.
-- Add MinIO artifact-byte roundtrip tests.
-- Document artifact metadata vs artifact bytes clearly.
+## Examples
 
-### Phase 13 — Performance and Async I/O (foundation complete)
+### Local demo
 
-- Improve async read/write paths.
-- Add batching where useful.
-- Add concurrent checkpoint uploads.
-- Add dataset prefetching prototype.
-- Add backpressure limits.
-- Add timeout and retry behavior.
+```bash
+PYTHONPATH=python python python/examples/local_demo.py
+```
 
-#### Phase 13A — Timeout/Retry/Backpressure foundation (complete)
+### Benchmark harness smoke
 
-- [x] Add reusable storage operation policy defaults.
-- [x] Add retry helper with capped exponential backoff and retryability guard.
-- [x] Add async timeout helper for async-capable storage operations.
-- [x] Add concurrency/backpressure primitive for storage operations.
-- [x] Wire bounded concurrent checkpoint artifact upload helper (Phase 13B).
-- [x] Add dataset prefetching prototype (Phase 13C complete).
-- [ ] Add full benchmark harness (later Phase 13 work).
+```bash
+cargo run -p runtime-bench -- worker-rpc --workers 2 --heartbeats 2
+cargo run -p runtime-bench -- scaling-workers --workers-list 1,2 --heartbeats 2
+```
 
-Phase 13 should optimize the **real artifact byte path introduced in Phase 12.5**, not only metadata reporting.
+### PyTorch single-worker example
 
-Coordinator artifact-byte upload via control-plane RPC remains intentionally out of scope until Phase 12.5 is implemented.
+```bash
+PYTHONPATH=python python python/examples/pytorch_train.py --epochs 1 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-smoke
+PYTHONPATH=python python python/examples/pytorch_train.py --epochs 2 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-smoke --resume
+```
 
-- Phase 13C dataset prefetching prototype: complete.
-- Benchmark harness: pending.
-- Full async read/write rewrite: pending.
-- Production dataset prefetch/cache-aware placement: pending.
+### PyTorch simulated distributed-style example
 
+```bash
+PYTHONPATH=python python python/examples/pytorch_simulated_distributed.py --workers 2 --epochs 1 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-dist-smoke
+PYTHONPATH=python python python/examples/pytorch_simulated_distributed.py --workers 2 --epochs 2 --samples 32 --batch-size 8 --shards 4 --out-dir .dtruntime-pytorch-dist-smoke --resume
+```
 
-#### Phase 13D — Storage async/read-write cleanup and status cleanup (complete)
+## Documentation index
 
-- [x] Extend `StorageOperationPolicy` coverage in `S3Storage` beyond put (get/exists/delete/list_prefix).
-- [x] Add minimal backend-neutral batch helpers in `runtime-storage` (`put_many`, `get_many`, `exists_many`).
-- [x] Keep `StorageBackend` API compatibility and LocalStorage behavior.
-- [x] Clean roadmap/documentation inconsistencies for Phase 13 status.
+- [Quickstart](docs/quickstart.md)
+- [Architecture](docs/architecture.md)
+- [Benchmarks](docs/benchmarks.md)
+- [Scaling tests](docs/scaling-tests.md)
+- [Observability](docs/observability.md)
+- [Protocol compatibility](docs/protocol-compatibility.md)
+- [Retry and idempotency](docs/retry-idempotency.md)
+- [Leases](docs/leases.md)
+- [Checkpoint cleanup](docs/checkpoint-cleanup.md)
+- [Object storage](docs/object-storage.md)
+- [Checkpoint protocol](docs/checkpoint-protocol.md)
+- [ML integration](docs/ml-integration.md)
+- [ML runbook](docs/ml-runbook.md)
 
-Next planned step: **Phase 14 benchmark harness**.
+## Limitations and non-goals (current)
 
+- Coordinator behavior is still MVP-oriented and local-development focused.
+- Persistence and object-storage paths exist, but production hardening/operations posture is not claimed here.
+- Distributed PyTorch workflow is intentionally simulated and does not use real `torch.distributed` primitives.
+- No production scheduler integration.
+- No Kubernetes deployment path.
+- No Prometheus/Grafana exporter integration yet.
+- Performance expectations should come from your own local benchmark runs in this repo; no external scaling guarantees are claimed.
 
-### Phase 14 — Benchmark Harness (complete)
+## Validation status
 
-- [x] Phase 13 complete.
-- [x] Phase 14A local benchmark CLI and local benchmarks (`dataset-read`, `checkpoint-write`, `checkpoint-restore`) complete.
-- [x] Phase 14B worker registration/heartbeat overhead benchmark complete (`worker-rpc`).
-- Local benchmark scope only; no cloud/distributed performance claims yet.
+Recent local validation scope (environment-dependent):
+- `cargo fmt`
+- `cargo check --workspace`
+- `cargo test --workspace`
+- `PYTHONPATH=python python -m pytest python/tests`
+- `PYTHONPATH=python python python/examples/local_demo.py`
+- local integration tests
 
-Next planned step: **Phase 15 observability**.
-
-
-### Phase 15 — Observability (started)
-
-- [x] Phase 14 complete.
-- [x] Phase 15A structured logging and in-process metrics foundation complete.
-- [x] Phase 15B wire in-process metrics through coordinator worker/shard/checkpoint execution paths.
-- [ ] Add optional Prometheus/Grafana integration later.
-
-Next planned step: **Phase 16 scaling tests**.
-
-See `docs/observability.md` for current scope and usage.
-
-
-### Phase 16 — Scaling tests (complete)
-
-- [x] Phase 16A local scaling benchmark command complete (`runtime-bench scaling-workers` for `1,2,4,8,16`).
-- [x] Phase 16B simulated larger worker-count mode implemented (`--simulate-large`, default `32,64,128`, local logical-worker simulation).
-- [x] Phase 16C runbook/result-format documentation complete (`docs/scaling-tests.md`).
-- Local coordinator benchmark scope only; no multi-machine/distributed production claims.
-- Phase 16 remains pending full local validation after pull until all requested validation commands pass in a local environment.
-
-- [x] Phase 16 full completion validated locally (including simulated-large runs).
-- Next planned step: **Phase 17 hardening**.
-
-
-### Phase 17 — Hardening (complete)
-
-- [x] Phase 17A coordinator error handling consistency + compatibility/version notes documentation complete.
-- [x] Phase 17B retry/idempotency hardening documentation + tests complete.
-- [x] Phase 17C lease hardening complete (ownership/epoch/worker-state checks + lease docs).
-- [x] Phase 17D checkpoint cleanup helper/policy complete (explicit helper, no background scheduler/RPC).
-- [x] Phase 17E version metadata + compatibility final pass complete (`GetRuntimeInfo`, protocol metadata constants/helpers, compatibility docs updates).
-- Scope note: full runtime negotiation is still not implemented; version metadata is informational.
-- Prometheus/Grafana integration remains optional future work and is not part of Phase 17 completion.
-
-
-See `docs/retry-idempotency.md` for current retry/idempotency guarantees and limitations.
-
-
-See `docs/checkpoint-cleanup.md` for cleanup policy and safety behavior.
-
-
-### Phase 18 — Real ML Integration (complete)
-
-- [x] Phase 18A minimal local PyTorch example complete (`python/examples/pytorch_train.py`).
-- [x] Phase 18B checkpointed model/optimizer/scheduler state + restore latest checkpoint integration.
-- [x] Phase 18C distributed-style simulated training example (`python/examples/pytorch_simulated_distributed.py`).
-- Scope note: current ML examples are local/CPU-only, include simulated distributed-style behavior only, and do not claim real distributed execution.
-
-- [x] Phase 18D docs/runbook/final validation pass complete.
-
-See `docs/ml-integration.md` for details and current limitations.
-See `docs/ml-runbook.md` for runnable commands, validation checklist, and cleanup steps.
-- [x] Phase 18 complete: PyTorch example + training loop + model/optimizer/scheduler checkpoint save + latest restore + simulated distributed-style example + docs/runbook/final validation cleanup.
-- [ ] Future: real `torch.distributed` integration.
-- [ ] Future: real multi-node training orchestration.
-- [ ] Future: coordinator-driven ML orchestration.
-- [ ] Future: cloud/S3-backed ML example checkpoint path.
-- [ ] Future: production scheduling integration.
-
+If your environment is missing optional dependencies/services (for example, crates index access, `google.protobuf`, PyTorch, or Docker/MinIO), see the quickstart and runbook notes for expected behavior and workarounds.
