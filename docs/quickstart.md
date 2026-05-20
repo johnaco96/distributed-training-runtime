@@ -2,6 +2,8 @@
 
 This quickstart gives a concise local setup and validation path for the Distributed Training Runtime prototype.
 
+For a system-level map of components and flows, see [Architecture Overview](architecture.md).
+
 ## Prerequisites
 
 Required:

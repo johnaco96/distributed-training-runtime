@@ -1,6 +1,7 @@
 # Benchmarks (Phase 14)
 
 Phase 14A adds a **local-only** benchmark harness via `runtime-bench`.
+For how benchmarks fit into overall runtime structure, see [Architecture Overview](architecture.md).
 
 ## Scope
 - Local dataset read benchmark.
