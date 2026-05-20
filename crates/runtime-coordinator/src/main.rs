@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use runtime_coordinator::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome};
 use runtime_coordinator::auth::{AuthMode, Authorizer};
 use runtime_coordinator::init_tracing_from_env;
 use runtime_coordinator::persistence::SqliteMetadataStore;
@@ -37,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let audit = AuditLogger::tracing();
     let addr: SocketAddr = args.addr.parse()?;
     info!(%addr, "runtime-coordinator configured listen address");
 
@@ -51,9 +53,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = CoordinatorServiceImpl::with_authorizer(state, Authorizer::new(args.auth_mode));
 
     info!(%addr, "starting runtime-coordinator gRPC server");
+    audit.emit(AuditEvent::new(
+        AuditEventKind::CoordinatorStarted,
+        AuditOutcome::Success,
+    ));
+    audit.emit(AuditEvent::new(
+        AuditEventKind::AuthModeConfigured,
+        AuditOutcome::Success,
+    ));
 
     let mut builder = Server::builder();
-    if let Some(tls) = load_tls_config(&args)? {
+    if let Some(tls) = load_tls_config(&args, &audit)? {
         builder = builder.tls_config(tls)?;
     }
 
@@ -69,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn load_tls_config(
     args: &CoordinatorCliArgs,
+    audit: &AuditLogger,
 ) -> Result<Option<ServerTlsConfig>, Box<dyn std::error::Error>> {
     match (&args.tls_cert, &args.tls_key) {
         (None, None) => {
@@ -76,6 +87,10 @@ fn load_tls_config(
                 return Err("--tls-client-ca requires --tls-cert and --tls-key".into());
             }
             info!("runtime-coordinator transport security disabled; serving plaintext gRPC");
+            audit.emit(AuditEvent::new(
+                AuditEventKind::TlsEnabled,
+                AuditOutcome::Failure,
+            ));
             Ok(None)
         }
         (Some(_), None) => Err("--tls-cert requires --tls-key".into()),
@@ -103,8 +118,20 @@ fn load_tls_config(
                 info!(
                     "runtime-coordinator TLS enabled with client certificate verification (mTLS)"
                 );
+                audit.emit(AuditEvent::new(
+                    AuditEventKind::MtlsEnabled,
+                    AuditOutcome::Success,
+                ));
+                audit.emit(AuditEvent::new(
+                    AuditEventKind::TlsEnabled,
+                    AuditOutcome::Success,
+                ));
             } else {
                 info!("runtime-coordinator TLS enabled without client certificate verification");
+                audit.emit(AuditEvent::new(
+                    AuditEventKind::TlsEnabled,
+                    AuditOutcome::Success,
+                ));
             }
             Ok(Some(tls))
         }
@@ -201,7 +228,10 @@ mod tests {
                 show_help: false,
             }
         );
-        assert!(load_tls_config(&parsed).expect("load tls").is_none());
+        let audit = AuditLogger::tracing();
+        assert!(load_tls_config(&parsed, &audit)
+            .expect("load tls")
+            .is_none());
     }
 
     #[test]
@@ -230,7 +260,8 @@ mod tests {
     fn tls_cert_without_key_errors() {
         let parsed = coordinator_args(vec!["--tls-cert".to_string(), "server.crt".to_string()])
             .expect("args parse");
-        let err = load_tls_config(&parsed).expect_err("should error");
+        let audit = AuditLogger::tracing();
+        let err = load_tls_config(&parsed, &audit).expect_err("should error");
         assert_eq!(err.to_string(), "--tls-cert requires --tls-key");
     }
 
@@ -238,7 +269,8 @@ mod tests {
     fn tls_key_without_cert_errors() {
         let parsed = coordinator_args(vec!["--tls-key".to_string(), "server.key".to_string()])
             .expect("args parse");
-        let err = load_tls_config(&parsed).expect_err("should error");
+        let audit = AuditLogger::tracing();
+        let err = load_tls_config(&parsed, &audit).expect_err("should error");
         assert_eq!(err.to_string(), "--tls-key requires --tls-cert");
     }
 
@@ -253,7 +285,8 @@ mod tests {
         .expect("args parse");
         assert!(parsed.tls_cert.is_some());
         assert!(parsed.tls_key.is_some());
-        let err = load_tls_config(&parsed).expect_err("file read should fail");
+        let audit = AuditLogger::tracing();
+        let err = load_tls_config(&parsed, &audit).expect_err("file read should fail");
         assert!(err
             .to_string()
             .starts_with("failed to read --tls-cert file"));
@@ -263,7 +296,8 @@ mod tests {
     fn tls_client_ca_without_server_tls_errors() {
         let parsed = coordinator_args(vec!["--tls-client-ca".to_string(), "ca.crt".to_string()])
             .expect("args parse");
-        let err = load_tls_config(&parsed).expect_err("should error");
+        let audit = AuditLogger::tracing();
+        let err = load_tls_config(&parsed, &audit).expect_err("should error");
         assert_eq!(
             err.to_string(),
             "--tls-client-ca requires --tls-cert and --tls-key"

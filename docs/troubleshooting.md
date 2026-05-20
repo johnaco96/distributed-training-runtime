@@ -167,3 +167,6 @@ If reviewing Phase 20F-1 work, confirm that:
 - no real secrets/tokens were committed,
 - local placeholder values are clearly marked example-only,
 - docs do not claim production auth/dashboard/HA readiness.
+
+
+Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
