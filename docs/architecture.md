@@ -2,6 +2,8 @@
 
 This document describes how the Distributed Training Runtime is structured **today** and how the main components interact. It is intentionally honest about current MVP limits.
 
+For the current project boundary list and validation posture, see [Status and limitations](status-and-limitations.md).
+
 ## High-level system overview
 
 Implemented today:
