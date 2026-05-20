@@ -4,6 +4,8 @@ This document describes how the Distributed Training Runtime is structured **tod
 
 For the current project boundary list and validation posture, see [Status and limitations](status-and-limitations.md).
 
+For planned sequencing and product evolution priorities, see [Product direction](product-direction.md).
+
 ## High-level system overview
 
 Implemented today:
