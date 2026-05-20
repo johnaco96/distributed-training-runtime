@@ -136,3 +136,12 @@ Coordinator health endpoints and Kubernetes startup/readiness/liveness probes ar
 
 Linux scaling/checkpoint outputs support host-scoped evidence for coordinator latency/throughput and checkpoint stall behavior.
 They do not imply hyperscale or vendor-infrastructure superiority claims.
+
+
+### High-scale logical-worker benchmarking
+The runtime now includes a `runtime-bench logical-workers` mode that emulates hundreds to thousands of logical workers from one or more benchmark processes while issuing real coordinator gRPC control-plane RPCs (register worker, shard assignment, heartbeat, checkpoint metadata lifecycle, and restore-latest checks). This is the recommended way to benchmark control-plane scalability to 100/250/500/1000/2000+ workers without requiring thousands of physical GPUs or pods.
+
+Use:
+`cargo run -p runtime-bench -- logical-workers --workers 1000 --duration-secs 60 --concurrency 128 --heartbeat-interval-ms 1000 --shards 10000 --checkpoint-every-secs 30 --checkpoint-artifacts-per-checkpoint 4 --checkpoint-bytes 67108864 --out-json logical-workers.json --out-csv logical-workers.csv`
+
+Interpretation guidance: use p50/p95/p99 latencies together with coordinator CPU/RSS and disk/network metrics from Linux profiling outputs. Claims about cluster-scale behavior must be based on measured runs and reported caveats; unavailable metrics are recorded as unavailable/null rather than zero.

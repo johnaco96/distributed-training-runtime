@@ -365,9 +365,9 @@ pub fn run_checkpoint_restore(
     })
 }
 
-pub const DEFAULT_SCALING_WORKERS: &str = "1,2,4,8,16";
-pub const DEFAULT_SIMULATED_SCALING_WORKERS: &str = "32,64,128";
-pub const MAX_WORKER_COUNT_GUARDRAIL: usize = 1024;
+pub const DEFAULT_SCALING_WORKERS: &str = "100,250,500,1000,2000";
+pub const DEFAULT_SIMULATED_SCALING_WORKERS: &str = "1000,2000,5000";
+pub const MAX_WORKER_COUNT_GUARDRAIL: usize = 10000;
 
 pub fn scaling_benchmark_name(workers: usize, simulated: bool) -> String {
     if simulated {
@@ -805,6 +805,323 @@ fn start_local_coordinator(addr: &str) -> Result<Child, String> {
     let _ = child.kill();
     let _ = child.wait();
     Err(format!("timed out waiting for coordinator at {addr}"))
+}
+
+pub fn run_logical_workers(
+    target: Option<String>,
+    workers: usize,
+    duration_secs: u64,
+    concurrency: usize,
+    heartbeat_interval_ms: u64,
+    shards: usize,
+    checkpoint_every_secs: u64,
+    checkpoint_artifacts_per_checkpoint: usize,
+    checkpoint_bytes: usize,
+    failure_rate: f64,
+    recover_failed_workers: bool,
+    start_coordinator: bool,
+) -> Result<BenchmarkSummary, String> {
+    let runtime = Runtime::new().map_err(|e| e.to_string())?;
+    runtime.block_on(run_logical_workers_async(
+        target,
+        workers,
+        duration_secs,
+        concurrency,
+        heartbeat_interval_ms,
+        shards,
+        checkpoint_every_secs,
+        checkpoint_artifacts_per_checkpoint,
+        checkpoint_bytes,
+        failure_rate,
+        recover_failed_workers,
+        start_coordinator,
+    ))
+}
+
+async fn run_logical_workers_async(
+    target: Option<String>,
+    workers: usize,
+    duration_secs: u64,
+    _concurrency: usize,
+    heartbeat_interval_ms: u64,
+    shards: usize,
+    checkpoint_every_secs: u64,
+    checkpoint_artifacts_per_checkpoint: usize,
+    checkpoint_bytes: usize,
+    failure_rate: f64,
+    recover_failed_workers: bool,
+    start_coordinator: bool,
+) -> Result<BenchmarkSummary, String> {
+    validate_worker_counts(&[workers])?;
+    let addr = target.unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    let mut child = if start_coordinator {
+        Some(start_local_coordinator(&addr)?)
+    } else {
+        None
+    };
+    let mut client = CoordinatorServiceClient::connect(format!("http://{addr}"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let bench_id = format!(
+        "logical-workers-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+
+    let run_t0 = Instant::now();
+    let run_resp = client
+        .register_run(Request::new(RegisterRunRequest {
+            idempotency_key: format!("{bench_id}-run"),
+            run_name: "runtime-bench-logical-workers".into(),
+            assignment_policy: AssignmentPolicy::StaticRank as i32,
+            storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
+            world_size: workers as u32,
+            run_version: "bench".into(),
+        }))
+        .await;
+    let run_id = run_resp
+        .as_ref()
+        .ok()
+        .and_then(|r| r.get_ref().run_id.clone())
+        .ok_or_else(|| "register_run failed".to_string())?;
+
+    let dataset_id = runtime_proto::runtime::v1::DatasetId {
+        value: "bench-dataset".into(),
+    };
+    let shard_metas: Vec<_> = (0..shards)
+        .map(|i| runtime_proto::runtime::v1::ShardMetadata {
+            shard_id: Some(runtime_proto::runtime::v1::ShardId {
+                value: format!("shard-{i}"),
+            }),
+            dataset_id: Some(dataset_id.clone()),
+            shard_uri: format!("file:///tmp/shard-{i}.bin"),
+            byte_range_start: 0,
+            byte_range_end: checkpoint_bytes as i64,
+            size_bytes: checkpoint_bytes as i64,
+            checksum: String::new(),
+            checksum_algorithm: String::new(),
+        })
+        .collect();
+    let _ = client
+        .register_dataset(Request::new(
+            runtime_proto::runtime::v1::RegisterDatasetRequest {
+                idempotency_key: format!("{bench_id}-dataset"),
+                run_id: Some(run_id.clone()),
+                dataset: Some(runtime_proto::runtime::v1::DatasetMetadata {
+                    dataset_id: Some(dataset_id.clone()),
+                    name: "bench".into(),
+                    dataset_uri: "file:///tmp/bench".into(),
+                    format: "synthetic".into(),
+                    shard_count: shards as u32,
+                    dataset_version: "v1".into(),
+                    labels: Default::default(),
+                    registered_at: None,
+                }),
+                shards: shard_metas,
+            },
+        ))
+        .await;
+
+    let mut samples = Vec::new();
+    let mut reg_lat = Vec::new();
+    let mut hb_lat = Vec::new();
+    let mut assign_lat = Vec::new();
+    let mut cbegin = Vec::new();
+    let mut cread = Vec::new();
+    let mut ccommit = Vec::new();
+    let mut crest = Vec::new();
+    let mut worker_ids = Vec::new();
+    for i in 0..workers {
+        let wid = ProtoWorkerId {
+            value: format!("logical-worker-{i}"),
+        };
+        let t = Instant::now();
+        let ok = client
+            .register_worker(Request::new(RegisterWorkerRequest {
+                idempotency_key: format!("{bench_id}-reg-{i}"),
+                run_id: Some(run_id.clone()),
+                worker_id: Some(wid.clone()),
+                rank: i as u32,
+                host: "bench".into(),
+                sdk_version: "bench".into(),
+                protocol_version: "v1".into(),
+            }))
+            .await
+            .is_ok();
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        reg_lat.push(ms);
+        samples.push(BenchmarkSample {
+            latency_ms: ms,
+            bytes: 0,
+            success: ok,
+            retry_count: 0,
+        });
+        if ok {
+            worker_ids.push(wid);
+        }
+    }
+
+    let start = Instant::now();
+    let mut checkpoint_seq = 0_u64;
+    while start.elapsed().as_secs() < duration_secs {
+        for (idx, wid) in worker_ids.iter().enumerate() {
+            if failure_rate > 0.0 && ((idx as f64 / workers as f64) < failure_rate) {
+                continue;
+            }
+            let t = Instant::now();
+            let ok = client
+                .heartbeat(Request::new(HeartbeatRequest {
+                    run_id: Some(run_id.clone()),
+                    worker_id: Some(wid.clone()),
+                    idempotency_key: format!("{bench_id}-hb-{}", idx),
+                    client_time: None,
+                    active_shard_ids: Vec::new(),
+                }))
+                .await
+                .is_ok();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            hb_lat.push(ms);
+            samples.push(BenchmarkSample {
+                latency_ms: ms,
+                bytes: 0,
+                success: ok,
+                retry_count: 0,
+            });
+            let t = Instant::now();
+            let ok = client
+                .get_shard_assignment(Request::new(
+                    runtime_proto::runtime::v1::GetShardAssignmentRequest {
+                        run_id: Some(run_id.clone()),
+                        worker_id: Some(wid.clone()),
+                        dataset_id: Some(dataset_id.clone()),
+                        idempotency_key: format!("{bench_id}-asg-{}", idx),
+                    },
+                ))
+                .await
+                .is_ok();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            assign_lat.push(ms);
+            samples.push(BenchmarkSample {
+                latency_ms: ms,
+                bytes: 0,
+                success: ok,
+                retry_count: 0,
+            });
+        }
+        if checkpoint_every_secs > 0 && start.elapsed().as_secs() % checkpoint_every_secs == 0 {
+            checkpoint_seq += 1;
+            let ckid = runtime_proto::runtime::v1::CheckpointId {
+                value: format!("ckpt-{checkpoint_seq}"),
+            };
+            let owner = worker_ids.first().cloned().unwrap_or(ProtoWorkerId {
+                value: "logical-worker-0".into(),
+            });
+            let t = Instant::now();
+            let ok = client
+                .begin_checkpoint(Request::new(
+                    runtime_proto::runtime::v1::BeginCheckpointRequest {
+                        run_id: Some(run_id.clone()),
+                        worker_id: Some(owner.clone()),
+                        checkpoint_id: Some(ckid.clone()),
+                        step: checkpoint_seq,
+                        idempotency_key: format!("{bench_id}-cbegin-{checkpoint_seq}"),
+                    },
+                ))
+                .await
+                .is_ok();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            cbegin.push(ms);
+            samples.push(BenchmarkSample {
+                latency_ms: ms,
+                bytes: 0,
+                success: ok,
+                retry_count: 0,
+            });
+            for a in 0..checkpoint_artifacts_per_checkpoint {
+                let t = Instant::now();
+                let ok = client
+                    .report_checkpoint_artifact(Request::new(
+                        runtime_proto::runtime::v1::ReportCheckpointArtifactRequest {
+                            run_id: Some(run_id.clone()),
+                            worker_id: Some(owner.clone()),
+                            checkpoint_id: Some(ckid.clone()),
+                            artifact_report: Some(runtime_proto::runtime::v1::ArtifactReport {
+                                artifact_name: format!("a-{a}"),
+                                artifact_uri: format!("file:///tmp/{a}"),
+                                size_bytes: checkpoint_bytes as i64,
+                                checksum: "".into(),
+                                checksum_algorithm: "".into(),
+                                uploaded_at: None,
+                            }),
+                            idempotency_key: format!("{bench_id}-creport-{checkpoint_seq}-{a}"),
+                        },
+                    ))
+                    .await
+                    .is_ok();
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                cread.push(ms);
+                samples.push(BenchmarkSample {
+                    latency_ms: ms,
+                    bytes: checkpoint_bytes as u64,
+                    success: ok,
+                    retry_count: 0,
+                });
+            }
+            let t = Instant::now();
+            let ok = client
+                .commit_checkpoint(Request::new(
+                    runtime_proto::runtime::v1::CommitCheckpointRequest {
+                        run_id: Some(run_id.clone()),
+                        checkpoint_id: Some(ckid.clone()),
+                        idempotency_key: format!("{bench_id}-ccommit-{checkpoint_seq}"),
+                    },
+                ))
+                .await
+                .is_ok();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            ccommit.push(ms);
+            samples.push(BenchmarkSample {
+                latency_ms: ms,
+                bytes: 0,
+                success: ok,
+                retry_count: 0,
+            });
+            let t = Instant::now();
+            let ok = client
+                .get_latest_checkpoint(Request::new(
+                    runtime_proto::runtime::v1::GetLatestCheckpointRequest {
+                        run_id: Some(run_id.clone()),
+                    },
+                ))
+                .await
+                .is_ok();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            crest.push(ms);
+            samples.push(BenchmarkSample {
+                latency_ms: ms,
+                bytes: 0,
+                success: ok,
+                retry_count: 0,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(heartbeat_interval_ms)).await;
+    }
+
+    if let Some(mut c) = child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    let mut s = BenchmarkSummary::from_samples(
+        "logical-workers",
+        "local-dev",
+        "coordinator-rpc",
+        "logical-worker-control-plane",
+        vec!["real gRPC coordinator RPCs from logical worker emulation".into()],
+        &samples,
+        start.elapsed().as_secs_f64() * 1000.0,
+        json!({"logical_worker_count":workers,"duration_seconds":duration_secs,"failure_rate":failure_rate,"recover_failed_workers":recover_failed_workers}),
+    );
+    s.extra = json!({"logical_worker_count":workers,"register_worker_latency_ms":latency_summary(&reg_lat),"heartbeat_latency_ms":latency_summary(&hb_lat),"shard_assignment_latency_ms":latency_summary(&assign_lat),"checkpoint_begin_latency_ms":latency_summary(&cbegin),"checkpoint_report_artifact_latency_ms":latency_summary(&cread),"checkpoint_commit_latency_ms":latency_summary(&ccommit),"restore_latest_latency_ms":latency_summary(&crest)});
+    Ok(s)
 }
 
 pub fn run_dataset_prefetch(
