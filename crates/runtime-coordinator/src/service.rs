@@ -673,6 +673,7 @@ fn millis_to_timestamp(millis: u64) -> prost_types::Timestamp {
 mod tests {
     use super::*;
     use runtime_proto::runtime::v1::{AssignmentPolicy, StorageBackendKind};
+    use runtime_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR, PROTOCOL_PATCH};
 
     fn register_request(idempotency_key: &str) -> RegisterRunRequest {
         register_request_with_world_size(idempotency_key, 8)
