@@ -82,3 +82,8 @@ Phase 20F-3 adds an internal authorization model with optional metadata-based ca
 
 
 Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
+
+## Phase 20F-5 gating update
+
+Production readiness claims must now satisfy the explicit gates in [production-gates.md](production-gates.md). Phase 20 completion is documented as a security/product-direction milestone, not full production readiness.
+

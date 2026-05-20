@@ -1,32 +1,70 @@
-# High Availability Plan (Phase 20F-1)
+# High Availability Plan (Phase 20F-5 Secure Design Track)
 
 ## Current status
 
-- Coordinator deployment model is currently single-replica.
-- HA coordinator replication is not implemented in this phase.
+- Coordinator deployment is currently single-replica.
+- Local Kubernetes Deployment uses `replicas: 1`.
+- No leader election is implemented.
+- No active/passive coordinator failover semantics are implemented.
+- No production HA claim is made.
 
-## Why HA is not simply `replicas: 3`
+## Why replicas alone are unsafe
 
-Multiple replicas alone are insufficient without consistency controls. HA requires correctness across leadership, metadata durability, and write serialization semantics.
+Running multiple coordinator replicas without semantic safety controls risks:
 
-## Core HA requirements
+- Duplicate checkpoint commits.
+- Conflicting worker liveness reconciliation.
+- Lease epoch races.
+- Idempotency store divergence.
+- Latest-checkpoint pointer races.
+- Inconsistent metadata persistence and read/write ordering.
 
-- Durable metadata store.
+## Required HA architecture
+
+Before HA replica count changes are allowed, the control plane needs:
+
+- Durable external metadata store.
 - Leader election.
-- Fencing against split-brain writers.
-- Idempotency correctness under retries/failover.
-- Checkpoint consistency across failover boundaries.
-- Lease/liveness reconciliation after coordinator transitions.
-- Deterministic failover testing.
+- Fencing token / coordinator epoch.
+- Transactional checkpoint metadata updates.
+- Durable idempotency key store.
+- Safe lease/liveness reconciliation rules.
+- Safe recovery after leader restart.
+- Explicit failover test coverage.
 
-## Proposed implementation phases
+## Proposed HA phases
 
-1. Durable metadata hardening.
-2. Leader election model.
-3. Active/passive coordinator failover behavior.
-4. Failover and recovery correctness tests.
-5. Read scaling only if safety/correctness is preserved.
+- **HA-1:** Durable metadata hardening and schema review.
+- **HA-2:** Leader election design.
+- **HA-3:** Active/passive coordinator with fencing.
+- **HA-4:** Failover simulation tests.
+- **HA-5:** Kubernetes HA manifests only after code semantics are safe.
+- **HA-6:** Operational runbook and rollback plan.
 
-## Non-claims
+## Acceptance criteria
 
-This document does not claim HA is implemented today. It defines required design direction before implementation.
+HA is not considered ready until all are true:
+
+- Checkpoint state cannot be double-committed during failover.
+- Worker lease state remains consistent during leader transitions.
+- Idempotency guarantees survive coordinator restart/failover.
+- Latest checkpoint pointer remains monotonic/safe.
+- Stale/failure reconciliation runs only on active leader.
+- Automated tests cover leader restart and failover behavior.
+
+## Risk register
+
+- Split-brain behavior.
+- Duplicate checkpoint commits.
+- Stale leader mutating state after leadership loss.
+- Delayed lease reconciliation causing worker instability.
+- Metadata database outage during leadership transition.
+- Clock skew affecting lease/fencing assumptions.
+
+## Explicit non-claims
+
+This phase does **not** implement:
+- Coordinator replication semantics.
+- Leader election runtime behavior.
+- Active/passive failover runtime behavior.
+- Production HA Kubernetes rollout.

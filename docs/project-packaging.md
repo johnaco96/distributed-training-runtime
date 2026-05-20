@@ -79,3 +79,8 @@ For reviewer-facing clarity, include links to the security foundation docs and a
 - [Production readiness](production-readiness.md)
 
 Do not claim full auth/dashboard/HA/production S3 readiness. 20F-2 is the next implementation step for TLS/mTLS.
+
+## Security/readiness packaging note
+
+Packaging outputs remain local/dev oriented. Phase 20F-5 adds secure design tracks and production gates documentation; it does not add production dashboard, HA replicas, or production S3 rollout manifests.
+

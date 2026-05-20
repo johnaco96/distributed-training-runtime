@@ -1,40 +1,77 @@
-# Dashboard Plan (Phase 20F-1)
+# Dashboard Plan (Phase 20F-5 Secure Design Track)
 
-## Current dashboard status
+## Current status
 
-- Dashboard is not implemented.
+- Dashboard is **not implemented**.
+- No dashboard server currently exists.
+- No dashboard authentication/authorization flow exists yet.
+- Structured audit/security event foundation from Phase 20F-4 exists and can be used as a source for future dashboard security visibility.
+- Metrics/log visibility currently exists only through local/runtime foundations (service metrics snapshots, logs, and docs), not a dedicated dashboard product.
 
-## Current observability foundation
+## Target secure dashboard model
 
-- Structured logs are available.
-- In-process runtime metrics exist.
-- Benchmark outputs exist as JSON/CSV artifacts.
+Target direction is staged and conservative:
 
-## Future dashboard views
+1. **Read-only local dashboard first.**
+2. **Authentication required before any non-local exposure.**
+3. OIDC/human identity provider integration comes later (post-MVP).
+4. Role separation:
+   - read-only viewer
+   - operator
+   - admin
+5. Dashboard must never display:
+   - secrets
+   - raw auth metadata maps
+   - private key/certificate/token material
+   - object-store credentials
+6. Dashboard service is **not exposed publicly by default**.
+7. Default bind/exposure should remain localhost/local-cluster only until explicit hardening gates are complete.
 
-Planned read-oriented views include:
-- Active runs.
-- Worker status (active/stale/failed).
-- Checkpoint lifecycle state.
-- Latest checkpoint metadata.
-- Shard assignment overview.
-- Benchmark summaries.
-- RPC error/security event summaries.
+## Proposed dashboard views (future)
 
-## Security requirements
+- Active runs
+- Run status
+- Active/stale/failed workers
+- Shard assignment overview
+- Checkpoint lifecycle state
+- Latest checkpoint summary
+- Audit/security event summary
+- Benchmark summary ingestion
+- Coordinator health
+- Storage/checkpoint cleanup status
 
-- Authentication required.
-- No public default exposure.
-- No secrets displayed.
-- Role separation to be added in later phases.
+## Implementation phases
 
-## Implementation path
+- **Dashboard-1:** Read-only CLI/status endpoint or local-only API summary.
+- **Dashboard-2:** Local read-only web UI with no public exposure.
+- **Dashboard-3:** Authentication and role-based access.
+- **Dashboard-4:** Audit/security-event view.
+- **Dashboard-5:** Optional Prometheus/Grafana integration.
+- **Dashboard-6:** Production deployment hardening.
 
-1. Metrics endpoint/exporter hardening.
-2. Local read-only dashboard prototype.
-3. Auth integration.
-4. Prometheus/Grafana integration later if needed.
+## Acceptance criteria
 
-## Non-claims
+A dashboard track is only considered secure-ready when:
 
-This document does not claim a dashboard implementation exists in the current codebase.
+- No secrets are displayed in UI/API payloads.
+- Auth is required for non-local use.
+- Dashboard logs exclude secrets and sensitive auth material.
+- Security event visibility exists (at least summary-level from audit events).
+- Safe defaults are enforced (local bind/no public exposure by default).
+- Documentation and tests cover security behavior and non-claims.
+
+## Risk register
+
+- Accidental public exposure of dashboard endpoint.
+- Secret leakage in views, APIs, or logs.
+- Confusing local metrics behavior with production-scale observability guarantees.
+- Dashboard becoming an unintended control-plane mutation path.
+- Missing/incomplete authorization checks for sensitive data.
+
+## Explicit non-claims
+
+This design track does **not** implement:
+- A production dashboard server.
+- OIDC authentication.
+- Production-ready dashboard authorization.
+- Public dashboard deployment defaults.
