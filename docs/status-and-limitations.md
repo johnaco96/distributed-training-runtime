@@ -126,3 +126,7 @@ Added runtime-bench subcommands: `dataset-prefetch`, `cache-aware-placement`, `a
 
 
 Observability update: Step 1 Prometheus/Grafana is implemented. See `docs/observability.md`, `observability/prometheus/prometheus.yml`, and `observability/grafana/dtruntime-dashboard.json`.
+
+## Step 2 update (health probes)
+
+Coordinator health endpoints and Kubernetes startup/readiness/liveness probes are now implemented for local manifests. This improves pod lifecycle safety, but does not by itself claim full production readiness.

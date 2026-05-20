@@ -99,3 +99,12 @@ Production readiness claims must now satisfy the explicit gates in [production-g
 
 
 Observability update: Step 1 Prometheus/Grafana is implemented. See `docs/observability.md`, `observability/prometheus/prometheus.yml`, and `observability/grafana/dtruntime-dashboard.json`.
+
+## Step 2 status: readiness/liveness probes
+
+Step 2 of the production-readiness roadmap is implemented for local Kubernetes manifests and coordinator HTTP health endpoints:
+- `/healthz` (liveness)
+- `/readyz` (readiness)
+- startup probe wired to `/healthz`
+
+Health endpoints are intentionally low-cost and do not expose secrets.

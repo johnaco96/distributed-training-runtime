@@ -155,3 +155,11 @@ Added runtime-bench subcommands: `dataset-prefetch`, `cache-aware-placement`, `a
 
 ## Step 1 production observability
 Prometheus /metrics is available via `--metrics-addr` and Grafana dashboard assets are under `observability/`.
+
+## Step 2 production probes
+
+Coordinator health endpoints are now available on the metrics HTTP listener (`--metrics-addr`):
+- `GET /healthz` for liveness
+- `GET /readyz` for readiness
+
+Local Kubernetes manifests wire startup/readiness/liveness probes to these endpoints to prevent early traffic routing and to restart unhealthy pods.

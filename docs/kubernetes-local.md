@@ -117,3 +117,11 @@ No cert/key/token material is committed in-repo.
 
 
 Observability update: Step 1 Prometheus/Grafana is implemented. See `docs/observability.md`, `observability/prometheus/prometheus.yml`, and `observability/grafana/dtruntime-dashboard.json`.
+
+## Step 2 readiness/liveness/startup probes
+
+`k8s/local/` and `k8s/local-secure/` now configure coordinator `startupProbe`, `livenessProbe`, and `readinessProbe` against the metrics port (`:9090`):
+- `/healthz` is used for liveness/startup.
+- `/readyz` is used for readiness gating.
+
+This prevents routing traffic before readiness and allows Kubernetes to restart unhealthy pods.
