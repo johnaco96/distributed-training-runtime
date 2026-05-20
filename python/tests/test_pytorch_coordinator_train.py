@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,12 @@ requires_deps = pytest.mark.skipif(
 )
 
 
+def subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "python"
+    return env
+
+
 @requires_deps
 def test_smoke_with_checkpoint(tmp_path: Path) -> None:
     out_dir = tmp_path / "coord"
@@ -44,7 +51,7 @@ def test_smoke_with_checkpoint(tmp_path: Path) -> None:
         "--out-dir",
         str(out_dir),
     ]
-    subprocess.run(cmd, check=True, env={**dict(), **{"PYTHONPATH": "python"}})
+    subprocess.run(cmd, check=True, env=subprocess_env())
     metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["workers"] == 2
     assert metrics["shards"] == 4
@@ -70,7 +77,7 @@ def test_no_checkpoint(tmp_path: Path) -> None:
         str(out_dir),
         "--no-checkpoint",
     ]
-    subprocess.run(cmd, check=True, env={**dict(), **{"PYTHONPATH": "python"}})
+    subprocess.run(cmd, check=True, env=subprocess_env())
     metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["checkpoint_id"] is None
     assert not (out_dir / "checkpoints" / "latest.json").exists()
@@ -93,8 +100,8 @@ def test_resume(tmp_path: Path) -> None:
         "--out-dir",
         str(out_dir),
     ]
-    subprocess.run([*base, "--epochs", "1"], check=True, env={"PYTHONPATH": "python"})
-    subprocess.run([*base, "--epochs", "2", "--resume"], check=True, env={"PYTHONPATH": "python"})
+    subprocess.run([*base, "--epochs", "1"], check=True, env=subprocess_env())
+    subprocess.run([*base, "--epochs", "2", "--resume"], check=True, env=subprocess_env())
     metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["final_epoch"] == 2
     assert metrics["resumed_from_checkpoint"] is True

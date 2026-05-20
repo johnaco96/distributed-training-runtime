@@ -96,7 +96,7 @@ Remove-Item -Recurse -Force .dtruntime-pytorch-dist-no-checkpoint -ErrorAction S
 
 ## G) S3/MinIO optional commands
 
-MinIO must be running/configured before these commands.
+The S3 feature checks below do not require MinIO. The MinIO roundtrip test requires MinIO to be running/configured and must be explicitly enabled with DTRUNTIME_RUN_MINIO_TESTS=1.
 
 ```bash
 cargo check -p runtime-storage --features s3
