@@ -300,7 +300,8 @@ def test_register_worker_builds_request_and_calls_stub(monkeypatch):
             host="host-a",
             sdk_version="0.1.0-test",
             protocol_version="runtime.v1-test",
-        )
+        ),
+        metadata=[]
     )
     assert result == response
 
@@ -379,7 +380,8 @@ def test_register_dataset_builds_request_and_calls_stub(monkeypatch):
                     checksum_algorithm="sha256",
                 ),
             ],
-        )
+        ),
+        metadata=[]
     )
     assert result == response
 
@@ -403,7 +405,8 @@ def test_heartbeat_builds_request_and_converts_active_shard_ids(monkeypatch):
             worker_id=WorkerId(value="worker-1"),
             idempotency_key="idem-2",
             active_shard_ids=[ShardId(value="shard-a"), ShardId(value="shard-b")],
-        )
+        ),
+        metadata=[]
     )
     assert result == response
 
@@ -427,7 +430,8 @@ def test_request_shard_builds_request_and_calls_stub(monkeypatch):
             worker_id=WorkerId(value="worker-1"),
             dataset_id=DatasetId(value="dataset-1"),
             idempotency_key="idem-shard-1",
-        )
+        ),
+        metadata=[]
     )
     assert result == response
 
@@ -453,7 +457,8 @@ def test_begin_checkpoint_builds_request_and_calls_stub(monkeypatch):
             checkpoint_id=CheckpointId(value="ckpt-1"),
             step=42,
             idempotency_key="idem-checkpoint-1",
-        )
+        ),
+        metadata=[]
     )
     assert result == response
 
@@ -491,7 +496,8 @@ def test_report_checkpoint_artifact_builds_request_and_calls_stub(monkeypatch):
                 checksum_algorithm="sha256",
             ),
             idempotency_key="idem-artifact-1",
-        )
+        ),
+        metadata=[]
     )
     assert result == response
 
@@ -513,7 +519,8 @@ def test_commit_checkpoint_builds_request_and_calls_stub(monkeypatch):
             run_id=RunId(value="run-1"),
             checkpoint_id=CheckpointId(value="ckpt-1"),
             idempotency_key="idem-commit-1",
-        )
+        ),
+        metadata=[]
     )
     assert result == response
 
@@ -528,6 +535,23 @@ def test_restore_latest_builds_request_and_calls_stub(monkeypatch):
     result = client.restore_latest(run_id="run-1")
 
     stub.GetLatestCheckpoint.assert_called_once_with(
-        GetLatestCheckpointRequest(run_id=RunId(value="run-1"))
+        GetLatestCheckpointRequest(run_id=RunId(value="run-1")),
+        metadata=[]
     )
     assert result == response
+
+
+def test_auth_metadata_from_args(monkeypatch):
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    client = RuntimeClient("127.0.0.1:50051", auth_subject="worker-0", auth_role="worker", auth_worker_id="worker-0")
+    client.heartbeat(run_id="r", worker_id="worker-0")
+    stub.Heartbeat.assert_called_once()
+    assert stub.Heartbeat.call_args.kwargs["metadata"] == [("x-dtruntime-subject", "worker-0"), ("x-dtruntime-role", "worker"), ("x-dtruntime-worker-id", "worker-0")]
+
+def test_auth_metadata_from_env(monkeypatch):
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    monkeypatch.setenv("DTRUNTIME_AUTH_SUBJECT", "admin")
+    monkeypatch.setenv("DTRUNTIME_AUTH_ROLE", "admin")
+    client = RuntimeClient("127.0.0.1:50051")
+    client.restore_latest("r")
+    assert stub.GetLatestCheckpoint.call_args.kwargs["metadata"] == [("x-dtruntime-subject", "admin"), ("x-dtruntime-role", "admin")]

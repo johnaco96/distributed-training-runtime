@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod auth;
 pub mod persistence;
 pub mod service;
 pub mod state;
