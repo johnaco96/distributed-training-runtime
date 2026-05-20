@@ -555,7 +555,10 @@ mod tests {
     }
     #[test]
     fn csv_has_headers() {
-        assert!(BenchmarkSummary::csv_header().contains("benchmark,operation_count"));
+        let header = BenchmarkSummary::csv_header();
+        assert!(header.starts_with(
+            "benchmark,environment,surface,mode,caveats,timestamp_utc,operation_count"
+        ));
     }
     #[test]
     fn dataset_small() {

@@ -247,7 +247,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_args() {
+    fn default_args() -> Result<(), Box<dyn std::error::Error>> {
         let parsed = coordinator_args(Vec::<String>::new()).expect("default args should parse");
         assert_eq!(
             parsed,
@@ -271,6 +271,7 @@ mod tests {
         assert!(load_tls_config(&parsed, &audit)
             .expect("load tls")
             .is_none());
+        Ok(())
     }
 
     #[test]

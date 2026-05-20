@@ -1812,7 +1812,7 @@ mod tests {
             .register_worker(worker_request(run_id.clone(), "worker-key"))
             .expect("worker should register")
             .worker_id;
-        let _dataset = state
+        let dataset = state
             .register_dataset(dataset_request(run_id.clone(), "dataset-key"))
             .expect("dataset should register");
         assert!(state.set_worker_heartbeat_deadline_for_test(
