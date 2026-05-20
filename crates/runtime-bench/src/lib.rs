@@ -58,6 +58,7 @@ pub struct BenchmarkSummary {
     pub p90_latency_ms: f64,
     pub p99_latency_ms: f64,
     pub retry_count: u64,
+    #[serde(default)]
     pub extra: Value,
 }
 
