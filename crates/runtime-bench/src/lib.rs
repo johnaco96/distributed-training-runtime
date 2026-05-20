@@ -800,14 +800,39 @@ fn start_local_coordinator(addr: &str) -> Result<Child, String> {
         if TcpStream::connect(addr).is_ok() {
             return Ok(child);
         }
-        if let Ok(Some(_)) = child.try_wait() {
-            return Err("runtime-coordinator exited before benchmark client connected".into());
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "spawned runtime-coordinator exited before benchmark client connected (status: {status})"
+            ));
         }
         thread::sleep(Duration::from_millis(100));
     }
     let _ = child.kill();
     let _ = child.wait();
-    Err(format!("timed out waiting for coordinator at {addr}"))
+    Err(format!(
+        "timed out waiting for spawned coordinator at {addr}"
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LogicalWorkersCoordinatorMode {
+    External { target: String },
+    Spawned { target: String },
+}
+
+fn resolve_logical_workers_coordinator_mode(
+    target: Option<String>,
+    start_coordinator: bool,
+) -> Result<LogicalWorkersCoordinatorMode, String> {
+    if start_coordinator {
+        Ok(LogicalWorkersCoordinatorMode::Spawned {
+            target: target.unwrap_or_else(|| "127.0.0.1:50051".to_string()),
+        })
+    } else {
+        let target = target
+            .ok_or_else(|| "--target is required unless --start-coordinator is used".to_string())?;
+        Ok(LogicalWorkersCoordinatorMode::External { target })
+    }
 }
 
 pub fn run_logical_workers(
@@ -856,15 +881,22 @@ async fn run_logical_workers_async(
     start_coordinator: bool,
 ) -> Result<BenchmarkSummary, String> {
     validate_worker_counts(&[workers])?;
-    let addr = target.unwrap_or_else(|| "127.0.0.1:50051".to_string());
-    let mut child = if start_coordinator {
-        Some(start_local_coordinator(&addr)?)
-    } else {
-        None
+    let mode = resolve_logical_workers_coordinator_mode(target, start_coordinator)?;
+    let (addr, mut child) = match mode {
+        LogicalWorkersCoordinatorMode::Spawned { target } => {
+            let child = start_local_coordinator(target.trim_start_matches("http://"))?;
+            (target, Some(child))
+        }
+        LogicalWorkersCoordinatorMode::External { target } => (target, None),
     };
-    let mut client = CoordinatorServiceClient::connect(format!("http://{addr}"))
+    let endpoint = if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.clone()
+    } else {
+        format!("http://{addr}")
+    };
+    let mut client = CoordinatorServiceClient::connect(endpoint)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| format!("timed out waiting for existing coordinator at {addr}"))?;
     let bench_id = format!(
         "logical-workers-{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1125,6 +1157,47 @@ async fn run_logical_workers_async(
     );
     s.extra = json!({"logical_worker_count":workers,"register_worker_latency_ms":latency_summary(&reg_lat),"heartbeat_latency_ms":latency_summary(&hb_lat),"shard_assignment_latency_ms":latency_summary(&assign_lat),"checkpoint_begin_latency_ms":latency_summary(&cbegin),"checkpoint_report_artifact_latency_ms":latency_summary(&cread),"checkpoint_commit_latency_ms":latency_summary(&ccommit),"restore_latest_latency_ms":latency_summary(&crest)});
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_logical_workers_coordinator_mode, LogicalWorkersCoordinatorMode};
+
+    #[test]
+    fn logical_workers_with_target_and_no_start_coordinator_uses_external_mode() {
+        let mode =
+            resolve_logical_workers_coordinator_mode(Some("http://127.0.0.1:50051".into()), false)
+                .expect("external mode should resolve");
+        assert_eq!(
+            mode,
+            LogicalWorkersCoordinatorMode::External {
+                target: "http://127.0.0.1:50051".into()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_workers_start_coordinator_uses_spawned_mode() {
+        let mode = resolve_logical_workers_coordinator_mode(Some("127.0.0.1:50051".into()), true)
+            .expect("spawned mode should resolve");
+        assert_eq!(
+            mode,
+            LogicalWorkersCoordinatorMode::Spawned {
+                target: "127.0.0.1:50051".into()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_workers_missing_target_without_start_coordinator_fails_clearly() {
+        let err = resolve_logical_workers_coordinator_mode(None, false)
+            .expect_err("missing target should fail");
+        assert_eq!(
+            err,
+            "--target is required unless --start-coordinator is used"
+        );
+        assert!(!err.contains("runtime-coordinator exited before benchmark client connected"));
+    }
 }
 
 pub fn run_dataset_prefetch(
