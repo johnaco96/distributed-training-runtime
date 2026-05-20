@@ -203,3 +203,7 @@ Examples remain local/dev oriented. They do not represent production dashboard a
 - Secure Kubernetes runbook depth expanded for local certificate/secret creation flow.
 - Production readiness is still not claimed; remaining gaps are tracked in status/production docs.
 \n- Phase 20 update: benchmark expansion and MinIO/S3 validation are environment-gated; no production-readiness claim.
+
+
+## Phase 20 benchmark surface expansion
+Added runtime-bench subcommands: `dataset-prefetch`, `cache-aware-placement`, `auth-audit-overhead`, and `status-snapshot`. Outputs now include `environment`, `surface`, `mode`, `caveats`, `timestamp_utc`, duration/latency fields, plus JSON/CSV outputs. MinIO-gated paths remain optional and must be enabled via `DTRUNTIME_RUN_MINIO_TESTS=1`; otherwise they should skip cleanly with caveats.
