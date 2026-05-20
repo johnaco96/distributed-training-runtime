@@ -125,3 +125,6 @@ Observability update: Step 1 Prometheus/Grafana is implemented. See `docs/observ
 - `/readyz` is used for readiness gating.
 
 This prevents routing traffic before readiness and allows Kubernetes to restart unhealthy pods.
+
+## Step 3 secure deployment validation
+For secure local validation, follow `k8s/local-secure/README.md` and apply manifests in order (service, deployment, job). Do not use placeholder YAML secrets as runtime inputs; create real Secrets with `kubectl create secret tls` / `kubectl create secret generic` from `.dtruntime-certs/`.

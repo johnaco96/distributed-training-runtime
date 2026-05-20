@@ -50,3 +50,6 @@ Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit 
 
 ## Phase 20F-3 authorization matrix coverage update
 Service-level metadata authorization tests now cover coordinator RPC groups across admin-only and worker-scoped endpoints (including worker self-mismatch denial and missing/invalid identity rejection). This remains local/dev metadata identity scaffolding and is not production identity assurance. Production mTLS/SPIFFE identity extraction and policy integration remain future work.
+
+## Step 3 secure local Kubernetes path
+`k8s/local-secure/` now validates TLS/mTLS with real Kubernetes Secrets (`dtruntime-tls`, `dtruntime-client-ca`, `dtruntime-client-tls`) created from generated local certs in `.dtruntime-certs/`. The coordinator consumes `--tls-cert`, `--tls-key`, and `--tls-client-ca` from mounted secret files, and the PyTorch job uses `DTRUNTIME_TLS_CA_CERT`, `DTRUNTIME_TLS_CLIENT_CERT`, and `DTRUNTIME_TLS_CLIENT_KEY`.
