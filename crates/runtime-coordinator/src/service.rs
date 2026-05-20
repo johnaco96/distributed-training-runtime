@@ -696,7 +696,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<ReportCheckpointArtifactRequest>,
     ) -> Result<Response<ReportCheckpointArtifactResponse>, Status> {
-        let request = request.into_inner();
+        let (metadata, extensions, request) = request.into_parts();
         validate_idempotency_key("report_checkpoint_artifact", &request.idempotency_key)?;
         let run_id = request
             .run_id
@@ -704,6 +704,8 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let auth_req = Request::from_parts(metadata, extensions, ());
+        self.allow_admin_or_worker_self(&auth_req, &worker_id.value, "worker_self_request")?;
         let checkpoint_id = request
             .checkpoint_id
             .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?;
@@ -1243,6 +1245,241 @@ mod tests {
         assert_permission_denied(assignment_err);
     }
 
+    #[tokio::test]
+    async fn metadata_auth_admin_only_and_worker_scoped_matrix_core_paths() {
+        let service = build_service_with_metadata_auth();
+        let run_id = service
+            .register_run(request_as_admin(register_request("run-matrix")))
+            .await
+            .unwrap()
+            .into_inner()
+            .run_id
+            .unwrap();
+        let worker_id = service
+            .register_worker(request_as_worker(
+                "seed-worker",
+                worker_request(run_id.clone(), "worker-matrix"),
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .worker_id
+            .unwrap();
+        let dataset_id = service
+            .register_dataset(request_as_admin(dataset_request(
+                run_id.clone(),
+                "dataset-matrix",
+                Some("dataset-m"),
+                &[Some("shard-0")],
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .dataset_id
+            .unwrap();
+
+        let deny = service
+            .register_dataset(request_as_worker(
+                &worker_id.value,
+                dataset_request(
+                    run_id.clone(),
+                    "dataset-deny",
+                    Some("d2"),
+                    &[Some("shard-1")],
+                ),
+            ))
+            .await
+            .expect_err("worker denied");
+        assert_permission_denied(deny);
+        assert_unauthenticated(
+            service
+                .register_dataset(request_without_auth(dataset_request(
+                    run_id.clone(),
+                    "dataset-missing",
+                    Some("d3"),
+                    &[Some("shard-2")],
+                )))
+                .await
+                .expect_err("missing"),
+        );
+        assert_unauthenticated(
+            service
+                .register_dataset(request_with_invalid_role(dataset_request(
+                    run_id.clone(),
+                    "dataset-invalid",
+                    Some("d4"),
+                    &[Some("shard-3")],
+                )))
+                .await
+                .expect_err("invalid"),
+        );
+
+        service
+            .get_run_status(request_as_admin(GetRunStatusRequest {
+                run_id: Some(run_id.clone()),
+            }))
+            .await
+            .unwrap();
+        assert_permission_denied(
+            service
+                .get_run_status(request_as_worker(
+                    &worker_id.value,
+                    GetRunStatusRequest {
+                        run_id: Some(run_id.clone()),
+                    },
+                ))
+                .await
+                .expect_err("worker denied"),
+        );
+
+        service
+            .get_shard_assignment(request_as_worker(
+                &worker_id.value,
+                GetShardAssignmentRequest {
+                    run_id: Some(run_id.clone()),
+                    worker_id: Some(worker_id.clone()),
+                    dataset_id: Some(dataset_id.clone()),
+                    idempotency_key: "ok".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert_permission_denied(
+            service
+                .get_shard_assignment(request_as_worker(
+                    "other",
+                    GetShardAssignmentRequest {
+                        run_id: Some(run_id.clone()),
+                        worker_id: Some(worker_id.clone()),
+                        dataset_id: Some(dataset_id.clone()),
+                        idempotency_key: "bad".into(),
+                    },
+                ))
+                .await
+                .expect_err("mismatch"),
+        );
+
+        let ckpt = service
+            .begin_checkpoint(request_as_worker(
+                &worker_id.value,
+                BeginCheckpointRequest {
+                    run_id: Some(run_id.clone()),
+                    worker_id: Some(worker_id.clone()),
+                    checkpoint_id: Some(CheckpointId {
+                        value: "ckpt-m".into(),
+                    }),
+                    step: 1,
+                    idempotency_key: "begin-m".into(),
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .checkpoint_id
+            .unwrap();
+        assert_permission_denied(
+            service
+                .begin_checkpoint(request_as_worker(
+                    "other",
+                    BeginCheckpointRequest {
+                        run_id: Some(run_id.clone()),
+                        worker_id: Some(worker_id.clone()),
+                        checkpoint_id: Some(CheckpointId {
+                            value: "ckpt-bad".into(),
+                        }),
+                        step: 1,
+                        idempotency_key: "begin-bad".into(),
+                    },
+                ))
+                .await
+                .expect_err("mismatch"),
+        );
+
+        service
+            .report_checkpoint_artifact(request_as_worker(
+                &worker_id.value,
+                artifact_request(
+                    run_id.clone(),
+                    worker_id.clone(),
+                    &ckpt.value,
+                    "weights.bin",
+                    "s3://bucket/weights.bin",
+                    "artifact-m",
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_permission_denied(
+            service
+                .report_checkpoint_artifact(request_as_worker(
+                    "other",
+                    artifact_request(
+                        run_id.clone(),
+                        worker_id.clone(),
+                        &ckpt.value,
+                        "weights2.bin",
+                        "s3://bucket/weights2.bin",
+                        "artifact-bad",
+                    ),
+                ))
+                .await
+                .expect_err("mismatch"),
+        );
+
+        service
+            .commit_checkpoint(request_as_admin(CommitCheckpointRequest {
+                run_id: Some(run_id.clone()),
+                checkpoint_id: Some(ckpt.clone()),
+                idempotency_key: "commit-m".into(),
+            }))
+            .await
+            .unwrap();
+        assert_permission_denied(
+            service
+                .commit_checkpoint(request_as_worker(
+                    &worker_id.value,
+                    CommitCheckpointRequest {
+                        run_id: Some(run_id.clone()),
+                        checkpoint_id: Some(ckpt.clone()),
+                        idempotency_key: "commit-deny".into(),
+                    },
+                ))
+                .await
+                .expect_err("worker denied"),
+        );
+
+        service
+            .get_latest_checkpoint(request_as_admin(GetLatestCheckpointRequest {
+                run_id: Some(run_id.clone()),
+            }))
+            .await
+            .unwrap();
+        assert_permission_denied(
+            service
+                .get_latest_checkpoint(request_as_worker(
+                    &worker_id.value,
+                    GetLatestCheckpointRequest {
+                        run_id: Some(run_id.clone()),
+                    },
+                ))
+                .await
+                .expect_err("worker denied"),
+        );
+
+        service
+            .get_runtime_info(request_as_admin(GetRuntimeInfoRequest {}))
+            .await
+            .unwrap();
+        assert_permission_denied(
+            service
+                .get_runtime_info(request_as_worker(
+                    &worker_id.value,
+                    GetRuntimeInfoRequest {},
+                ))
+                .await
+                .expect_err("worker denied"),
+        );
+    }
     #[tokio::test]
     async fn register_run_and_get_run_status_round_trip() {
         let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));

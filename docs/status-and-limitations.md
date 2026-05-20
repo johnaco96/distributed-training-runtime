@@ -106,3 +106,7 @@ Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit 
 
 References: [Phase 20F summary](phase-20f-summary.md), [production gates](production-gates.md).
 
+
+
+## Phase 20F-3 authorization matrix coverage update
+Service-level metadata authorization tests now cover coordinator RPC groups across admin-only and worker-scoped endpoints (including worker self-mismatch denial and missing/invalid identity rejection). This remains local/dev metadata identity scaffolding and is not production identity assurance. Production mTLS/SPIFFE identity extraction and policy integration remain future work.
