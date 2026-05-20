@@ -58,6 +58,7 @@ pub struct BenchmarkSummary {
     pub p90_latency_ms: f64,
     pub p99_latency_ms: f64,
     pub retry_count: u64,
+    pub extra: Value,
 }
 
 impl BenchmarkSummary {
@@ -116,7 +117,7 @@ impl BenchmarkSummary {
 
     pub fn to_csv_row(&self) -> String {
         format!(
-            "{},{},{},{},"{}",{},{},{},{},{:.6},{},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
+            "{},{},{},{},\"{}\",{},{},{},{},{:.6},{},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
             self.benchmark,
             self.environment,
             self.surface,

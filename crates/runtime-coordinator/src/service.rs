@@ -50,7 +50,7 @@ impl CoordinatorServiceImpl {
         )
     }
 
-    pub fn with_metrics_and_authorizer(
+    pub fn with_metrics_authorizer_and_audit(
         state: Arc<CoordinatorState>,
         metrics: Arc<RuntimeMetrics>,
         authorizer: Authorizer,
@@ -1030,7 +1030,7 @@ mod tests {
         let state = Arc::new(CoordinatorState::default());
         let audit_sink = Arc::new(crate::audit::InMemoryAuditSink::default());
         let audit = AuditLogger::new(audit_sink);
-        CoordinatorServiceImpl::with_metrics_and_authorizer(
+        CoordinatorServiceImpl::with_metrics_authorizer_and_audit(
             state,
             Arc::new(RuntimeMetrics::default()),
             Authorizer::new(crate::auth::AuthMode::Metadata),
