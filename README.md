@@ -161,7 +161,9 @@ See `docs/checkpoint-cleanup.md` for cleanup policy and safety behavior.
 
 - [x] Phase 18A minimal local PyTorch example complete (`python/examples/pytorch_train.py`).
 - [x] Phase 18B checkpointed model/optimizer/scheduler state + restore latest checkpoint integration.
-- [ ] Phase 18C distributed-style simulated training example.
+- [x] Phase 18C distributed-style simulated training example (`python/examples/pytorch_simulated_distributed.py`).
 - Scope note: current ML example is local/CPU-only and does not claim distributed execution.
+
+- [ ] Phase 18D docs/runbook/final validation pass pending.
 
 See `docs/ml-integration.md` for details and current limitations.
