@@ -3,145 +3,148 @@
 #[cfg(feature = "s3")]
 mod tests {
     use runtime_checkpoint::{
-        upload_checkpoint_artifacts_concurrently, CheckpointArtifactUpload, CheckpointId,
-        CheckpointRecord, CheckpointStore, ChecksumAlgorithm, RunId, WorkerId,
+        upload_checkpoint_artifacts_concurrently, CheckpointArtifactUpload,
+        CheckpointCleanupPolicy, CheckpointId, CheckpointRecord, CheckpointStore,
+        ChecksumAlgorithm, RunId, WorkerId,
     };
-    use runtime_storage::{S3Storage, S3StorageConfig, StorageKey, StorageOperationPolicy};
+    use runtime_storage::{
+        S3Storage, S3StorageConfig, StorageBackend, StorageKey, StorageOperationPolicy,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn env_optional(name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.trim().is_empty())
     }
-
-    fn env_required_or_skip(name: &str) -> Option<String> {
-        match env_optional(name) {
-            Some(v) => Some(v),
-            None => {
-                eprintln!("skipping MinIO test; missing required env var: {name}");
-                None
-            }
-        }
-    }
-
     fn unique_suffix() -> String {
-        let nanos = SystemTime::now()
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("time monotonic")
-            .as_nanos();
-        format!("{nanos}")
+            .expect("time")
+            .as_nanos()
+            .to_string()
     }
 
-    #[test]
-    fn minio_checkpoint_roundtrip_env_gated() {
+    fn maybe_storage() -> Option<S3Storage> {
         if std::env::var("DTRUNTIME_RUN_MINIO_TESTS").as_deref() != Ok("1") {
-            eprintln!("skipping MinIO test; set DTRUNTIME_RUN_MINIO_TESTS=1 to enable");
-            return;
+            eprintln!("skipping MinIO test; set DTRUNTIME_RUN_MINIO_TESTS=1");
+            return None;
         }
-
-        let configured_prefix = env_optional("DTRUNTIME_S3_KEY_PREFIX");
-        let key_prefix = Some(match configured_prefix {
-            Some(prefix) if !prefix.trim().is_empty() => {
-                format!("{}/test-runs/{}", prefix.trim_matches('/'), unique_suffix())
-            }
-            _ => format!("test-runs/{}", unique_suffix()),
-        });
-
-        let Some(endpoint_url) = env_required_or_skip("DTRUNTIME_S3_ENDPOINT_URL") else {
-            return;
-        };
-        let Some(region) = env_required_or_skip("DTRUNTIME_S3_REGION") else {
-            return;
-        };
-        let Some(bucket) = env_required_or_skip("DTRUNTIME_S3_BUCKET") else {
-            return;
-        };
-        let Some(access_key_id) = env_required_or_skip("DTRUNTIME_S3_ACCESS_KEY_ID") else {
-            return;
-        };
-        let Some(secret_access_key) = env_required_or_skip("DTRUNTIME_S3_SECRET_ACCESS_KEY") else {
-            return;
-        };
-
-        let storage = match S3Storage::new(S3StorageConfig {
+        let endpoint_url = env_optional("DTRUNTIME_S3_ENDPOINT_URL")?;
+        let region = env_optional("DTRUNTIME_S3_REGION")?;
+        let bucket = env_optional("DTRUNTIME_S3_BUCKET")?;
+        let access_key_id = env_optional("DTRUNTIME_S3_ACCESS_KEY_ID")?;
+        let secret_access_key = env_optional("DTRUNTIME_S3_SECRET_ACCESS_KEY")?;
+        let key_prefix = Some(format!(
+            "{}/test-runs/{}",
+            env_optional("DTRUNTIME_S3_KEY_PREFIX")
+                .unwrap_or_else(|| "dtruntime".into())
+                .trim_matches('/'),
+            unique_suffix()
+        ));
+        S3Storage::new(S3StorageConfig {
             endpoint_url: Some(endpoint_url),
             region,
             bucket,
             access_key_id,
             secret_access_key,
-            force_path_style: std::env::var("DTRUNTIME_S3_FORCE_PATH_STYLE")
-                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-                .unwrap_or(true),
+            force_path_style: true,
             key_prefix,
-        }) {
-            Ok(storage) => storage,
-            Err(err) => {
-                eprintln!("skipping MinIO test; unable to create S3 storage client: {err}");
-                return;
-            }
-        };
+        })
+        .ok()
+    }
 
-        let store = CheckpointStore::new(storage.clone());
-        let run_id = RunId("run-minio".into());
-        let checkpoint_id = CheckpointId("ckpt-minio".into());
+    fn commit_one(
+        store: &CheckpointStore<S3Storage>,
+        storage: &S3Storage,
+        run_id: &RunId,
+        checkpoint_id: &CheckpointId,
+        step: u64,
+    ) {
         let worker_id = WorkerId("worker-0".into());
-        let mut record = CheckpointRecord::new(run_id.clone(), checkpoint_id.clone(), 42, 1000);
-
-        store
-            .write_pending_manifest(&record)
-            .expect("write pending manifest");
-        let artifacts = match upload_checkpoint_artifacts_concurrently(
-            &storage,
-            vec![
-                CheckpointArtifactUpload {
-                    worker_id: worker_id.clone(),
-                    artifact_name: "model.bin".into(),
-                    storage_key: StorageKey::new(format!(
-                        "runs/{}/checkpoints/{}/workers/{}/model.bin",
-                        run_id.0, checkpoint_id.0, worker_id.0
-                    ))
-                    .unwrap(),
-                    bytes: b"minio-bytes".to_vec(),
-                    checksum_algorithm: ChecksumAlgorithm::Sha256,
-                },
-                CheckpointArtifactUpload {
-                    worker_id: worker_id.clone(),
-                    artifact_name: "optim.bin".into(),
-                    storage_key: StorageKey::new(format!(
-                        "runs/{}/checkpoints/{}/workers/{}/optim.bin",
-                        run_id.0, checkpoint_id.0, worker_id.0
-                    ))
-                    .unwrap(),
-                    bytes: b"minio-optim".to_vec(),
-                    checksum_algorithm: ChecksumAlgorithm::Sha256,
-                },
-            ],
+        let mut record =
+            CheckpointRecord::new(run_id.clone(), checkpoint_id.clone(), step, 1000 + step);
+        store.write_pending_manifest(&record).expect("pending");
+        let artifacts = upload_checkpoint_artifacts_concurrently(
+            storage,
+            vec![CheckpointArtifactUpload {
+                worker_id: worker_id.clone(),
+                artifact_name: "model.bin".into(),
+                storage_key: StorageKey::new(format!(
+                    "runs/{}/checkpoints/{}/workers/{}/model.bin",
+                    run_id.0, checkpoint_id.0, worker_id.0
+                ))
+                .unwrap(),
+                bytes: format!("payload-{step}").into_bytes(),
+                checksum_algorithm: ChecksumAlgorithm::Sha256,
+            }],
             &StorageOperationPolicy {
-                max_concurrent_operations: 2,
+                max_concurrent_operations: 1,
                 ..Default::default()
             },
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                eprintln!("skipping MinIO test; artifact upload failed (MinIO unavailable/misconfigured): {err}");
-                return;
-            }
-        };
-        for a in artifacts.clone() {
-            record.add_artifact(a, 1001).expect("add artifact");
+        )
+        .expect("upload");
+        for a in artifacts {
+            record.add_artifact(a, 2000 + step).expect("add");
         }
-        let committed = store
-            .commit_checkpoint(&mut record, 2000)
-            .expect("commit checkpoint");
-        let latest = store.load_latest_manifest(&run_id).expect("load latest");
+        store
+            .commit_checkpoint(&mut record, 3000 + step)
+            .expect("commit");
+    }
 
-        assert_eq!(latest.checkpoint_id, committed.checkpoint_id);
-        assert_eq!(latest.checkpoint_id, checkpoint_id.0);
-        assert_eq!(latest.artifacts.len(), 2);
+    #[test]
+    fn minio_cleanup_preserves_latest_and_latest_loads() {
+        let Some(storage) = maybe_storage() else {
+            return;
+        };
+        let store = CheckpointStore::new(storage.clone());
+        let run_id = RunId("run-minio-cleanup".into());
+        commit_one(&store, &storage, &run_id, &CheckpointId("ckpt-1".into()), 1);
+        commit_one(&store, &storage, &run_id, &CheckpointId("ckpt-2".into()), 2);
+        let before = store.load_latest_manifest(&run_id).expect("latest before");
+        assert_eq!(before.checkpoint_id, "ckpt-2");
 
-        let cleanup_result = store.cleanup_checkpoints(&run_id, 1, true);
-        assert!(
-            cleanup_result.is_ok(),
-            "cleanup should complete for MinIO-backed run"
-        );
+        store
+            .cleanup_checkpoints(
+                &run_id,
+                CheckpointCleanupPolicy {
+                    retain_last_n: 1,
+                    delete_obsolete_artifacts: true,
+                },
+            )
+            .expect("cleanup");
+        let after = store.load_latest_manifest(&run_id).expect("latest after");
+        assert_eq!(after.checkpoint_id, "ckpt-2");
+    }
+
+    #[test]
+    fn minio_commit_rejects_checksum_mismatch_after_tamper() {
+        let Some(storage) = maybe_storage() else {
+            return;
+        };
+        let store = CheckpointStore::new(storage.clone());
+        let run_id = RunId("run-minio-mismatch".into());
+        let checkpoint_id = CheckpointId("ckpt-bad".into());
+        let worker_id = WorkerId("worker-0".into());
+        let mut record = CheckpointRecord::new(run_id.clone(), checkpoint_id.clone(), 1, 1);
+        store.write_pending_manifest(&record).expect("pending");
+        let key = StorageKey::new(format!(
+            "runs/{}/checkpoints/{}/workers/{}/model.bin",
+            run_id.0, checkpoint_id.0, worker_id.0
+        ))
+        .unwrap();
+        let mut artifacts = upload_checkpoint_artifacts_concurrently(
+            &storage,
+            vec![CheckpointArtifactUpload {
+                worker_id: worker_id.clone(),
+                artifact_name: "model.bin".into(),
+                storage_key: key.clone(),
+                bytes: b"original".to_vec(),
+                checksum_algorithm: ChecksumAlgorithm::Sha256,
+            }],
+            &StorageOperationPolicy::default(),
+        )
+        .expect("upload");
+        storage.put(&key, b"tampered").expect("tamper object");
+        record.add_artifact(artifacts.remove(0), 2).expect("add");
+        assert!(store.commit_checkpoint(&mut record, 3).is_err());
     }
 }

@@ -82,3 +82,4 @@ This phase does **not** implement:
 - `DTRUNTIME_S3_KEY_PREFIX` optional test key prefix root.
 
 These are local/dev validation inputs only and must not be committed.
+\n- Phase 20 update: benchmark expansion and MinIO/S3 validation are environment-gated; no production-readiness claim.

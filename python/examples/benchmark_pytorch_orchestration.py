@@ -10,6 +10,7 @@ import statistics
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +226,15 @@ def main() -> None:
         and (args.skip_resume or (item["standalone_resume"]["returncode"] == 0 and item["coordinator_resume"]["returncode"] == 0))
     )
 
+    benchmark_surfaces = [
+        {"environment": args.environment, "surface": "orchestration", "mode": "standalone-vs-coordinator", "caveat": "local benchmark; not proof of distributed scaling"},
+        {"environment": args.environment, "surface": "dataset_prefetch_summary", "mode": "placeholder", "caveat": "requires runtime-bench dataset prefetch command; reported as skipped when unavailable"},
+        {"environment": args.environment, "surface": "cache_aware_placement", "mode": "placeholder", "caveat": "compare deterministic vs cache-aware assignment with runtime-bench expansion"},
+        {"environment": args.environment, "surface": "status", "mode": "placeholder", "caveat": "status endpoint smoke/latency benchmark not started by this script"},
+        {"environment": args.environment, "surface": "auth_audit", "mode": "placeholder", "caveat": "auth/audit overhead microbenchmark is env dependent and may be skipped"},
+        {"environment": "minio/local-dev" if args.minio_enabled else args.environment, "surface": "checkpoint_s3", "mode": "env-gated", "caveat": "requires DTRUNTIME_RUN_MINIO_TESTS=1 and MinIO configuration"},
+    ]
+
     summary = {
         "environment_label": args.environment,
         "surface_labels": ["local", "docker", "kubernetes", "secure-mode", "minio-gated"],
@@ -235,7 +245,9 @@ def main() -> None:
             "Not evidence of distributed multi-node scaling, Kubernetes performance, or production throughput.",
             "Secure-mode and MinIO labels are declarative unless corresponding services/certs are provided.",
         ],
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "settings": json_safe(vars(args)),
+        "benchmark_surfaces": benchmark_surfaces,
         "successful_runs": successful_runs,
         "failed_runs": args.runs - successful_runs,
         "standalone_fresh_seconds": _stats([r["standalone_fresh_seconds"] for r in run_results]),
@@ -262,6 +274,10 @@ def main() -> None:
     json_path.write_text(json.dumps(json_safe(summary), indent=2), encoding="utf-8")
 
     fieldnames = [
+        "environment",
+        "surface",
+        "mode",
+        "caveat",
         "run_index",
         "seed",
         "standalone_fresh_seconds",
@@ -281,6 +297,10 @@ def main() -> None:
         for row in run_results:
             writer.writerow(
                 {
+                    "environment": args.environment,
+                    "surface": "orchestration",
+                    "mode": "standalone-vs-coordinator",
+                    "caveat": "local benchmark; no performance superiority claims",
                     "run_index": row["run_index"],
                     "seed": row["seed"],
                     "standalone_fresh_seconds": row["standalone_fresh_seconds"],
