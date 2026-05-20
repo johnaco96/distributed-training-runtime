@@ -103,3 +103,11 @@ Caveats: this is local-only and environment-specific. Coordinator timings includ
 - `benchmark_pytorch_orchestration.py` compares **local standalone** vs **local coordinator-driven** training only.
 - Current coordinator timings include startup cost unless a warmed/external coordinator mode is implemented and used.
 - These results are **not** proof of Kubernetes readiness or multi-node scaling performance.
+
+
+## Phase 20 hardening update (in progress)
+
+- Added stricter env-gated MinIO/S3 integration-test behavior with explicit skip messaging.
+- Expanded benchmark/runbook documentation labels and caveats for local/dev versus secure/minio optional surfaces.
+- Secure Kubernetes runbook depth expanded for local certificate/secret creation flow.
+- Production readiness is still not claimed; remaining gaps are tracked in status/production docs.

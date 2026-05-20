@@ -110,3 +110,11 @@ References: [Phase 20F summary](phase-20f-summary.md), [production gates](produc
 
 ## Phase 20F-3 authorization matrix coverage update
 Service-level metadata authorization tests now cover coordinator RPC groups across admin-only and worker-scoped endpoints (including worker self-mismatch denial and missing/invalid identity rejection). This remains local/dev metadata identity scaffolding and is not production identity assurance. Production mTLS/SPIFFE identity extraction and policy integration remain future work.
+
+
+## Phase 20 hardening update (in progress)
+
+- Added stricter env-gated MinIO/S3 integration-test behavior with explicit skip messaging.
+- Expanded benchmark/runbook documentation labels and caveats for local/dev versus secure/minio optional surfaces.
+- Secure Kubernetes runbook depth expanded for local certificate/secret creation flow.
+- Production readiness is still not claimed; remaining gaps are tracked in status/production docs.

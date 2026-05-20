@@ -94,3 +94,23 @@ Phase 20F-3 adds an internal authorization model with optional metadata-based ca
 
 Local Kubernetes manifests are local/dev only. Default path is plaintext and no-auth unless explicitly configured using optional placeholders. No public exposure is configured by default.
 
+
+
+## Optional secure local/dev path (`k8s/local-secure`)
+
+This path is local/dev only and not a production claim.
+
+1. Generate local dev certs (ignored output under `.dtruntime-certs/`):
+   - `pwsh -File scripts/generate_dev_certs.ps1`
+2. Create namespace: `kubectl apply -f k8s/local-secure/namespace.yaml`
+3. Create TLS Secret from generated local files (example names):
+   - `kubectl -n dtruntime create secret tls dtruntime-tls --cert=.dtruntime-certs/server.crt --key=.dtruntime-certs/server.key --dry-run=client -o yaml | kubectl apply -f -`
+4. Create auth secret placeholder/environment inputs (do not commit real values):
+   - `kubectl apply -f k8s/local-secure/auth-secret.example.yaml`
+5. Apply secure manifests: `kubectl apply -f k8s/local-secure/`
+6. Wait for coordinator: `kubectl -n dtruntime rollout status deployment/runtime-coordinator`
+7. Run secure PyTorch job if configured: `kubectl apply -f k8s/local-secure/pytorch-coordinator-job.yaml`
+8. Inspect logs: `kubectl -n dtruntime logs deployment/runtime-coordinator`
+9. Cleanup: `kubectl delete -f k8s/local-secure/`
+
+No cert/key/token material is committed in-repo.
