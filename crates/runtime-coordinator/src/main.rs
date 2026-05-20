@@ -15,6 +15,7 @@ use runtime_coordinator::init_tracing_from_env;
 use runtime_coordinator::persistence::SqliteMetadataStore;
 use runtime_coordinator::service::CoordinatorServiceImpl;
 use runtime_coordinator::state::CoordinatorState;
+use runtime_coordinator::telemetry::render_prometheus_metrics;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorServiceServer;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::info;
@@ -30,6 +31,7 @@ struct CoordinatorCliArgs {
     tls_client_ca: Option<PathBuf>,
     auth_mode: AuthMode,
     status_addr: Option<String>,
+    metrics_addr: Option<String>,
     show_help: bool,
 }
 
@@ -67,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_mode = args.auth_mode;
     let service =
         CoordinatorServiceImpl::with_authorizer(state.clone(), Authorizer::new(args.auth_mode));
+    let metrics_service = service.clone();
 
     info!(%addr, "starting runtime-coordinator gRPC server");
     audit.emit(AuditEvent::new(
@@ -93,6 +96,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 started_at,
             ) {
                 tracing::warn!(error = %e, "status endpoint stopped");
+            }
+        });
+    }
+
+    if let Some(metrics_addr) = &args.metrics_addr {
+        let metrics_service = metrics_service.clone();
+        let metrics_audit = audit.clone();
+        let metrics_addr = metrics_addr.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = serve_metrics_endpoint(metrics_addr, metrics_service, metrics_audit) {
+                tracing::warn!(error = %e, "metrics endpoint stopped");
             }
         });
     }
@@ -174,7 +188,7 @@ fn load_tls_config(
 }
 
 fn print_usage() {
-    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--help|-h]");
+    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--help|-h]");
     println!("\nOptions:");
     println!("  --addr <ADDR>           Coordinator listen address (default: {DEFAULT_ADDR})");
     println!("  --metadata-db <PATH>    Enable SQLite metadata persistence at PATH");
@@ -184,6 +198,7 @@ fn print_usage() {
         "  --tls-key <PATH>        Enable TLS with private key PEM at PATH (requires --tls-cert)"
     );
     println!("  --tls-client-ca <PATH>  Require mTLS client certs signed by CA PEM at PATH");
+    println!("  --metrics-addr <ADDR>    Enable Prometheus /metrics endpoint at ADDR");
     println!("  --help, -h              Show this help message");
 }
 
@@ -204,6 +219,7 @@ fn coordinator_args(
             .parse()
             .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
         status_addr: None,
+        metrics_addr: None,
         show_help: false,
     };
 
@@ -232,6 +248,8 @@ fn coordinator_args(
             ));
         } else if arg == "--status-addr" {
             parsed.status_addr = Some(args.next().ok_or("--status-addr requires an address")?);
+        } else if arg == "--metrics-addr" {
+            parsed.metrics_addr = Some(args.next().ok_or("--metrics-addr requires an address")?);
         } else if arg == "--help" || arg == "-h" {
             parsed.show_help = true;
         } else {
@@ -264,6 +282,7 @@ mod tests {
                     .parse()
                     .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
                 status_addr: None,
+                metrics_addr: None,
                 show_help: false,
             }
         );
@@ -437,6 +456,53 @@ content-length: {}
         };
         let _ = stream.write_all(header.as_bytes());
         let _ = stream.write_all(response.as_bytes());
+    }
+    Ok(())
+}
+
+fn serve_metrics_endpoint(
+    addr: String,
+    service: CoordinatorServiceImpl,
+    audit: AuditLogger,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(&addr)?;
+    info!(metrics_addr = %addr, "runtime-coordinator metrics endpoint enabled");
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut buf = [0_u8; 1024];
+        let read = stream.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..read]);
+        let is_get_metrics = req.starts_with("GET /metrics ");
+        let (status, content_type, body) = if is_get_metrics {
+            (
+                "200 OK",
+                "text/plain; version=0.0.4",
+                render_prometheus_metrics(&service.metrics_snapshot(), audit.emitted_count()),
+            )
+        } else if req.starts_with("GET ") {
+            ("404 Not Found", "text/plain", String::from("not found"))
+        } else {
+            (
+                "405 Method Not Allowed",
+                "text/plain",
+                String::from("method not allowed"),
+            )
+        };
+        let header = format!(
+            "HTTP/1.1 {}
+content-type: {}
+content-length: {}
+
+",
+            status,
+            content_type,
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
     }
     Ok(())
 }

@@ -134,6 +134,7 @@ impl CoordinatorServiceImpl {
                 AuditEventKind::AuthorizationAllowed,
                 AuditOutcome::Success,
             ));
+            self.metrics.inc_auth_allowed_total();
         }
         Ok(())
     }
@@ -164,6 +165,7 @@ impl CoordinatorServiceImpl {
                 AuditEventKind::AuthorizationAllowed,
                 AuditOutcome::Success,
             ));
+            self.metrics.inc_auth_allowed_total();
         }
         Ok(())
     }
@@ -316,6 +318,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let request = request.into_inner();
         validate_idempotency_key("register_run", &request.idempotency_key)?;
         let registered = self.state.register_run(request);
+        self.metrics.inc_runs_total();
 
         let response = RegisterRunResponse {
             run_id: Some(registered.run_id),
