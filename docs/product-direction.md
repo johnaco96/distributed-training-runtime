@@ -251,3 +251,8 @@ Do **not** position it yet as:
 - No runtime behavior changed in Phase 20A.
 - Product path is explicitly selected.
 - Claims remain conservative.
+
+
+## Phase 20B status
+
+Phase 20B is now implemented with a coordinator-driven PyTorch orchestration example (`python/examples/pytorch_coordinator_train.py`) that bridges local training loops to runtime coordinator APIs in a deterministic, local-first, single-process flow.

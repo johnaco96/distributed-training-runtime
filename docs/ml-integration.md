@@ -166,3 +166,8 @@ Single-worker and simulated-distributed examples are intentionally different: th
 Checkpoint state currently includes model state and progress/metrics metadata, and resume behavior starts from `restored_epoch + 1` using `checkpoints/latest.json` as the required pointer file.
 
 For command-level usage and cleanup steps, see `docs/ml-runbook.md`.
+
+
+## Phase 20B: Coordinator-driven PyTorch orchestration
+
+Added `python/examples/pytorch_coordinator_train.py`, a local single-process PyTorch example that exercises coordinator control-plane calls during training: worker registration, heartbeat, dataset/shard registration, coordinator shard assignment requests, checkpoint artifact reporting/commit, and latest checkpoint lookup. This is intentionally not `torch.distributed` or multi-node training.
