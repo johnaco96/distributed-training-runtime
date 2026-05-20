@@ -80,7 +80,10 @@ impl Authorizer {
         self.mode
     }
 
-    fn context(&self, metadata: &MetadataMap) -> Result<Option<AuthContext>, AuthorizationError> {
+    pub(crate) fn context(
+        &self,
+        metadata: &MetadataMap,
+    ) -> Result<Option<AuthContext>, AuthorizationError> {
         if self.mode == AuthMode::Disabled {
             return Ok(None);
         }

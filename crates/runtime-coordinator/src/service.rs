@@ -31,6 +31,7 @@ impl CoordinatorServiceImpl {
             state,
             Arc::new(RuntimeMetrics::default()),
             Authorizer::new(crate::auth::AuthMode::Disabled),
+            AuditLogger::tracing(),
         )
     }
 
@@ -39,6 +40,7 @@ impl CoordinatorServiceImpl {
             state,
             metrics,
             Authorizer::new(crate::auth::AuthMode::Disabled),
+            AuditLogger::tracing(),
         )
     }
 
@@ -47,6 +49,7 @@ impl CoordinatorServiceImpl {
             state,
             Arc::new(RuntimeMetrics::default()),
             authorizer,
+            AuditLogger::tracing(),
         )
     }
 
@@ -370,6 +373,14 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
+            .value
+            .clone();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -377,7 +388,6 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
 
         let heartbeat = self
             .state
@@ -439,6 +449,14 @@ impl CoordinatorService for CoordinatorServiceImpl {
         request: Request<GetShardAssignmentRequest>,
     ) -> Result<Response<GetShardAssignmentResponse>, Status> {
         let cached_hints = cached_shard_hints(request.metadata());
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
+            .value
+            .clone();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -446,7 +464,6 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
         let dataset_id = request
             .dataset_id
             .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
@@ -510,6 +527,14 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<RenewShardLeaseRequest>,
     ) -> Result<Response<RenewShardLeaseResponse>, Status> {
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
+            .value
+            .clone();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -517,7 +542,6 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
         let shard_id = request
             .shard_id
             .ok_or_else(|| Status::invalid_argument("shard_id is required"))?;
@@ -570,6 +594,14 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<ReportShardProgressRequest>,
     ) -> Result<Response<ReportShardProgressResponse>, Status> {
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
+            .value
+            .clone();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -577,7 +609,6 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
         let dataset_id = request
             .dataset_id
             .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
@@ -643,6 +674,14 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<BeginCheckpointRequest>,
     ) -> Result<Response<BeginCheckpointResponse>, Status> {
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
+            .value
+            .clone();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
         let request = request.into_inner();
         validate_idempotency_key("begin_checkpoint", &request.idempotency_key)?;
         let run_id = request
@@ -651,7 +690,6 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let worker_id = request
             .worker_id
             .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
-        self.allow_admin_or_worker_self(&request, &worker_id.value, "worker_self_request")?;
 
         let checkpoint = self
             .state
