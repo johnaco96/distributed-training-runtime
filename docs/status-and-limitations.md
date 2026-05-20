@@ -35,6 +35,10 @@ This project currently does **not** claim:
 
 Important boundary: local simulated worker scaling is useful for smoke/perf exploration, but it is **not** proof of real cluster scale.
 
+## Phase 20+ direction
+
+Phase 20 roadmap and sequencing are documented in [Product direction](product-direction.md). This document remains the conservative source for current capabilities and limitations until those future phases are implemented and validated.
+
 ## Validation status
 
 Locally validated baseline commands generally include:

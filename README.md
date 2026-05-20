@@ -19,9 +19,9 @@ Distributed Training Runtime is a **local-first prototype** for coordinating ML-
 - Not Prometheus/Grafana exporter integration (current observability is structured logs + in-process metrics).
 - Not a fully validated cloud-production S3 path by default (must be explicitly validated in your environment).
 
-## Current status (Phases 10–18 complete)
+## Current status
 
-This repository is currently at **Phase 19D (documentation polish complete)**, with Phases 10 through 18 completed.
+This repository is currently at **Phase 20A (product direction documentation complete)**, with Phases 10 through 19 completed and the Phase 20 roadmap explicitly selected.
 
 Highlights from completed phases:
 - Benchmark harness foundations and scaling simulation paths.
@@ -112,6 +112,7 @@ PYTHONPATH=python python python/examples/pytorch_simulated_distributed.py --work
 - [ML runbook](docs/ml-runbook.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Status and limitations](docs/status-and-limitations.md)
+- [Product direction (Phase 20)](docs/product-direction.md)
 
 ## Limitations and non-goals (current)
 
