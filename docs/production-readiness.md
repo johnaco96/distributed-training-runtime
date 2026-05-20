@@ -108,3 +108,6 @@ Step 2 of the production-readiness roadmap is implemented for local Kubernetes m
 - startup probe wired to `/healthz`
 
 Health endpoints are intentionally low-cost and do not expose secrets.
+
+## Step 3 status: Secure TLS/mTLS deployment validation
+Implemented and validated in `k8s/local-secure/` with secret-backed TLS/mTLS mounts and secure Python job connectivity. Runbook includes deterministic namespace cleanup, cert generation, secret creation, ordered applies, readiness/probe checks, secure job completion, and cleanup.

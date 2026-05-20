@@ -163,3 +163,6 @@ Coordinator health endpoints are now available on the metrics HTTP listener (`--
 - `GET /readyz` for readiness
 
 Local Kubernetes manifests wire startup/readiness/liveness probes to these endpoints to prevent early traffic routing and to restart unhealthy pods.
+
+## Step 3: Secure TLS/mTLS Kubernetes validation
+Use `k8s/local-secure/` as the runnable secure deployment path. Generate local/dev certs with `scripts/generate_dev_certs.ps1`, create `dtruntime-tls`, `dtruntime-client-ca`, and `dtruntime-client-tls` Secrets, then deploy coordinator + job in order as documented in `k8s/local-secure/README.md`. No certificate or key material is committed to git.

@@ -18,6 +18,22 @@ spec:
           env:
             - name: PYTHONPATH
               value: /app/python
+            - name: DTRUNTIME_TLS_CA_CERT
+              value: /etc/dtruntime/tls/ca/ca.crt
+            - name: DTRUNTIME_TLS_CLIENT_CERT
+              value: /etc/dtruntime/tls/client/tls.crt
+            - name: DTRUNTIME_TLS_CLIENT_KEY
+              value: /etc/dtruntime/tls/client/tls.key
+            - name: DTRUNTIME_AUTH_SUBJECT
+              valueFrom:
+                secretKeyRef:
+                  name: dtruntime-auth
+                  key: DTRUNTIME_AUTH_SUBJECT
+            - name: DTRUNTIME_AUTH_ROLE
+              valueFrom:
+                secretKeyRef:
+                  name: dtruntime-auth
+                  key: DTRUNTIME_AUTH_ROLE
           command: ["python", "python/examples/pytorch_coordinator_train.py"]
           args:
             - "--addr"
@@ -41,3 +57,19 @@ spec:
             limits:
               cpu: "1000m"
               memory: "2Gi"
+          volumeMounts:
+            - name: client-ca
+              mountPath: /etc/dtruntime/tls/ca
+              readOnly: true
+            - name: client-tls
+              mountPath: /etc/dtruntime/tls/client
+              readOnly: true
+      volumes:
+        - name: client-ca
+          secret:
+            secretName: dtruntime-client-ca
+            optional: false
+        - name: client-tls
+          secret:
+            secretName: dtruntime-client-tls
+            optional: false
