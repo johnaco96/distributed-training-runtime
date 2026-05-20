@@ -114,3 +114,15 @@ def test_example_uses_separate_admin_and_worker_identity_paths() -> None:
     assert "worker_clients[worker_id].request_shard(" in source
     assert "worker_clients[worker_id].heartbeat(" in source
     assert "admin_client.commit_checkpoint(" in source
+
+
+def test_example_has_no_stale_single_client_runtime_pb2_usage() -> None:
+    source = Path(MODULE).read_text(encoding="utf-8")
+    assert "client._runtime_pb2" not in source
+    assert "admin_client._runtime_pb2" not in source
+    assert "from dtruntime.generated import runtime_pb2" in source
+
+
+def test_example_has_no_legacy_single_client_register_run_path() -> None:
+    source = Path(MODULE).read_text(encoding="utf-8")
+    assert "client.stub.RegisterRun" not in source

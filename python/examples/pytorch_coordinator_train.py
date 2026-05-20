@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from dtruntime.client import connect
+from dtruntime.generated import runtime_pb2
 
 try:
     import torch
@@ -253,8 +254,8 @@ def main() -> None:
             run_response = admin_client.register_run(
                 idempotency_key=f"pt-register-run-{idempotency_suffix}",
                 run_name=run_name,
-                assignment_policy=client._runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
-                storage_backend_kind=client._runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
+                assignment_policy=runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
+                storage_backend_kind=runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
                 world_size=args.workers,
                 run_version="phase-20b",
             )
