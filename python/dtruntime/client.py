@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -18,7 +20,7 @@ class RuntimeClient:
     available for low-level use.
     """
 
-    def __init__(self, address: str) -> None:
+    def __init__(self, address: str, tls_ca_cert: str | Path | None = None, tls_client_cert: str | Path | None = None, tls_client_key: str | Path | None = None) -> None:
         """Create a client connected to a coordinator gRPC address."""
         try:
             import grpc
@@ -32,7 +34,26 @@ class RuntimeClient:
 
         self.address = address
         self._runtime_pb2 = runtime_pb2
-        self._channel: Any = grpc.insecure_channel(address)
+
+        tls_ca_cert = tls_ca_cert or os.getenv("DTRUNTIME_TLS_CA_CERT")
+        tls_client_cert = tls_client_cert or os.getenv("DTRUNTIME_TLS_CLIENT_CERT")
+        tls_client_key = tls_client_key or os.getenv("DTRUNTIME_TLS_CLIENT_KEY")
+
+        if (tls_client_cert is None) != (tls_client_key is None):
+            raise ValueError("tls_client_cert and tls_client_key must be provided together")
+
+        if tls_ca_cert is None and tls_client_cert is None:
+            self._channel = grpc.insecure_channel(address)
+        else:
+            root_certificates = _read_optional_pem(tls_ca_cert, "tls_ca_cert")
+            certificate_chain = _read_optional_pem(tls_client_cert, "tls_client_cert")
+            private_key = _read_optional_pem(tls_client_key, "tls_client_key")
+            creds = grpc.ssl_channel_credentials(
+                root_certificates=root_certificates,
+                private_key=private_key,
+                certificate_chain=certificate_chain,
+            )
+            self._channel = grpc.secure_channel(address, creds)
         self._stub = runtime_pb2_grpc.CoordinatorServiceStub(self._channel)
         self.stub = self._stub
         self._closed = False
@@ -233,3 +254,13 @@ class RuntimeClient:
 def connect(address: str) -> RuntimeClient:
     """Create a RuntimeClient for the given coordinator address."""
     return RuntimeClient(address)
+
+
+def _read_optional_pem(path_value: str | Path | None, label: str) -> bytes | None:
+    if path_value is None:
+        return None
+    path = Path(path_value)
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"failed to read {label} file at {path}: {exc}") from exc
