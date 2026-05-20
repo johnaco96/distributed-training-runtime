@@ -10,6 +10,7 @@ from typing import Optional
 from unittest.mock import Mock
 
 from dtruntime.client import RuntimeClient
+import pytest
 
 
 @dataclass
@@ -177,7 +178,12 @@ class GetLatestCheckpointResponse:
 
 def install_fake_generated_modules(monkeypatch):
     channel = object()
-    grpc_module = types.SimpleNamespace(insecure_channel=Mock(return_value=channel))
+    creds = object()
+    grpc_module = types.SimpleNamespace(
+        insecure_channel=Mock(return_value=channel),
+        ssl_channel_credentials=Mock(return_value=creds),
+        secure_channel=Mock(return_value=channel),
+    )
     runtime_pb2 = types.SimpleNamespace(
         RunId=RunId,
         WorkerId=WorkerId,
@@ -213,11 +219,63 @@ def install_fake_generated_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, "dtruntime.generated.runtime_pb2", runtime_pb2)
     monkeypatch.setitem(sys.modules, "dtruntime.generated.runtime_pb2_grpc", runtime_pb2_grpc)
 
-    return grpc_module, runtime_pb2_grpc, stub, channel
+    return grpc_module, runtime_pb2_grpc, stub, channel, creds
 
+
+
+def test_tls_ca_uses_secure_channel(monkeypatch, tmp_path):
+    grpc_module, _, _, channel, creds = install_fake_generated_modules(monkeypatch)
+    ca = tmp_path / "ca.crt"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nreplace-me\n-----END CERTIFICATE-----\n")
+
+    client = RuntimeClient("127.0.0.1:50051", tls_ca_cert=ca)
+
+    grpc_module.ssl_channel_credentials.assert_called_once()
+    grpc_module.secure_channel.assert_called_once_with("127.0.0.1:50051", creds)
+    grpc_module.insecure_channel.assert_not_called()
+    assert client._channel is channel
+
+
+def test_tls_client_cert_without_key_errors(monkeypatch, tmp_path):
+    install_fake_generated_modules(monkeypatch)
+    cert = tmp_path / "client.crt"
+    cert.write_text("dummy")
+    with pytest.raises(ValueError, match="tls_client_cert and tls_client_key"):
+        RuntimeClient("127.0.0.1:50051", tls_client_cert=cert)
+
+
+def test_tls_client_key_without_cert_errors(monkeypatch, tmp_path):
+    install_fake_generated_modules(monkeypatch)
+    key = tmp_path / "client.key"
+    key.write_text("dummy")
+    with pytest.raises(ValueError, match="tls_client_cert and tls_client_key"):
+        RuntimeClient("127.0.0.1:50051", tls_client_key=key)
+
+
+def test_tls_paths_from_environment(monkeypatch, tmp_path):
+    grpc_module, _, _, _, _ = install_fake_generated_modules(monkeypatch)
+    ca = tmp_path / "ca.crt"
+    cert = tmp_path / "client.crt"
+    key = tmp_path / "client.key"
+    ca.write_text("ca")
+    cert.write_text("cert")
+    key.write_text("key")
+    monkeypatch.setenv("DTRUNTIME_TLS_CA_CERT", str(ca))
+    monkeypatch.setenv("DTRUNTIME_TLS_CLIENT_CERT", str(cert))
+    monkeypatch.setenv("DTRUNTIME_TLS_CLIENT_KEY", str(key))
+
+    RuntimeClient("127.0.0.1:50051")
+
+    grpc_module.secure_channel.assert_called_once()
+
+
+def test_missing_tls_file_errors(monkeypatch):
+    install_fake_generated_modules(monkeypatch)
+    with pytest.raises(ValueError, match="failed to read tls_ca_cert"):
+        RuntimeClient("127.0.0.1:50051", tls_ca_cert="/does/not/exist/ca.crt")
 
 def test_register_worker_builds_request_and_calls_stub(monkeypatch):
-    _, runtime_pb2_grpc, stub, channel = install_fake_generated_modules(monkeypatch)
+    _, runtime_pb2_grpc, stub, channel, _ = install_fake_generated_modules(monkeypatch)
     response = RegisterWorkerResponse(worker_id=WorkerId(value="worker-1"))
     stub.RegisterWorker.return_value = response
 
@@ -248,7 +306,7 @@ def test_register_worker_builds_request_and_calls_stub(monkeypatch):
 
 
 def test_register_dataset_builds_request_and_calls_stub(monkeypatch):
-    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
     response = RegisterDatasetResponse(
         dataset_id=DatasetId(value="dataset-1"), accepted_shard_count=2
     )
@@ -327,7 +385,7 @@ def test_register_dataset_builds_request_and_calls_stub(monkeypatch):
 
 
 def test_heartbeat_builds_request_and_converts_active_shard_ids(monkeypatch):
-    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
     response = HeartbeatResponse(state=2)
     stub.Heartbeat.return_value = response
 
@@ -351,7 +409,7 @@ def test_heartbeat_builds_request_and_converts_active_shard_ids(monkeypatch):
 
 
 def test_request_shard_builds_request_and_calls_stub(monkeypatch):
-    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
     response = GetShardAssignmentResponse(assignments=[object()])
     stub.GetShardAssignment.return_value = response
 
@@ -375,7 +433,7 @@ def test_request_shard_builds_request_and_calls_stub(monkeypatch):
 
 
 def test_begin_checkpoint_builds_request_and_calls_stub(monkeypatch):
-    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
     response = BeginCheckpointResponse(checkpoint_id=CheckpointId(value="ckpt-1"))
     stub.BeginCheckpoint.return_value = response
 
@@ -403,7 +461,7 @@ def test_begin_checkpoint_builds_request_and_calls_stub(monkeypatch):
 
 
 def test_report_checkpoint_artifact_builds_request_and_calls_stub(monkeypatch):
-    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
     response = ReportCheckpointArtifactResponse(accepted=True)
     stub.ReportCheckpointArtifact.return_value = response
 
@@ -439,7 +497,7 @@ def test_report_checkpoint_artifact_builds_request_and_calls_stub(monkeypatch):
 
 
 def test_commit_checkpoint_builds_request_and_calls_stub(monkeypatch):
-    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
     response = CommitCheckpointResponse(checkpoint_id=CheckpointId(value="ckpt-1"))
     stub.CommitCheckpoint.return_value = response
 
@@ -461,7 +519,7 @@ def test_commit_checkpoint_builds_request_and_calls_stub(monkeypatch):
 
 
 def test_restore_latest_builds_request_and_calls_stub(monkeypatch):
-    _, _, stub, _ = install_fake_generated_modules(monkeypatch)
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
     manifest = object()
     response = GetLatestCheckpointResponse(manifest=manifest)
     stub.GetLatestCheckpoint.return_value = response

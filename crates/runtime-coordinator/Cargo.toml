@@ -10,7 +10,7 @@ runtime-proto = { path = "../runtime-proto" }
 prost-types = "0.13"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tonic = { version = "0.12", default-features = false, features = ["transport"] }
+tonic = { version = "0.12", default-features = false, features = ["transport", "tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
