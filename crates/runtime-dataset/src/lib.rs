@@ -3,7 +3,11 @@
 //! Dataset metadata and shard prefetch support.
 
 use runtime_checkpoint::{compute_checksum, ChecksumAlgorithm};
-use runtime_storage::{StorageBackend, StorageError, StorageKey, StorageOperationPolicy};
+use runtime_storage::{
+    is_retryable_storage_error, retry_backoff_for_attempt, StorageBackend, StorageError,
+    StorageKey, StorageOperationPolicy,
+};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DatasetPrefetchItem {
@@ -46,38 +50,77 @@ pub struct DatasetPrefetchResult {
     pub result: Result<DatasetPrefetchSuccess, DatasetPrefetchError>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DatasetPrefetchSummary {
+    pub requested_shards: usize,
+    pub successful_shards: usize,
+    pub failed_shards: usize,
+    pub bytes_read: u64,
+    pub duration: Duration,
+}
+
+#[derive(Debug)]
+pub struct DatasetPrefetchBatchResult {
+    pub results: Vec<DatasetPrefetchResult>,
+    pub summary: DatasetPrefetchSummary,
+}
+
 pub fn prefetch_dataset_shards<B: StorageBackend + Sync>(
     storage: &B,
     items: &[DatasetPrefetchItem],
     policy: &StorageOperationPolicy,
 ) -> Result<Vec<DatasetPrefetchResult>, StorageError> {
+    Ok(prefetch_dataset_shards_with_summary(storage, items, policy)?.results)
+}
+
+pub fn prefetch_dataset_shards_with_summary<B: StorageBackend + Sync>(
+    storage: &B,
+    items: &[DatasetPrefetchItem],
+    policy: &StorageOperationPolicy,
+) -> Result<DatasetPrefetchBatchResult, StorageError> {
     policy.validate()?;
+    let started = Instant::now();
     let max = policy.max_concurrent_operations as usize;
 
-    let mut out = Vec::with_capacity(items.len());
+    let mut results = Vec::with_capacity(items.len());
     for chunk in items.chunks(max) {
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(chunk.len());
             for item in chunk {
-                handles.push(scope.spawn(|| prefetch_one(storage, item.clone())));
+                handles.push(scope.spawn(|| prefetch_one(storage, item.clone(), policy)));
             }
             for handle in handles {
-                out.push(handle.join().expect("prefetch worker should not panic"));
+                results.push(handle.join().expect("prefetch worker should not panic"));
             }
         });
     }
-    Ok(out)
+
+    let successful_shards = results.iter().filter(|r| r.result.is_ok()).count();
+    let bytes_read = results
+        .iter()
+        .filter_map(|r| r.result.as_ref().ok().map(|ok| ok.bytes_read))
+        .sum::<u64>();
+    let requested_shards = results.len();
+    Ok(DatasetPrefetchBatchResult {
+        results,
+        summary: DatasetPrefetchSummary {
+            requested_shards,
+            successful_shards,
+            failed_shards: requested_shards.saturating_sub(successful_shards),
+            bytes_read,
+            duration: started.elapsed(),
+        },
+    })
 }
 
 fn prefetch_one<B: StorageBackend>(
     storage: &B,
     item: DatasetPrefetchItem,
+    policy: &StorageOperationPolicy,
 ) -> DatasetPrefetchResult {
     let result = (|| {
         validate_checksum_metadata(&item)?;
-
-        let bytes = storage
-            .get(&item.storage_key)
+        let bytes = get_with_retry(storage, &item.storage_key, policy)
             .map_err(DatasetPrefetchError::Storage)?;
         let actual_size = bytes.len() as u64;
 
@@ -122,6 +165,26 @@ fn prefetch_one<B: StorageBackend>(
     }
 }
 
+fn get_with_retry<B: StorageBackend>(
+    storage: &B,
+    key: &StorageKey,
+    policy: &StorageOperationPolicy,
+) -> Result<Vec<u8>, StorageError> {
+    let mut attempt = 0_u32;
+    loop {
+        match storage.get(key) {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) => {
+                if attempt >= policy.max_retries || !is_retryable_storage_error(&err) {
+                    return Err(err);
+                }
+                std::thread::sleep(retry_backoff_for_attempt(policy, attempt));
+                attempt += 1;
+            }
+        }
+    }
+}
+
 fn validate_checksum_metadata(item: &DatasetPrefetchItem) -> Result<(), DatasetPrefetchError> {
     match (&item.checksum_algorithm, &item.checksum) {
         (None, None) | (Some(_), Some(_)) => Ok(()),
@@ -134,6 +197,7 @@ mod tests {
     use super::*;
     use runtime_checkpoint::ChecksumAlgorithm;
     use runtime_storage::LocalStorage;
+    use runtime_storage::StorageError as SE;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -349,6 +413,110 @@ mod tests {
         assert_eq!(out.len(), 5);
         assert!(out.iter().all(|r| r.result.is_ok()));
         assert!(storage.max_seen() <= 2, "max seen {}", storage.max_seen());
+    }
+
+    struct FlakyStorage {
+        failures_left: AtomicUsize,
+        bytes: Vec<u8>,
+    }
+
+    impl runtime_storage::StorageBackend for FlakyStorage {
+        fn get(&self, _key: &StorageKey) -> Result<Vec<u8>, SE> {
+            let prev = self.failures_left.fetch_sub(1, Ordering::SeqCst);
+            if prev > 0 {
+                return Err(SE::Io(std::io::Error::other("transient")));
+            }
+            Ok(self.bytes.clone())
+        }
+        fn put(&self, _key: &StorageKey, _bytes: &[u8]) -> Result<(), SE> {
+            Ok(())
+        }
+        fn delete(&self, _key: &StorageKey) -> Result<(), SE> {
+            Ok(())
+        }
+        fn exists(&self, _key: &StorageKey) -> Result<bool, SE> {
+            Ok(true)
+        }
+        fn list_prefix(&self, _prefix: &str) -> Result<Vec<StorageKey>, SE> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn prefetch_retries_transient_error_then_succeeds() {
+        let storage = FlakyStorage {
+            failures_left: AtomicUsize::new(1),
+            bytes: b"abc".to_vec(),
+        };
+        let item = DatasetPrefetchItem {
+            shard_id: "s1".into(),
+            storage_key: StorageKey::new("datasets/r/s1").unwrap(),
+            expected_size_bytes: Some(3),
+            checksum_algorithm: None,
+            checksum: None,
+        };
+        let out =
+            prefetch_dataset_shards(&storage, &[item], &StorageOperationPolicy::default()).unwrap();
+        assert!(out[0].result.is_ok());
+    }
+
+    #[test]
+    fn prefetch_retry_limit_fails() {
+        let storage = FlakyStorage {
+            failures_left: AtomicUsize::new(10),
+            bytes: b"abc".to_vec(),
+        };
+        let policy = StorageOperationPolicy {
+            max_retries: 1,
+            ..StorageOperationPolicy::default()
+        };
+        let item = DatasetPrefetchItem {
+            shard_id: "s1".into(),
+            storage_key: StorageKey::new("datasets/r/s1").unwrap(),
+            expected_size_bytes: None,
+            checksum_algorithm: None,
+            checksum: None,
+        };
+        let out = prefetch_dataset_shards(&storage, &[item], &policy).unwrap();
+        assert!(matches!(
+            out[0].result,
+            Err(DatasetPrefetchError::Storage(SE::Io(_)))
+        ));
+    }
+
+    #[test]
+    fn prefetch_summary_metrics_are_reported() {
+        let root = temp_dir("summary");
+        let storage = LocalStorage::new(root).unwrap();
+        let key_ok = StorageKey::new("datasets/run-a/ok.bin").unwrap();
+        storage.put(&key_ok, b"abcd").unwrap();
+        let key_miss = StorageKey::new("datasets/run-a/missing.bin").unwrap();
+        let items = vec![
+            DatasetPrefetchItem {
+                shard_id: "ok".into(),
+                storage_key: key_ok,
+                expected_size_bytes: None,
+                checksum_algorithm: None,
+                checksum: None,
+            },
+            DatasetPrefetchItem {
+                shard_id: "missing".into(),
+                storage_key: key_miss,
+                expected_size_bytes: None,
+                checksum_algorithm: None,
+                checksum: None,
+            },
+        ];
+        let out = prefetch_dataset_shards_with_summary(
+            &storage,
+            &items,
+            &StorageOperationPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(out.summary.requested_shards, 2);
+        assert_eq!(out.summary.successful_shards, 1);
+        assert_eq!(out.summary.failed_shards, 1);
+        assert_eq!(out.summary.bytes_read, 4);
     }
 
     #[derive(Default, Clone)]
