@@ -232,6 +232,14 @@ pub struct CommitCheckpointResult {
     pub committed_at_millis: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoordinatorStatusSnapshot {
+    pub run_count: usize,
+    pub worker_count: usize,
+    pub active_worker_count: u64,
+    pub checkpoint_count: usize,
+    pub latest_checkpoint_id: Option<String>,
+}
 pub enum GetShardAssignmentsError {
     RunNotFound,
     WorkerNotFound,

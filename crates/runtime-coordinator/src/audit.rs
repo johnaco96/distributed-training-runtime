@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +74,7 @@ impl AuditSink for TracingAuditSink {
 #[derive(Clone)]
 pub struct AuditLogger {
     sink: Arc<dyn AuditSink>,
+    emitted_count: Arc<AtomicU64>,
 }
 impl std::fmt::Debug for AuditLogger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,13 +83,21 @@ impl std::fmt::Debug for AuditLogger {
 }
 impl AuditLogger {
     pub fn new(sink: Arc<dyn AuditSink>) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            emitted_count: Arc::new(AtomicU64::new(0)),
+        }
     }
     pub fn tracing() -> Self {
         Self::new(Arc::new(TracingAuditSink))
     }
     pub fn emit(&self, event: AuditEvent) {
+        self.emitted_count.fetch_add(1, Ordering::Relaxed);
         self.sink.emit(event);
+    }
+
+    pub fn emitted_count(&self) -> u64 {
+        self.emitted_count.load(Ordering::Relaxed)
     }
 }
 

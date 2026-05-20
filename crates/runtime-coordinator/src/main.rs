@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use runtime_coordinator::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome};
 use runtime_coordinator::auth::{AuthMode, Authorizer};
@@ -26,6 +29,7 @@ struct CoordinatorCliArgs {
     tls_key: Option<PathBuf>,
     tls_client_ca: Option<PathBuf>,
     auth_mode: AuthMode,
+    status_addr: Option<String>,
     show_help: bool,
 }
 
@@ -57,7 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Arc::new(CoordinatorState::default())
     };
-    let service = CoordinatorServiceImpl::with_authorizer(state, Authorizer::new(args.auth_mode));
+    let started_at = SystemTime::now();
+    let tls_enabled = args.tls_cert.is_some();
+    let mtls_enabled = args.tls_client_ca.is_some();
+    let auth_mode = args.auth_mode;
+    let service =
+        CoordinatorServiceImpl::with_authorizer(state.clone(), Authorizer::new(args.auth_mode));
 
     info!(%addr, "starting runtime-coordinator gRPC server");
     audit.emit(AuditEvent::new(
@@ -68,6 +77,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         AuditEventKind::AuthModeConfigured,
         AuditOutcome::Success,
     ));
+
+    if let Some(status_addr) = &args.status_addr {
+        let status_state = state.clone();
+        let status_audit = audit.clone();
+        let status_addr = status_addr.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = serve_status_endpoint(
+                status_addr,
+                status_state,
+                status_audit,
+                auth_mode,
+                tls_enabled,
+                mtls_enabled,
+                started_at,
+            ) {
+                tracing::warn!(error = %e, "status endpoint stopped");
+            }
+        });
+    }
 
     let mut builder = Server::builder();
     if let Some(tls) = load_tls_config(&args, &audit)? {
@@ -146,7 +174,7 @@ fn load_tls_config(
 }
 
 fn print_usage() {
-    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--help|-h]");
+    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--help|-h]");
     println!("\nOptions:");
     println!("  --addr <ADDR>           Coordinator listen address (default: {DEFAULT_ADDR})");
     println!("  --metadata-db <PATH>    Enable SQLite metadata persistence at PATH");
@@ -175,6 +203,7 @@ fn coordinator_args(
             .unwrap_or("disabled")
             .parse()
             .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
+        status_addr: None,
         show_help: false,
     };
 
@@ -201,6 +230,8 @@ fn coordinator_args(
             parsed.tls_client_ca = Some(PathBuf::from(
                 args.next().ok_or("--tls-client-ca requires a path")?,
             ));
+        } else if arg == "--status-addr" {
+            parsed.status_addr = Some(args.next().ok_or("--status-addr requires an address")?);
         } else if arg == "--help" || arg == "-h" {
             parsed.show_help = true;
         } else {
@@ -232,6 +263,7 @@ mod tests {
                     .unwrap_or("disabled")
                     .parse()
                     .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
+                status_addr: None,
                 show_help: false,
             }
         );
@@ -342,4 +374,57 @@ mod ha_lock_tests {
         let second = CoordinatorLockGuard::acquire(&db);
         assert!(second.is_err());
     }
+}
+
+fn serve_status_endpoint(
+    addr: String,
+    state: Arc<CoordinatorState>,
+    audit: AuditLogger,
+    auth_mode: AuthMode,
+    tls_enabled: bool,
+    mtls_enabled: bool,
+    started_at: SystemTime,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(&addr)?;
+    info!(status_addr = %addr, "runtime-coordinator status endpoint enabled");
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut buf = [0_u8; 1024];
+        let read = stream.read(&mut buf).unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..read]);
+        let is_get_status = req.starts_with("GET /status ");
+        let response = if is_get_status {
+            let snapshot = state.status_snapshot();
+            let uptime = started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+            format!("{{"health":"ok","auth_mode":"{:?}","tls_enabled":{},"mtls_enabled":{},"run_count":{},"worker_count":{},"active_worker_count":{},"checkpoint_count":{},"latest_checkpoint_id":{},"audit_event_count":{},"uptime_seconds":{}}}",
+                auth_mode, tls_enabled, mtls_enabled, snapshot.run_count, snapshot.worker_count, snapshot.active_worker_count, snapshot.checkpoint_count,
+                snapshot.latest_checkpoint_id.as_ref().map(|v| format!(""{}"", v)).unwrap_or_else(||"null".to_string()), audit.emitted_count(), uptime)
+        } else {
+            String::from("method not allowed")
+        };
+        let header = if is_get_status {
+            format!(
+                "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+
+",
+                response.len()
+            )
+        } else {
+            format!(
+                "HTTP/1.1 405 Method Not Allowed
+content-length: {}
+
+",
+                response.len()
+            )
+        };
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(response.as_bytes());
+    }
+    Ok(())
 }
