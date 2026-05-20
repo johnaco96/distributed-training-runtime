@@ -95,3 +95,14 @@ Phase 20F-3 adds an internal authorization model with optional metadata-based ca
 
 
 Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
+
+## Phase 20F-5 status
+
+- Secure foundation exists (TLS/authz scaffolding + audit foundation + design tracks).
+- Dashboard is planned, not implemented.
+- HA coordinator replication is planned, not implemented.
+- Production S3 hardening is planned, not implemented.
+- Local Kubernetes remains local/dev only.
+
+References: [Phase 20F summary](phase-20f-summary.md), [production gates](production-gates.md).
+

@@ -295,3 +295,8 @@ Phase 20F-3 adds an internal authorization model with optional metadata-based ca
 
 
 Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
+
+## Phase 20 completion note
+
+Phase 20 is complete as a local-first packaging + security-foundation milestone. Dashboard implementation, HA coordinator replication semantics, and production S3 hardening are still planned implementation tracks documented in Phase 20F-5 design docs.
+

@@ -128,3 +128,8 @@ Phase 20F-3 adds an internal authorization model with optional metadata-based ca
 
 
 Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
+
+## Phase 20F-5 runbook direction
+
+Runbooks currently cover local/dev flows. Future runbooks should implement the production gates in [production-gates.md](production-gates.md), including dashboard auth, HA failover drills, and production S3 restore/retention validation.
+

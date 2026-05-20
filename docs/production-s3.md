@@ -1,26 +1,70 @@
-# Production S3 Track (Phase 20F-1)
+# Production S3 Plan (Phase 20F-5 Secure Design Track)
 
-## Current S3/MinIO support status
+## Current status
 
-- Storage abstraction supports local filesystem and S3-compatible backends.
-- Local/dev MinIO-style paths exist for testing.
+- Local filesystem and S3-compatible storage abstraction paths exist.
+- MinIO/S3-compatible flows exist for local/dev and test-oriented paths.
+- Checkpoint commit path includes checksum-oriented validation.
 - Production S3 hardening is not complete.
 
-## Production S3 checklist
+## Target production S3 model
 
-- Credentials delivered from secret manager and/or controlled env injection.
-- Least-privilege IAM policies.
-- Bucket and prefix isolation by environment/run scope.
-- Checksum validation enforced.
+Production direction requires all of the following:
+
+- Credentials from external secret manager or Kubernetes Secret reference only; never committed in repo.
+- Least-privilege IAM policy scoped to required prefixes/actions.
+- Bucket/prefix isolation by environment (dev/staging/prod).
 - Server-side encryption configured.
-- Lifecycle policy defined.
-- Retry/backoff behavior tuned.
-- Multipart thresholds tuned for artifact size distributions.
-- Regional latency considerations documented.
-- Staging validation runbook.
-- Failure-injection scenarios tested.
-- Credential rotation procedure tested.
+- Checksum validation enforced on write/read validation flows.
+- Retry/backoff policy tuned for transient object-store failures.
+- Multipart upload threshold/concurrency tuning for large checkpoint artifacts.
+- Lifecycle cleanup policy with explicit retention safety.
+- Object lock/versioning discussion where compliance/recovery needs justify it.
+- Regional latency and cross-zone traffic implications documented.
+- Mandatory staging validation before production adoption.
 
-## Current non-claims
+## Credential model
 
-This repository does not currently claim full production S3 posture, IAM policy completeness, or finalized tuning defaults.
+- Local MinIO env vars are dev-only convenience.
+- Production credentials should come from workload identity and/or external secret manager integration.
+- No static long-lived credentials in Kubernetes manifests.
+- Rotation plan must define cadence, trigger, rollback, and validation steps.
+
+## Failure modes to design/test
+
+- Partial uploads.
+- Checksum mismatch.
+- Stale/latest pointer inconsistency.
+- Object store unavailable.
+- Access denied from IAM misconfiguration.
+- High latency/throttling.
+- Lifecycle policy deleting still-needed checkpoint artifacts.
+- Bucket/prefix collision across environments.
+
+## Acceptance criteria
+
+Production S3 path is not ready until:
+
+- No credentials are committed in repository.
+- Checksum mismatch paths are rejected and tested.
+- Staging bucket integration tests pass.
+- Failure-injection scenarios are exercised and documented.
+- Restore tests succeed after cleanup/lifecycle events.
+- Retention/lifecycle policies are documented with ownership.
+- Cost/latency considerations are explicitly documented.
+
+## Risk register
+
+- Credential leakage.
+- Accidental deletion of required artifacts.
+- Corrupted checkpoint restore.
+- Misconfigured lifecycle policy.
+- Cross-environment prefix collision.
+- Cost blow-up from benchmark/checkpoint artifact growth.
+
+## Explicit non-claims
+
+This phase does **not** implement:
+- Production cloud-provider S3 deployment.
+- Automatic IAM provisioning.
+- Full production S3 tuning in runtime code.
