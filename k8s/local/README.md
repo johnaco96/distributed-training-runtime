@@ -28,3 +28,12 @@ Security planning references:
 - TLS/auth secret examples are placeholders only; do not commit real credentials or key material.
 - No production exposure is configured by default (no Ingress/LoadBalancer).
 
+
+## Coordinator health probes
+
+The coordinator deployment enables `--metrics-addr 0.0.0.0:9090` and configures:
+- `startupProbe` -> `GET /healthz`
+- `livenessProbe` -> `GET /healthz`
+- `readinessProbe` -> `GET /readyz`
+
+These endpoints return safe low-cost responses and expose no secrets.

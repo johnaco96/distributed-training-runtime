@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -70,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service =
         CoordinatorServiceImpl::with_authorizer(state.clone(), Authorizer::new(args.auth_mode));
     let metrics_service = service.clone();
+    let coordinator_ready = Arc::new(AtomicBool::new(false));
 
     info!(%addr, "starting runtime-coordinator gRPC server");
     audit.emit(AuditEvent::new(
@@ -104,8 +106,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let metrics_service = metrics_service.clone();
         let metrics_audit = audit.clone();
         let metrics_addr = metrics_addr.clone();
+        let metrics_ready = coordinator_ready.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve_metrics_endpoint(metrics_addr, metrics_service, metrics_audit) {
+            if let Err(e) =
+                serve_metrics_endpoint(metrics_addr, metrics_service, metrics_audit, metrics_ready)
+            {
                 tracing::warn!(error = %e, "metrics endpoint stopped");
             }
         });
@@ -115,6 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = load_tls_config(&args, &audit)? {
         builder = builder.tls_config(tls)?;
     }
+
+    coordinator_ready.store(true, Ordering::Release);
 
     builder
         .add_service(CoordinatorServiceServer::new(service))
@@ -464,6 +471,7 @@ fn serve_metrics_endpoint(
     addr: String,
     service: CoordinatorServiceImpl,
     audit: AuditLogger,
+    ready: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr)?;
     info!(metrics_addr = %addr, "runtime-coordinator metrics endpoint enabled");
@@ -475,7 +483,8 @@ fn serve_metrics_endpoint(
         let mut buf = [0_u8; 1024];
         let read = stream.read(&mut buf).unwrap_or(0);
         let req = String::from_utf8_lossy(&buf[..read]);
-        let response = build_metrics_http_response(&req, &service, &audit);
+        let response =
+            build_metrics_http_response(&req, &service, &audit, ready.load(Ordering::Acquire));
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
     }
@@ -486,9 +495,22 @@ fn build_metrics_http_response(
     request: &str,
     service: &CoordinatorServiceImpl,
     audit: &AuditLogger,
+    ready: bool,
 ) -> String {
     let is_get_metrics = request.starts_with("GET /metrics ");
-    let (status, content_type, body) = if is_get_metrics {
+    let (status, content_type, body) = if request.starts_with("GET /healthz ") {
+        ("200 OK", "text/plain; charset=utf-8", String::from("ok\n"))
+    } else if request.starts_with("GET /readyz ") {
+        if ready {
+            ("200 OK", "text/plain; charset=utf-8", String::from("ok\n"))
+        } else {
+            (
+                "503 Service Unavailable",
+                "text/plain; charset=utf-8",
+                String::from("not ready\n"),
+            )
+        }
+    } else if is_get_metrics {
         (
             "200 OK",
             "text/plain; version=0.0.4; charset=utf-8",
@@ -529,7 +551,7 @@ mod metrics_http_tests {
     fn metrics_http_response_is_strict_http_11() {
         let (service, audit) = test_service_and_audit();
         let response =
-            build_metrics_http_response("GET /metrics HTTP/1.1\r\n\r\n", &service, &audit);
+            build_metrics_http_response("GET /metrics HTTP/1.1\r\n\r\n", &service, &audit, true);
 
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"));
@@ -541,7 +563,8 @@ mod metrics_http_tests {
     #[test]
     fn unknown_path_returns_404() {
         let (service, audit) = test_service_and_audit();
-        let response = build_metrics_http_response("GET /wat HTTP/1.1\r\n\r\n", &service, &audit);
+        let response =
+            build_metrics_http_response("GET /wat HTTP/1.1\r\n\r\n", &service, &audit, true);
 
         assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
     }
@@ -550,7 +573,7 @@ mod metrics_http_tests {
     fn unsupported_method_returns_405() {
         let (service, audit) = test_service_and_audit();
         let response =
-            build_metrics_http_response("POST /metrics HTTP/1.1\r\n\r\n", &service, &audit);
+            build_metrics_http_response("POST /metrics HTTP/1.1\r\n\r\n", &service, &audit, true);
 
         assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
     }
@@ -559,7 +582,7 @@ mod metrics_http_tests {
     fn metrics_output_does_not_contain_secret_markers() {
         let (service, audit) = test_service_and_audit();
         let response =
-            build_metrics_http_response("GET /metrics HTTP/1.1\r\n\r\n", &service, &audit);
+            build_metrics_http_response("GET /metrics HTTP/1.1\r\n\r\n", &service, &audit, true);
         let body = response
             .split_once("\r\n\r\n")
             .map(|(_, body)| body)
@@ -579,6 +602,48 @@ mod metrics_http_tests {
             assert!(
                 !body.contains(marker),
                 "metrics body leaked marker: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn healthz_returns_200_ok() {
+        let (service, audit) = test_service_and_audit();
+        let response =
+            build_metrics_http_response("GET /healthz HTTP/1.1\r\n\r\n", &service, &audit, true);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/plain; charset=utf-8\r\n"));
+    }
+
+    #[test]
+    fn readyz_returns_200_when_ready() {
+        let (service, audit) = test_service_and_audit();
+        let response =
+            build_metrics_http_response("GET /readyz HTTP/1.1\r\n\r\n", &service, &audit, true);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn readyz_returns_503_when_not_ready() {
+        let (service, audit) = test_service_and_audit();
+        let response =
+            build_metrics_http_response("GET /readyz HTTP/1.1\r\n\r\n", &service, &audit, false);
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+    }
+
+    #[test]
+    fn health_response_does_not_contain_secret_markers() {
+        let (service, audit) = test_service_and_audit();
+        let response =
+            build_metrics_http_response("GET /healthz HTTP/1.1\r\n\r\n", &service, &audit, true);
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default();
+        for marker in ["PRIVATE KEY", "AKIA", "password=", "secret=", "token="] {
+            assert!(
+                !body.contains(marker),
+                "health body leaked marker: {marker}"
             );
         }
     }
