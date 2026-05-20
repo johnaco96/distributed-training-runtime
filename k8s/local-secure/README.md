@@ -4,6 +4,7 @@ This directory is the validated secure local/dev path for Step 3 production read
 It deploys the coordinator with TLS and mTLS enabled from Kubernetes Secrets and runs
 a secure PyTorch smoke job against `runtime-coordinator.dtruntime.svc.cluster.local:50051`.
 The secure job connects to `runtime-coordinator.dtruntime.svc.cluster.local:50051`, and TLS hostname verification remains enabled (no override).
+The job also supplies `DTRUNTIME_AUTH_SUBJECT` and `DTRUNTIME_AUTH_ROLE` from `dtruntime-auth`; `python/examples/pytorch_coordinator_train.py` forwards these metadata headers via `RuntimeClient` for coordinator RPCs.
 Do not commit generated cert/key/CA material under `.dtruntime-certs/`.
 
 

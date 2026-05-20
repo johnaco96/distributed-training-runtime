@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 if TYPE_CHECKING:
     from dtruntime.generated import runtime_pb2
@@ -69,6 +69,46 @@ class RuntimeClient:
         self.stub = self._stub
         self._closed = False
 
+
+    def rpc_metadata(
+        self,
+        worker_id: str | None = None,
+        extra: Sequence[tuple[str, str]] | None = None,
+    ) -> list[tuple[str, str]]:
+        """Build call metadata for coordinator RPCs.
+
+        Includes configured caller identity metadata when present and can
+        optionally include worker-scoped metadata and extra call-specific
+        metadata entries.
+        """
+        metadata = list(self._auth_metadata)
+        has_identity_metadata = any(key in {"x-dtruntime-subject", "x-dtruntime-role", "x-dtruntime-worker-id"} for key, _ in metadata)
+        if worker_id and has_identity_metadata and not any(key == "x-dtruntime-worker-id" for key, _ in metadata):
+            metadata.append(("x-dtruntime-worker-id", worker_id))
+        if extra:
+            metadata.extend(extra)
+        return metadata
+
+    def register_run(
+        self,
+        run_name: str,
+        world_size: int,
+        assignment_policy: int,
+        storage_backend_kind: int,
+        run_version: str = "",
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.RegisterRunResponse":
+        """Register a run with the coordinator and return its response."""
+        request = self._runtime_pb2.RegisterRunRequest(
+            idempotency_key=idempotency_key,
+            run_name=run_name,
+            assignment_policy=assignment_policy,
+            storage_backend_kind=storage_backend_kind,
+            world_size=world_size,
+            run_version=run_version,
+        )
+        return self._stub.RegisterRun(request, metadata=self.rpc_metadata())
+
     def register_worker(
         self,
         run_id: str,
@@ -89,7 +129,7 @@ class RuntimeClient:
             sdk_version=sdk_version,
             protocol_version=protocol_version,
         )
-        return self._stub.RegisterWorker(request, metadata=self._auth_metadata)
+        return self._stub.RegisterWorker(request, metadata=self.rpc_metadata(worker_id=worker_id))
 
     def register_dataset(
         self,
@@ -121,7 +161,7 @@ class RuntimeClient:
             ),
             shards=shard_metadata,
         )
-        return self._stub.RegisterDataset(request, metadata=self._auth_metadata)
+        return self._stub.RegisterDataset(request, metadata=self.rpc_metadata())
 
     def _shard_metadata_from_dict(
         self, shard: dict[str, Any], dataset_id: str
@@ -153,10 +193,13 @@ class RuntimeClient:
             dataset_id=self._runtime_pb2.DatasetId(value=dataset_id),
             idempotency_key=idempotency_key,
         )
-        metadata = list(self._auth_metadata)
+        extra_metadata: list[tuple[str, str]] = []
         if cached_shard_ids:
-            metadata.append(("x-dtruntime-cached-shards", ",".join(cached_shard_ids)))
-        return self._stub.GetShardAssignment(request, metadata=metadata)
+            extra_metadata.append(("x-dtruntime-cached-shards", ",".join(cached_shard_ids)))
+        return self._stub.GetShardAssignment(
+            request,
+            metadata=self.rpc_metadata(worker_id=worker_id, extra=extra_metadata),
+        )
 
     def begin_checkpoint(
         self,
@@ -174,7 +217,7 @@ class RuntimeClient:
             step=step,
             idempotency_key=idempotency_key,
         )
-        return self._stub.BeginCheckpoint(request, metadata=self._auth_metadata)
+        return self._stub.BeginCheckpoint(request, metadata=self.rpc_metadata(worker_id=worker_id))
 
 
     def report_checkpoint_artifact(
@@ -203,7 +246,7 @@ class RuntimeClient:
             ),
             idempotency_key=idempotency_key,
         )
-        return self._stub.ReportCheckpointArtifact(request, metadata=self._auth_metadata)
+        return self._stub.ReportCheckpointArtifact(request, metadata=self.rpc_metadata(worker_id=worker_id))
 
     def commit_checkpoint(
         self,
@@ -217,7 +260,7 @@ class RuntimeClient:
             checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
             idempotency_key=idempotency_key,
         )
-        return self._stub.CommitCheckpoint(request, metadata=self._auth_metadata)
+        return self._stub.CommitCheckpoint(request, metadata=self.rpc_metadata())
 
     def restore_latest(
         self,
@@ -227,7 +270,7 @@ class RuntimeClient:
         request = self._runtime_pb2.GetLatestCheckpointRequest(
             run_id=self._runtime_pb2.RunId(value=run_id),
         )
-        return self._stub.GetLatestCheckpoint(request, metadata=self._auth_metadata)
+        return self._stub.GetLatestCheckpoint(request, metadata=self.rpc_metadata())
 
     def heartbeat(
         self,
@@ -246,7 +289,7 @@ class RuntimeClient:
                 for shard_id in active_shard_ids or []
             ],
         )
-        return self._stub.Heartbeat(request, metadata=self._auth_metadata)
+        return self._stub.Heartbeat(request, metadata=self.rpc_metadata(worker_id=worker_id))
 
     def close(self) -> None:
         """Close the underlying gRPC channel."""
