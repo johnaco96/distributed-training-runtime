@@ -116,3 +116,16 @@ Caveats: this is local-only and environment-specific. Coordinator timings includ
 
 ## Phase 20 benchmark surface expansion
 Added runtime-bench subcommands: `dataset-prefetch`, `cache-aware-placement`, `auth-audit-overhead`, and `status-snapshot`. Outputs now include `environment`, `surface`, `mode`, `caveats`, `timestamp_utc`, duration/latency fields, plus JSON/CSV outputs. MinIO-gated paths remain optional and must be enabled via `DTRUNTIME_RUN_MINIO_TESTS=1`; otherwise they should skip cleanly with caveats.
+
+## Step 4: Production-style Kubernetes secure validation benchmark
+
+Use a fresh immutable-style image tag per run and keep coordinator + job on the same tag to avoid stale validation artifacts.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_k8s_secure_validation.ps1 `
+  -ImageTag distributed-training-runtime:step4-$(Get-Date -Format yyyyMMddHHmmss) `
+  -OutputDir .dtruntime-results\step4-secure
+```
+
+Artifacts: `summary.json`, `summary.csv`, `metrics.prom`, coordinator/job logs, and kubectl describe/get outputs.
+This is production-style validation evidence (secure runtime behavior and metrics), not a production-scale throughput claim.

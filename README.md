@@ -166,3 +166,7 @@ Local Kubernetes manifests wire startup/readiness/liveness probes to these endpo
 
 ## Step 3: Secure TLS/mTLS Kubernetes validation
 Use `k8s/local-secure/` as the runnable secure deployment path. Generate local/dev certs with `scripts/generate_dev_certs.ps1`, create `dtruntime-tls`, `dtruntime-client-ca`, and `dtruntime-client-tls` Secrets, then deploy coordinator + job in order as documented in `k8s/local-secure/README.md`. No certificate or key material is committed to git.
+
+### Step 4 production-style Kubernetes validation benchmark
+
+Use `scripts/run_k8s_secure_validation.ps1` to run secure coordinator rollout + secure PyTorch job + metrics artifact capture. The benchmark is evidence of secure runtime correctness in Kubernetes, not a production-scale throughput benchmark.

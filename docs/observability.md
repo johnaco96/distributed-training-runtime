@@ -22,3 +22,7 @@ The coordinator metrics HTTP listener (enabled with `--metrics-addr`) now also s
 - `GET /readyz` for readiness (returns `200 OK` when coordinator is ready for gRPC traffic, otherwise `503`).
 
 Probe responses are low-cost plain text and do not include secrets or workload identifiers.
+
+## Step 4 metrics collection note
+
+`run_k8s_secure_validation.ps1` always captures raw coordinator `/metrics` into `metrics.prom` for pass/fail evidence. Prometheus API queries are optional and should not gate baseline secure validation success.

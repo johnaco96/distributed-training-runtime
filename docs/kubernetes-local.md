@@ -131,3 +131,8 @@ This prevents routing traffic before readiness and allows Kubernetes to restart 
 For secure local validation, follow `k8s/local-secure/README.md` and apply manifests in order (service, deployment, job). Do not use placeholder YAML secrets as runtime inputs; create real Secrets with `kubectl create secret tls` / `kubectl create secret generic` from `.dtruntime-certs/`.
 For secure local validation, the job endpoint is `runtime-coordinator.dtruntime.svc.cluster.local:50051` and TLS hostname verification remains enabled (no `ssl_target_name_override`). Never commit generated cert/key/CA files from `.dtruntime-certs/`.
 
+
+## Step 4 benchmark workflow (secure runtime)
+
+Run `scripts/run_k8s_secure_validation.ps1` to execute an end-to-end secure Kubernetes validation and collect machine-readable artifacts under a timestamped output directory.
+Use unique image tags (or digests in production) and ensure deployment + job use the same exact image.
