@@ -352,6 +352,9 @@ impl CoordinatorService for CoordinatorServiceImpl {
             .register_worker(request)
             .ok_or_else(|| Status::not_found(format!("run {} was not found", run_id.value)))?;
         let worker_id_value = registered.worker_id.value.clone();
+        if registered.is_new {
+            self.metrics.inc_workers_total();
+        }
 
         let response = RegisterWorkerResponse {
             worker_id: Some(registered.worker_id),
@@ -408,6 +411,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
             next_heartbeat_deadline: Some(heartbeat.next_heartbeat_deadline.into()),
             server_time: Some(heartbeat.server_time.into()),
         };
+        self.metrics.inc_heartbeats_total();
         self.update_worker_metrics(&run_id);
         info!(run_id = %run_id.value, worker_id = %worker_id.value, "heartbeat accepted");
 
@@ -3040,6 +3044,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_worker_increments_workers_total_once_for_new_registration() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .expect("first registration should succeed");
+        service
+            .register_worker(Request::new(worker_request(run_id, "worker-key")))
+            .await
+            .expect("idempotent retry should succeed");
+
+        assert_eq!(service.metrics_snapshot().workers_total, 1);
+    }
+
+    #[tokio::test]
     async fn get_run_status_updates_stale_worker_metric() {
         let state = Arc::new(CoordinatorState::default());
         let service = CoordinatorServiceImpl::new(state.clone());
@@ -3063,6 +3084,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.metrics_snapshot().stale_workers, 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_increments_heartbeats_total_for_registered_worker() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        let worker_id = service
+            .register_worker(Request::new(worker_request(run_id.clone(), "worker-key")))
+            .await
+            .expect("register_worker should succeed")
+            .into_inner()
+            .worker_id
+            .expect("worker_id should be present");
+
+        service
+            .heartbeat(Request::new(HeartbeatRequest {
+                run_id: Some(run_id),
+                worker_id: Some(worker_id),
+                idempotency_key: "heartbeat-key".to_string(),
+            }))
+            .await
+            .expect("heartbeat should succeed");
+
+        assert_eq!(service.metrics_snapshot().heartbeats_total, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_worker_heartbeat_does_not_increment_heartbeats_total() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let err = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                run_id: Some(run_id),
+                worker_id: Some(WorkerId {
+                    value: "missing-worker".to_string(),
+                }),
+                idempotency_key: "heartbeat-key".to_string(),
+            }))
+            .await
+            .expect_err("heartbeat for unknown worker should fail");
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(service.metrics_snapshot().heartbeats_total, 0);
     }
 
     #[tokio::test]

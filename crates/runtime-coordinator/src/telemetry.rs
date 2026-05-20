@@ -139,6 +139,8 @@ mod tests {
     fn renders_help_type_and_values() {
         let s = RuntimeMetricsSnapshot {
             active_workers: 2,
+            workers_total: 5,
+            heartbeats_total: 7,
             checkpoint_writes: 3,
             shard_assignment_count: 4,
             ..RuntimeMetricsSnapshot::default()
@@ -147,6 +149,8 @@ mod tests {
         assert!(out.contains("# HELP dtruntime_active_workers"));
         assert!(out.contains("# TYPE dtruntime_active_workers gauge"));
         assert!(out.contains("dtruntime_active_workers 2"));
+        assert!(out.contains("dtruntime_workers_total 5"));
+        assert!(out.contains("dtruntime_heartbeats_total 7"));
         assert!(out.contains("dtruntime_checkpoints_committed_total 3"));
         assert!(out.contains("dtruntime_shard_assignments_total 4"));
         assert!(out.contains("dtruntime_audit_events_total 9"));

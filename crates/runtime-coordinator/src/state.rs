@@ -143,6 +143,7 @@ pub struct RegisteredWorker {
     pub state: i32,
     pub lease_renewal_deadline: SystemTime,
     pub server_time: SystemTime,
+    pub is_new: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1132,6 +1133,7 @@ impl CoordinatorState {
                 state: record.state,
                 lease_renewal_deadline: record.registered_at + HEARTBEAT_INTERVAL,
                 server_time: record.registered_at,
+                is_new: false,
             });
         }
 
@@ -1179,6 +1181,7 @@ impl CoordinatorState {
             state: WorkerState::Active as i32,
             lease_renewal_deadline: next_heartbeat_deadline,
             server_time: now,
+            is_new: true,
         })
     }
 
