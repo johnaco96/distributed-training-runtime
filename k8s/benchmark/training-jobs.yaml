@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dtruntime-baseline-training
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: baseline
+          image: distributed-training-runtime:local
+          command: ["python", "python/examples/pytorch_e2e_training_benchmark.py"]
+          args: ["--mode", "baseline-blocking", "--backend", "localfs"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dtruntime-managed-training
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: managed
+          image: distributed-training-runtime:local
+          env:
+            - name: DTRUNTIME_STORAGE_BACKEND
+              value: s3
+            - name: DTRUNTIME_S3_ENDPOINT
+              value: http://dtruntime-minio:9000
+            - name: DTRUNTIME_S3_BUCKET
+              value: dtruntime-bench
+            - name: DTRUNTIME_S3_REGION
+              value: us-east-1
+            - name: DTRUNTIME_S3_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: dtruntime-minio-credentials, key: accesskey } }
+            - name: DTRUNTIME_S3_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: dtruntime-minio-credentials, key: secretkey } }
+            - name: DTRUNTIME_S3_FORCE_PATH_STYLE
+              value: "true"
+            - name: DTRUNTIME_COORDINATOR_ADDR
+              value: runtime-coordinator:50051
+          command: ["python", "python/examples/pytorch_e2e_training_benchmark.py"]
+          args: ["--mode", "dtruntime-managed", "--backend", "minio"]
