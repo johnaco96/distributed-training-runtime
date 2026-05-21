@@ -49,7 +49,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     dataset_id = dataset_response.dataset_id.value
 
     report_count = min(getattr(args, "report_count", len(workers)), len(workers))
-    for rank, worker_id in enumerate(workers[:report_count]):
+    for rank, worker_id in enumerate(workers):
         client.register_worker(
             run_id=runtime_run_id,
             worker_id=worker_id,
@@ -87,7 +87,9 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     )
     checkpoint_id = begin.checkpoint_id.value
 
-    for rank, worker_id in enumerate(workers):
+    missing_workers = workers[report_count:]
+
+    for rank, worker_id in enumerate(workers[:report_count]):
         artifact_name = f"rank-{rank}-step-{args.step}.bin"
         artifact_uri = f"{runtime_run_id}/{checkpoint_id}/{artifact_name}"
         local_path = Path(args.output_dir) / "checkpoints" / artifact_uri
@@ -142,6 +144,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         "artifacts": artifacts,
         "expected_worker_count": len(workers),
         "reported_artifact_count": len(artifacts),
+        "missing_workers": missing_workers,
         "commit_status": commit_status,
         "commit_error": commit_error,
         "restore_status": int(restore_manifest.state),
