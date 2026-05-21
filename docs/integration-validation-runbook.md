@@ -80,3 +80,8 @@ Pass requires:
 ## 8) Before optimization
 
 This runbook validates wiring and recoverability, not latency optimization. Defer async checkpointing and throughput tuning until after these integration checks are stable.
+
+
+## Multi-worker incomplete checkpoint validation
+
+The integration runbook now includes `multi-worker-incomplete` validation: register 4 workers/ranks, report 3 artifacts, assert CommitCheckpoint fails, and assert RestoreLatest does not return the incomplete checkpoint id.

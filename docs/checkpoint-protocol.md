@@ -263,3 +263,8 @@ Phase 13B adds a backend-neutral helper in `runtime-checkpoint` for uploading mu
   - **Follow-up:** implement periodic garbage collector with retention policy.
 - **Risk:** protocol drift between Python SDK and Rust coordinator.
   - **Follow-up:** codify protobuf messages/RPCs directly from this doc in next milestone.
+
+
+## Distributed checkpoint completeness rule
+
+A checkpoint_id represents one logical global checkpoint for a run+step. The coordinator records the expected participant worker set at BeginCheckpoint, requires exactly one artifact per expected worker, and rejects CommitCheckpoint when artifacts are missing or mismatched. RestoreLatest only returns committed complete checkpoints.

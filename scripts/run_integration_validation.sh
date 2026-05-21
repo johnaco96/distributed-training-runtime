@@ -6,7 +6,7 @@ ROOT=".dtruntime-results/integration-${TS}"
 COORD_ADDR="${DTRUNTIME_COORDINATOR_ADDR:-127.0.0.1:50051}"
 METRICS_ADDR="${DTRUNTIME_METRICS_ADDR:-http://127.0.0.1:9090}"
 
-mkdir -p "$ROOT"/{localfs-managed,minio-managed,failure-recovery,multi-worker}
+mkdir -p "$ROOT"/{localfs-managed,minio-managed,failure-recovery,multi-worker,multi-worker-incomplete}
 
 run_localfs() {
   local out="$ROOT/localfs-managed"
@@ -70,6 +70,32 @@ PY
   curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
 }
 
+run_multiworker_incomplete() {
+  local out="$ROOT/multi-worker-incomplete"
+  local run_id="integration-multi-incomplete-${TS}"
+  set +e
+  PYTHONPATH=python python python/examples/multi_worker_checkpoint_validation.py \
+    --run-id "$run_id" --checkpoint-id "global-ckpt-step-4-incomplete" --world-size 4 --shard-count 4 --step 4 \
+    --report-count 3 \
+    --output-dir "$out" --json-out "$out/result.json" > "$out/expected-failure.log" 2>&1
+  local rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    echo "incomplete validation script failed unexpectedly" >&2
+    exit $rc
+  fi
+  python - <<'PY' "$out/result.json"
+import json, sys
+from pathlib import Path
+d = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if d.get("commit_error") is None:
+    raise SystemExit("expected commit failure for incomplete checkpoint")
+if d.get("restore_latest", {}).get("checkpoint_id") == d.get("checkpoint_id"):
+    raise SystemExit("incomplete checkpoint became restorable latest checkpoint")
+PY
+  curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
+}
+
 run_failure_recovery() {
   local out="$ROOT/failure-recovery"
   local runtime_run_id
@@ -112,6 +138,7 @@ PY
 run_localfs
 run_failure_recovery
 run_multiworker
+run_multiworker_incomplete
 if [[ -n "${DTRUNTIME_S3_ENDPOINT:-}" ]]; then
   run_minio
 else
