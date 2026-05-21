@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dtruntime-minio-credentials
+type: Opaque
+stringData:
+  accesskey: devminio
+  secretkey: devminiopassword
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dtruntime-minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: dtruntime-minio }
+  template:
+    metadata:
+      labels: { app: dtruntime-minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: dtruntime-minio-credentials, key: accesskey } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: dtruntime-minio-credentials, key: secretkey } }
+          ports:
+            - { containerPort: 9000, name: api }
+            - { containerPort: 9001, name: console }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dtruntime-minio
+spec:
+  selector: { app: dtruntime-minio }
+  ports:
+    - { name: api, port: 9000, targetPort: 9000 }
