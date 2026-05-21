@@ -39,6 +39,8 @@ class BenchmarkResult:
     shard_count: int
     backend: str
     mode: str
+    requested_run_id: str
+    runtime_run_id: str | None
 
 
 def percentile_ms(values: list[float], q: float) -> float | None:
@@ -219,6 +221,8 @@ def run_training(args: argparse.Namespace) -> BenchmarkResult:
         shard_count=args.shard_count,
         backend=args.backend,
         mode=args.mode,
+        requested_run_id=args.run_id,
+        runtime_run_id=runtime_run_id if args.mode == "dtruntime-managed" else None,
     )
 
 
