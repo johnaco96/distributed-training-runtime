@@ -10,13 +10,40 @@ mkdir -p "$ROOT"/{localfs-managed,minio-managed,failure-recovery,multi-worker}
 
 run_localfs() {
   local out="$ROOT/localfs-managed"
+  local requested_run_id="integration-localfs-${TS}"
   PYTHONPATH=python python python/examples/pytorch_e2e_training_benchmark.py \
-    --mode dtruntime-managed --backend localfs --run-id "integration-localfs-${TS}" \
+    --mode dtruntime-managed --backend localfs --run-id "$requested_run_id" \
     --worker-id worker-0 --shard-count 4 --steps 20 --checkpoint-every-steps 10 \
     --checkpoint-bytes $((16*1024*1024)) --output-dir "$out" --json-out "$out/result.json"
+  local runtime_run_id
+  runtime_run_id="$(python - <<'PY' "$out/result.json"
+import json
+import sys
+from pathlib import Path
+
+result_path = Path(sys.argv[1])
+data = json.loads(result_path.read_text(encoding="utf-8"))
+runtime_run_id = data.get("runtime_run_id")
+if not runtime_run_id:
+    raise SystemExit("missing runtime_run_id in benchmark result")
+print(runtime_run_id)
+PY
+)"
+  python - <<'PY' "$out/run-info.json" "$requested_run_id" "$runtime_run_id"
+import json
+import sys
+from pathlib import Path
+
+out_path = Path(sys.argv[1])
+payload = {
+    "requested_run_id": sys.argv[2],
+    "runtime_run_id": sys.argv[3],
+}
+out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
   curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
   find "$out/checkpoints" -type f | sort > "$out/checkpoint-files.txt"
-  PYTHONPATH=python python python/examples/restore_latest_checkpoint.py --run-id "integration-localfs-${TS}" --expect-backend localfs --local-root "$out" --json-out "$out/restore-latest.json"
+  PYTHONPATH=python python python/examples/restore_latest_checkpoint.py --run-id "$runtime_run_id" --expect-backend localfs --local-root "$out" --json-out "$out/restore-latest.json"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$out/time.txt"
 }
 
@@ -34,8 +61,21 @@ run_multiworker() {
 
 run_failure_recovery() {
   local out="$ROOT/failure-recovery"
-  local run_id="integration-localfs-${TS}"
-  PYTHONPATH=python python python/examples/restore_latest_checkpoint.py --run-id "$run_id" --expect-backend localfs --local-root "$ROOT/localfs-managed" --json-out "$out/restore-output.json" > "$out/recovery-log.txt"
+  local runtime_run_id
+  runtime_run_id="$(python - <<'PY' "$ROOT/localfs-managed/result.json"
+import json
+import sys
+from pathlib import Path
+
+result_path = Path(sys.argv[1])
+data = json.loads(result_path.read_text(encoding="utf-8"))
+runtime_run_id = data.get("runtime_run_id")
+if not runtime_run_id:
+    raise SystemExit("missing runtime_run_id in localfs-managed result")
+print(runtime_run_id)
+PY
+)"
+  PYTHONPATH=python python python/examples/restore_latest_checkpoint.py --run-id "$runtime_run_id" --expect-backend localfs --local-root "$ROOT/localfs-managed" --json-out "$out/restore-output.json" > "$out/recovery-log.txt"
 }
 
 run_minio() {
