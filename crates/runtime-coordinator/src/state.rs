@@ -410,7 +410,7 @@ impl CoordinatorState {
                 workers
                     .values()
                     .filter(|worker| worker.state == WorkerState::Active as i32)
-                    .map(|worker| worker.worker_id.value.clone())
+                    .map(|worker| worker.worker_id.clone())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -512,11 +512,12 @@ impl CoordinatorState {
                 .transition_to(DomainCheckpointState::UploadInProgress, now_millis)
                 .map_err(map_checkpoint_error)?;
         }
+        let domain_worker_id = DomainWorkerId(worker_id.clone());
         record
             .checkpoint
             .add_artifact(
                 ArtifactRecord {
-                    worker_id: DomainWorkerId(worker_id),
+                    worker_id: domain_worker_id,
                     artifact_name,
                     storage_key: artifact_uri,
                     size_bytes,
