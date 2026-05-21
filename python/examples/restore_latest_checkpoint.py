@@ -30,11 +30,23 @@ def main() -> None:
         raise SystemExit(f"restore_latest returned checkpoint without artifacts for run_id={args.run_id}")
 
     artifact_uri = manifest.artifacts[0].artifact_uri
+    artifacts = [
+        {
+            "artifact_name": artifact.artifact_name,
+            "artifact_uri": artifact.artifact_uri,
+            "size_bytes": artifact.size_bytes,
+            "checksum": artifact.checksum,
+            "checksum_algorithm": artifact.checksum_algorithm,
+        }
+        for artifact in manifest.artifacts
+    ]
     verification: dict[str, object] = {
         "run_id": manifest.run_id.value,
         "checkpoint_id": manifest.checkpoint_id.value,
         "step": manifest.step,
         "artifact_uri": artifact_uri,
+        "artifact_count": len(artifacts),
+        "artifacts": artifacts,
         "storage_backend_kind": manifest.storage_backend_kind,
     }
 

@@ -67,9 +67,10 @@ def write_checkpoint_bytes(path: Path, bytes_count: int) -> int:
 def _write_s3_object(key: str, bytes_count: int) -> int:
     import boto3
 
+    endpoint = os.getenv("DTRUNTIME_S3_ENDPOINT_URL") or os.getenv("DTRUNTIME_S3_ENDPOINT")
     client = boto3.client(
         "s3",
-        endpoint_url=os.getenv("DTRUNTIME_S3_ENDPOINT"),
+        endpoint_url=endpoint,
         region_name=os.getenv("DTRUNTIME_S3_REGION", "us-east-1"),
         aws_access_key_id=os.getenv("DTRUNTIME_S3_ACCESS_KEY_ID"),
         aws_secret_access_key=os.getenv("DTRUNTIME_S3_SECRET_ACCESS_KEY"),

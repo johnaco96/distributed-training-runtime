@@ -46,11 +46,12 @@ PYTHONPATH=python python python/examples/restore_latest_checkpoint.py \
 Set MinIO/S3 env first:
 
 ```bash
-export DTRUNTIME_S3_ENDPOINT=http://127.0.0.1:9000
+export DTRUNTIME_S3_ENDPOINT_URL=http://127.0.0.1:9000
 export DTRUNTIME_S3_REGION=us-east-1
 export DTRUNTIME_S3_ACCESS_KEY_ID=minioadmin
 export DTRUNTIME_S3_SECRET_ACCESS_KEY=minioadmin
 export DTRUNTIME_S3_BUCKET=dtruntime-checkpoints
+export DTRUNTIME_S3_FORCE_PATH_STYLE=true
 ```
 
 Then rerun:
@@ -67,6 +68,15 @@ The script writes results under:
 - `.dtruntime-results/integration-<timestamp>/minio-managed/`
 - `.dtruntime-results/integration-<timestamp>/failure-recovery/`
 - `.dtruntime-results/integration-<timestamp>/multi-worker/`
+
+When MinIO env is configured and validation runs, `minio-managed/` contains:
+- `result.json`
+- `restore-latest.json`
+- `object-list.txt`
+- `coordinator-metrics-after.prom`
+- `run-info.json`
+
+When MinIO env is missing, `minio-managed/skip.txt` is written instead.
 
 ## 7) Pass/fail interpretation
 
