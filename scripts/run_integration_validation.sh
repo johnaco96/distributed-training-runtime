@@ -156,32 +156,34 @@ run_minio() {
     --mode dtruntime-managed --backend minio --run-id "$run_id" --worker-id worker-0 \
     --shard-count 4 --steps 10 --checkpoint-every-steps 5 --checkpoint-bytes $((4*1024*1024)) \
     --output-dir "$out" --json-out "$out/result.json"
-  local runtime_run_id
-  runtime_run_id="$(python - <<'PY' "$out/result.json"
+  local requested_run_id runtime_run_id object_prefix
+  read -r requested_run_id runtime_run_id < <(python - <<'PY' "$out/result.json"
 import json, sys
 from pathlib import Path
 data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(data["runtime_run_id"])
+print(data["requested_run_id"], data["runtime_run_id"])
 PY
-)"
-  python - <<'PY' "$out/run-info.json" "$run_id" "$runtime_run_id" "$endpoint" "${DTRUNTIME_S3_BUCKET}"
+)
+  object_prefix="${requested_run_id}/"
+  python - <<'PY' "$out/run-info.json" "$requested_run_id" "$runtime_run_id" "$object_prefix" "$endpoint" "${DTRUNTIME_S3_BUCKET}"
 import json, sys
 from pathlib import Path
 payload = {
     "requested_run_id": sys.argv[2],
     "runtime_run_id": sys.argv[3],
-    "endpoint_url": sys.argv[4],
-    "bucket": sys.argv[5],
+    "object_prefix": sys.argv[4],
+    "endpoint_url": sys.argv[5],
+    "bucket": sys.argv[6],
 }
 Path(sys.argv[1]).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
   curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
-  python - <<'PY' "$out/object-list.txt" "$runtime_run_id"
+  python - <<'PY' "$out/object-list.txt" "$object_prefix"
 import boto3, os
 import sys
 from pathlib import Path
 out_path = Path(sys.argv[1])
-runtime_run_id = sys.argv[2]
+object_prefix = sys.argv[2]
 endpoint = os.getenv("DTRUNTIME_S3_ENDPOINT_URL") or os.getenv("DTRUNTIME_S3_ENDPOINT")
 s3 = boto3.client(
     "s3",
@@ -190,7 +192,7 @@ s3 = boto3.client(
     aws_access_key_id=os.getenv("DTRUNTIME_S3_ACCESS_KEY_ID"),
     aws_secret_access_key=os.getenv("DTRUNTIME_S3_SECRET_ACCESS_KEY"),
 )
-resp = s3.list_objects_v2(Bucket=os.environ["DTRUNTIME_S3_BUCKET"], Prefix=f"{runtime_run_id}/")
+resp = s3.list_objects_v2(Bucket=os.environ["DTRUNTIME_S3_BUCKET"], Prefix=object_prefix)
 objects = [(o["Key"], o["Size"]) for o in resp.get("Contents", [])]
 if len(objects) < 2:
     raise SystemExit("expected at least two checkpoint objects for minio validation")
