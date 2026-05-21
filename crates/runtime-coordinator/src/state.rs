@@ -200,6 +200,8 @@ pub struct CoordinatorCheckpointRecord {
     pub checkpoint: CheckpointRecord,
     pub initiated_by_worker_id: String,
     pub committed_at_millis: Option<u64>,
+    pub expected_worker_ids: Vec<String>,
+    pub expected_artifact_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -401,6 +403,17 @@ impl CoordinatorState {
         }
 
         let now_millis = now_millis();
+        let expected_worker_ids = inner
+            .workers_by_run
+            .get(&run_id)
+            .map(|workers| {
+                workers
+                    .values()
+                    .filter(|worker| worker.state == WorkerState::Active as i32)
+                    .map(|worker| worker.worker_id.value.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let record = CoordinatorCheckpointRecord {
             checkpoint: CheckpointRecord::new(
                 DomainRunId(run_id.clone()),
@@ -410,6 +423,8 @@ impl CoordinatorState {
             ),
             initiated_by_worker_id: worker_id,
             committed_at_millis: None,
+            expected_artifact_count: expected_worker_ids.len() as u32,
+            expected_worker_ids,
         };
         inner
             .checkpoints_by_run
@@ -511,6 +526,32 @@ impl CoordinatorState {
                 now_millis,
             )
             .map_err(map_checkpoint_error)?;
+        let duplicate_reports = record
+            .checkpoint
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.worker_id.0 == worker_id)
+            .count();
+        if duplicate_reports > 1 {
+            let latest = record
+                .checkpoint
+                .artifacts
+                .last()
+                .expect("artifact list must contain at least one item")
+                .clone();
+            let first = record
+                .checkpoint
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.worker_id.0 == worker_id)
+                .expect("worker artifact must exist");
+            if first != &latest {
+                return Err(ReportCheckpointArtifactError::InvalidInput(
+                    "worker already reported conflicting artifact metadata",
+                ));
+            }
+            record.checkpoint.artifacts.pop();
+        }
         let response = record.clone();
         if let Some(last) = response.checkpoint.artifacts.last() {
             self.persist_artifact(&run_id, &checkpoint_id, last);
@@ -552,6 +593,23 @@ impl CoordinatorState {
             .ok_or(CommitCheckpointError::CheckpointNotFound)?;
 
         if record.checkpoint.artifacts.is_empty() {
+            return Err(CommitCheckpointError::InvalidState);
+        }
+        if record.expected_artifact_count == 0 {
+            return Err(CommitCheckpointError::InvalidState);
+        }
+        if record.checkpoint.artifacts.len() != record.expected_artifact_count as usize {
+            return Err(CommitCheckpointError::InvalidState);
+        }
+        let reported_workers: std::collections::BTreeSet<String> = record
+            .checkpoint
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.worker_id.0.clone())
+            .collect();
+        let expected_workers: std::collections::BTreeSet<String> =
+            record.expected_worker_ids.iter().cloned().collect();
+        if reported_workers != expected_workers {
             return Err(CommitCheckpointError::InvalidState);
         }
 

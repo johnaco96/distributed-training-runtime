@@ -48,7 +48,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     )
     dataset_id = dataset_response.dataset_id.value
 
-    for rank, worker_id in enumerate(workers):
+    report_count = min(getattr(args, "report_count", len(workers)), len(workers))
+    for rank, worker_id in enumerate(workers[:report_count]):
         client.register_worker(
             run_id=runtime_run_id,
             worker_id=worker_id,
@@ -115,11 +116,17 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-    commit = client.commit_checkpoint(
-        run_id=runtime_run_id,
-        checkpoint_id=checkpoint_id,
-        idempotency_key=f"multi-commit-{runtime_run_id}-{args.step}",
-    )
+    commit_error = None
+    try:
+        commit = client.commit_checkpoint(
+            run_id=runtime_run_id,
+            checkpoint_id=checkpoint_id,
+            idempotency_key=f"multi-commit-{runtime_run_id}-{args.step}",
+        )
+        commit_status = int(commit.state)
+    except Exception as exc:  # noqa: BLE001
+        commit_error = str(exc)
+        commit_status = None
     restore = client.restore_latest(runtime_run_id)
     restore_manifest = restore.manifest
 
@@ -133,7 +140,10 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         "workers": workers,
         "ranks_shards": assignments,
         "artifacts": artifacts,
-        "commit_status": int(commit.state),
+        "expected_worker_count": len(workers),
+        "reported_artifact_count": len(artifacts),
+        "commit_status": commit_status,
+        "commit_error": commit_error,
         "restore_status": int(restore_manifest.state),
         "restore_latest": {
             "checkpoint_id": restore_manifest.checkpoint_id.value,
@@ -160,6 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--world-size", type=int, default=4)
     parser.add_argument("--shard-count", type=int, default=4)
     parser.add_argument("--step", type=int, default=10)
+    parser.add_argument("--report-count", type=int, default=4)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--json-out", required=True)
     return parser.parse_args()
