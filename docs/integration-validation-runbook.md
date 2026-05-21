@@ -73,6 +73,7 @@ The script writes results under:
 Pass requires:
 - Managed localfs run commits checkpoint and restore succeeds.
 - Fresh-process restore confirms latest checkpoint artifact exists.
+- Multi-worker path uses one logical checkpoint id for one run and reports one artifact per worker/rank (4 total by default).
 - Multi-worker path shows >=4 workers and shard assignments in metrics.
 - MinIO path only passes when object-list and restore metadata are both present.
 

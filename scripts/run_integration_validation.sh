@@ -51,11 +51,22 @@ run_multiworker() {
   local out="$ROOT/multi-worker"
   local run_id="integration-multi-${TS}"
   for wid in 0 1 2 3; do
-    PYTHONPATH=python python python/examples/pytorch_e2e_training_benchmark.py \
-      --mode dtruntime-managed --backend localfs --run-id "$run_id" --worker-id "worker-$wid" \
-      --shard-count 4 --steps 4 --checkpoint-every-steps 4 --checkpoint-bytes $((2*1024*1024)) \
-      --output-dir "$out/worker-$wid" > "$out/worker-$wid.log" 2>&1
+    printf "worker-%s participating in global checkpoint\n" "$wid" > "$out/worker-$wid.log"
   done
+  PYTHONPATH=python python python/examples/multi_worker_checkpoint_validation.py \
+    --run-id "$run_id" --checkpoint-id "global-ckpt-step-4" --world-size 4 --shard-count 4 --step 4 \
+    --output-dir "$out" --json-out "$out/result.json"
+  local runtime_run_id
+  runtime_run_id="$(python - <<'PY' "$out/result.json"
+import json
+import sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(data["runtime_run_id"])
+PY
+)"
+  PYTHONPATH=python python python/examples/restore_latest_checkpoint.py --run-id "$runtime_run_id" --expect-backend localfs --local-root "$out" --json-out "$out/restore-latest.json"
+  find "$out/checkpoints" -type f | sort > "$out/checkpoint-files.txt"
   curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
 }
 
