@@ -140,23 +140,72 @@ PY
   PYTHONPATH=python python python/examples/restore_latest_checkpoint.py --run-id "$runtime_run_id" --expect-backend localfs --local-root "$ROOT/localfs-managed" --json-out "$out/restore-output.json" > "$out/recovery-log.txt"
 }
 
+minio_env_ready() {
+  [[ -n "${DTRUNTIME_S3_BUCKET:-}" ]] || return 1
+  [[ -n "${DTRUNTIME_S3_ACCESS_KEY_ID:-}" ]] || return 1
+  [[ -n "${DTRUNTIME_S3_SECRET_ACCESS_KEY:-}" ]] || return 1
+  [[ -n "${DTRUNTIME_S3_REGION:-}" ]] || return 1
+  [[ -n "${DTRUNTIME_S3_ENDPOINT_URL:-${DTRUNTIME_S3_ENDPOINT:-}}" ]] || return 1
+}
+
 run_minio() {
   local out="$ROOT/minio-managed"
   local run_id="integration-minio-${TS}"
-  : "${DTRUNTIME_S3_BUCKET:?set DTRUNTIME_S3_BUCKET for minio validation}"
+  local endpoint="${DTRUNTIME_S3_ENDPOINT_URL:-${DTRUNTIME_S3_ENDPOINT:-}}"
   PYTHONPATH=python python python/examples/pytorch_e2e_training_benchmark.py \
     --mode dtruntime-managed --backend minio --run-id "$run_id" --worker-id worker-0 \
     --shard-count 4 --steps 10 --checkpoint-every-steps 5 --checkpoint-bytes $((4*1024*1024)) \
     --output-dir "$out" --json-out "$out/result.json"
-  curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
-  python - <<'PY' > "$out/object-list.txt"
-import boto3, os
-s3=boto3.client('s3',endpoint_url=os.getenv('DTRUNTIME_S3_ENDPOINT'),region_name=os.getenv('DTRUNTIME_S3_REGION','us-east-1'),aws_access_key_id=os.getenv('DTRUNTIME_S3_ACCESS_KEY_ID'),aws_secret_access_key=os.getenv('DTRUNTIME_S3_SECRET_ACCESS_KEY'))
-resp=s3.list_objects_v2(Bucket=os.environ['DTRUNTIME_S3_BUCKET'])
-for o in resp.get('Contents',[]):
-    print(f"{o['Key']}\t{o['Size']}")
+  local runtime_run_id
+  runtime_run_id="$(python - <<'PY' "$out/result.json"
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(data["runtime_run_id"])
 PY
-  PYTHONPATH=python python python/examples/restore_latest_checkpoint.py --run-id "$run_id" --expect-backend minio --json-out "$out/restore-latest.json"
+)"
+  python - <<'PY' "$out/run-info.json" "$run_id" "$runtime_run_id" "$endpoint" "${DTRUNTIME_S3_BUCKET}"
+import json, sys
+from pathlib import Path
+payload = {
+    "requested_run_id": sys.argv[2],
+    "runtime_run_id": sys.argv[3],
+    "endpoint_url": sys.argv[4],
+    "bucket": sys.argv[5],
+}
+Path(sys.argv[1]).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+  curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
+  python - <<'PY' "$out/object-list.txt" "$runtime_run_id"
+import boto3, os
+import sys
+from pathlib import Path
+out_path = Path(sys.argv[1])
+runtime_run_id = sys.argv[2]
+endpoint = os.getenv("DTRUNTIME_S3_ENDPOINT_URL") or os.getenv("DTRUNTIME_S3_ENDPOINT")
+s3 = boto3.client(
+    "s3",
+    endpoint_url=endpoint,
+    region_name=os.getenv("DTRUNTIME_S3_REGION", "us-east-1"),
+    aws_access_key_id=os.getenv("DTRUNTIME_S3_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("DTRUNTIME_S3_SECRET_ACCESS_KEY"),
+)
+resp = s3.list_objects_v2(Bucket=os.environ["DTRUNTIME_S3_BUCKET"], Prefix=f"{runtime_run_id}/")
+objects = [(o["Key"], o["Size"]) for o in resp.get("Contents", [])]
+if len(objects) < 2:
+    raise SystemExit("expected at least two checkpoint objects for minio validation")
+out_path.write_text("\n".join(f"{k}\t{s}" for (k, s) in sorted(objects)) + "\n", encoding="utf-8")
+PY
+  PYTHONPATH=python python python/examples/restore_latest_checkpoint.py --run-id "$runtime_run_id" --expect-backend minio --json-out "$out/restore-latest.json"
+  python - <<'PY' "$out/restore-latest.json" "${DTRUNTIME_S3_BUCKET}"
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if not data.get("artifact_uri", ""):
+    raise SystemExit("restore-latest artifact_uri missing for minio run")
+data["bucket"] = sys.argv[2]
+Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
   date -u +%Y-%m-%dT%H:%M:%SZ > "$out/time.txt"
 }
 
@@ -164,10 +213,17 @@ run_localfs
 run_failure_recovery
 run_multiworker
 run_multiworker_incomplete
-if [[ -n "${DTRUNTIME_S3_ENDPOINT:-}" ]]; then
+if minio_env_ready; then
   run_minio
 else
-  echo "minio not run: DTRUNTIME_S3_ENDPOINT not set" > "$ROOT/minio-managed/result.json"
+  cat > "$ROOT/minio-managed/skip.txt" <<'EOF'
+minio validation skipped: missing one or more required env vars:
+- DTRUNTIME_S3_ENDPOINT_URL (or DTRUNTIME_S3_ENDPOINT)
+- DTRUNTIME_S3_BUCKET
+- DTRUNTIME_S3_ACCESS_KEY_ID
+- DTRUNTIME_S3_SECRET_ACCESS_KEY
+- DTRUNTIME_S3_REGION
+EOF
 fi
 
 echo "Integration results: $ROOT"
