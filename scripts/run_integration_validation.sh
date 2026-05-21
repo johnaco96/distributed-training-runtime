@@ -87,13 +87,27 @@ run_multiworker_incomplete() {
   python - <<'PY' "$out/result.json"
 import json, sys
 from pathlib import Path
-d = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+p = Path(sys.argv[1])
+if not p.exists():
+    raise SystemExit("missing result.json for incomplete validation")
+d = json.loads(p.read_text(encoding="utf-8"))
+if d.get("expected_worker_count") != 4:
+    raise SystemExit("incomplete validation did not register all 4 workers")
+if d.get("reported_artifact_count") != 3:
+    raise SystemExit("incomplete validation did not report exactly 3 artifacts")
+missing_workers = d.get("missing_workers") or []
+if "worker-3" not in missing_workers:
+    raise SystemExit("incomplete validation missing worker list does not include worker-3")
 if d.get("commit_error") is None:
     raise SystemExit("expected commit failure for incomplete checkpoint")
+if "not found" in str(d.get("commit_error", "")).lower():
+    raise SystemExit("unexpected worker-not-found style error in incomplete validation")
 if d.get("restore_latest", {}).get("checkpoint_id") == d.get("checkpoint_id"):
     raise SystemExit("incomplete checkpoint became restorable latest checkpoint")
 PY
+  [[ -s "$out/expected-failure.log" ]] || { echo "missing expected-failure.log" >&2; exit 1; }
   curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
+  [[ -s "$out/coordinator-metrics-after.prom" ]] || { echo "missing metrics snapshot" >&2; exit 1; }
 }
 
 run_failure_recovery() {
