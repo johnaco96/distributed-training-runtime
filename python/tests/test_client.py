@@ -651,3 +651,12 @@ def test_worker_rpc_adds_worker_metadata_when_identity_present(monkeypatch):
     client.heartbeat(run_id="run-1", worker_id="worker-1")
     assert ("x-dtruntime-worker-id", "worker-1") in stub.Heartbeat.call_args.kwargs["metadata"]
 
+
+def test_http_prefixed_address_is_normalized(monkeypatch):
+    grpc_module, _, _, channel, _ = install_fake_generated_modules(monkeypatch)
+
+    client = RuntimeClient("http://127.0.0.1:50051")
+
+    grpc_module.insecure_channel.assert_called_once_with("127.0.0.1:50051")
+    assert client.address == "127.0.0.1:50051"
+    assert client._channel is channel

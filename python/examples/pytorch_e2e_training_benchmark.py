@@ -98,7 +98,7 @@ def run_training(args: argparse.Namespace) -> BenchmarkResult:
     dataset_id = ""
     worker_host = socket.gethostname()
     if args.mode == "dtruntime-managed":
-        coordinator_addr = os.getenv("DTRUNTIME_COORDINATOR_ADDR", "http://127.0.0.1:50051")
+        coordinator_addr = os.getenv("DTRUNTIME_COORDINATOR_ADDR", "127.0.0.1:50051")
         runtime_client = RuntimeClient(coordinator_addr)
         run_response = runtime_client.register_run(
             run_name=args.run_id,
