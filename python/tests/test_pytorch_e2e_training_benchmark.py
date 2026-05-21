@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -76,3 +78,90 @@ def test_report_sections_present() -> None:
     text = Path("scripts/run_e2e_training_benchmark_k8s.sh").read_text()
     for section in ["## environment", "## Kubernetes context", "## checkpoint stall comparison", "## what this does not prove"]:
         assert section in text
+
+
+def _benchmark_args(mode: str, output_dir: Path) -> Namespace:
+    return Namespace(
+        mode=mode,
+        backend="localfs",
+        samples=32,
+        steps=2,
+        batch_size=8,
+        checkpoint_every_steps=1,
+        checkpoint_bytes=1024,
+        input_dim=8,
+        num_classes=4,
+        seed=7,
+        run_id="test-run",
+        worker_id="worker-0",
+        shard_count=2,
+        output_dir=str(output_dir),
+        json_out=None,
+    )
+
+
+def test_dtruntime_managed_uses_runtime_client_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = _load_module()
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, address: str) -> None:
+            assert address == "http://127.0.0.1:50051"
+            self._runtime_pb2 = SimpleNamespace(
+                ASSIGNMENT_POLICY_STATIC_RANK=1,
+                STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM=1,
+                STORAGE_BACKEND_KIND_S3_COMPATIBLE=2,
+            )
+
+        def register_run(self, **_: object) -> SimpleNamespace:
+            calls.append("register_run")
+            return SimpleNamespace(run_id=SimpleNamespace(value="run-1"))
+
+        def register_worker(self, **_: object) -> None:
+            calls.append("register_worker")
+
+        def register_dataset(self, **_: object) -> SimpleNamespace:
+            calls.append("register_dataset")
+            return SimpleNamespace(dataset_id=SimpleNamespace(value="dataset-1"))
+
+        def request_shard(self, **_: object) -> None:
+            calls.append("request_shard")
+
+        def begin_checkpoint(self, **_: object) -> SimpleNamespace:
+            calls.append("begin_checkpoint")
+            return SimpleNamespace(checkpoint_id=SimpleNamespace(value="ckpt-1"))
+
+        def report_checkpoint_artifact(self, **_: object) -> None:
+            calls.append("report_checkpoint_artifact")
+
+        def commit_checkpoint(self, **_: object) -> None:
+            calls.append("commit_checkpoint")
+
+        def restore_latest(self, **_: object) -> None:
+            calls.append("restore_latest")
+
+        def close(self) -> None:
+            calls.append("close")
+
+    monkeypatch.setattr(bench, "RuntimeClient", FakeClient)
+    result = bench.run_training(_benchmark_args("dtruntime-managed", tmp_path))
+    assert result.restore_latest_seconds is not None
+    assert "register_run" in calls
+    assert "begin_checkpoint" in calls
+    assert "report_checkpoint_artifact" in calls
+    assert "commit_checkpoint" in calls
+    assert "restore_latest" in calls
+
+
+def test_dtruntime_managed_does_not_fallback_when_coordinator_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = _load_module()
+
+    class FailingClient:
+        def __init__(self, _: str) -> None:
+            raise RuntimeError("coordinator unreachable")
+
+    monkeypatch.setattr(bench, "RuntimeClient", FailingClient)
+
+    with pytest.raises(RuntimeError, match="coordinator unreachable"):
+        bench.run_training(_benchmark_args("dtruntime-managed", tmp_path))
