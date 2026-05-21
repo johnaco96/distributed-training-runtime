@@ -661,6 +661,42 @@ mod tests {
         );
         assert_eq!(s.benchmark, "worker-rpc");
     }
+
+        fn logical_workers_with_target_and_no_start_coordinator_uses_external_mode() {
+        let mode =
+            resolve_logical_workers_coordinator_mode(Some("http://127.0.0.1:50051".into()), false)
+                .expect("external mode should resolve");
+        assert_eq!(
+            mode,
+            LogicalWorkersCoordinatorMode::External {
+                target: "http://127.0.0.1:50051".into()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_workers_start_coordinator_uses_spawned_mode() {
+        let mode = resolve_logical_workers_coordinator_mode(Some("127.0.0.1:50051".into()), true)
+            .expect("spawned mode should resolve");
+        assert_eq!(
+            mode,
+            LogicalWorkersCoordinatorMode::Spawned {
+                target: "127.0.0.1:50051".into()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_workers_missing_target_without_start_coordinator_fails_clearly() {
+        let err = resolve_logical_workers_coordinator_mode(None, false)
+            .expect_err("missing target should fail");
+        assert_eq!(
+            err,
+            "--target is required unless --start-coordinator is used"
+        );
+        assert!(!err.contains("runtime-coordinator exited before benchmark client connected"));
+    }
+
 }
 
 pub fn run_worker_rpc(
@@ -1157,47 +1193,6 @@ async fn run_logical_workers_async(
     );
     s.extra = json!({"logical_worker_count":workers,"register_worker_latency_ms":latency_summary(&reg_lat),"heartbeat_latency_ms":latency_summary(&hb_lat),"shard_assignment_latency_ms":latency_summary(&assign_lat),"checkpoint_begin_latency_ms":latency_summary(&cbegin),"checkpoint_report_artifact_latency_ms":latency_summary(&cread),"checkpoint_commit_latency_ms":latency_summary(&ccommit),"restore_latest_latency_ms":latency_summary(&crest)});
     Ok(s)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{resolve_logical_workers_coordinator_mode, LogicalWorkersCoordinatorMode};
-
-    #[test]
-    fn logical_workers_with_target_and_no_start_coordinator_uses_external_mode() {
-        let mode =
-            resolve_logical_workers_coordinator_mode(Some("http://127.0.0.1:50051".into()), false)
-                .expect("external mode should resolve");
-        assert_eq!(
-            mode,
-            LogicalWorkersCoordinatorMode::External {
-                target: "http://127.0.0.1:50051".into()
-            }
-        );
-    }
-
-    #[test]
-    fn logical_workers_start_coordinator_uses_spawned_mode() {
-        let mode = resolve_logical_workers_coordinator_mode(Some("127.0.0.1:50051".into()), true)
-            .expect("spawned mode should resolve");
-        assert_eq!(
-            mode,
-            LogicalWorkersCoordinatorMode::Spawned {
-                target: "127.0.0.1:50051".into()
-            }
-        );
-    }
-
-    #[test]
-    fn logical_workers_missing_target_without_start_coordinator_fails_clearly() {
-        let err = resolve_logical_workers_coordinator_mode(None, false)
-            .expect_err("missing target should fail");
-        assert_eq!(
-            err,
-            "--target is required unless --start-coordinator is used"
-        );
-        assert!(!err.contains("runtime-coordinator exited before benchmark client connected"));
-    }
 }
 
 pub fn run_dataset_prefetch(
