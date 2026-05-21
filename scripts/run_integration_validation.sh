@@ -98,14 +98,25 @@ if d.get("reported_artifact_count") != 3:
 missing_workers = d.get("missing_workers") or []
 if "worker-3" not in missing_workers:
     raise SystemExit("incomplete validation missing worker list does not include worker-3")
-if d.get("commit_error") is None:
-    raise SystemExit("expected commit failure for incomplete checkpoint")
-if "not found" in str(d.get("commit_error", "")).lower():
-    raise SystemExit("unexpected worker-not-found style error in incomplete validation")
-if d.get("restore_latest", {}).get("checkpoint_id") == d.get("checkpoint_id"):
+if d.get("commit_rejected") is not True:
+    raise SystemExit("expected commit_rejected=true for incomplete checkpoint")
+if not d.get("commit_error"):
+    raise SystemExit("expected non-empty commit_error for incomplete checkpoint")
+if "worker not found" in str(d.get("commit_error", "")).lower():
+    raise SystemExit("unexpected worker-not-found during artifact reporting in incomplete validation")
+if not (d.get("restore_latest_not_found") is True or d.get("incomplete_checkpoint_restorable") is False):
+    raise SystemExit("restore latest must prove incomplete checkpoint is not restorable")
+if d.get("commit_status") == 4:
+    raise SystemExit("incomplete checkpoint commit unexpectedly succeeded")
+restore_latest = d.get("restore_latest")
+if isinstance(restore_latest, dict) and restore_latest.get("checkpoint_id") == d.get("checkpoint_id"):
     raise SystemExit("incomplete checkpoint became restorable latest checkpoint")
 PY
   [[ -s "$out/expected-failure.log" ]] || { echo "missing expected-failure.log" >&2; exit 1; }
+  if grep -qi "worker not found" "$out/expected-failure.log"; then
+    echo "unexpected worker-not-found during incomplete validation" >&2
+    exit 1
+  fi
   curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
   [[ -s "$out/coordinator-metrics-after.prom" ]] || { echo "missing metrics snapshot" >&2; exit 1; }
 }
