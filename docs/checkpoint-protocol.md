@@ -218,6 +218,8 @@ Included now:
 - Worker direct artifact uploads under worker-specific prefixes.
 - Two-phase metadata style: pending manifest then committed manifest + marker.
 - `LATEST` pointer with startup repair.
+
+Current MVP limitation (as implemented): commit requires at least one reported artifact and integrity validation for reported artifacts, but does not yet enforce an expected world-size-complete artifact set automatically. Multi-worker validation must therefore report all rank artifacts before commit to preserve logical global checkpoint semantics.
 - Restore based on latest committed checkpoint.
 
 ## 19. Out-of-scope items
