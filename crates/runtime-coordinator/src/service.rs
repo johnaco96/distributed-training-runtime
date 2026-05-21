@@ -447,6 +447,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
             accepted_shard_count: registered.accepted_shard_count,
             registered_at: Some(registered.registered_at.into()),
         };
+        self.metrics.inc_datasets_total();
 
         Ok(Response::new(response))
     }
@@ -726,6 +727,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
             })?;
         let created_at = std::time::UNIX_EPOCH
             + std::time::Duration::from_millis(checkpoint.checkpoint.created_at_millis);
+        self.metrics.inc_checkpoint_starts();
 
         Ok(Response::new(BeginCheckpointResponse {
             checkpoint_id: Some(CheckpointId {
@@ -788,6 +790,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 ),
             })?;
         self.metrics.add_storage_bytes_written(reported_size_bytes);
+        self.metrics.inc_checkpoint_artifacts_reported_total();
 
         Ok(Response::new(ReportCheckpointArtifactResponse {
             accepted: true,
@@ -868,6 +871,8 @@ impl CoordinatorService for CoordinatorServiceImpl {
                     )
                 }
             })?;
+
+        self.metrics.inc_latest_checkpoint_reads_total();
 
         let manifest = CheckpointManifest {
             run_id: Some(RunId {
