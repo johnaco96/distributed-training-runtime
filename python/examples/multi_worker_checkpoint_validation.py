@@ -7,6 +7,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+try:
+    import grpc
+except ImportError:  # pragma: no cover - exercised in unit tests with fake clients
+    grpc = None
+
 from dtruntime.client import RuntimeClient
 
 
@@ -119,6 +124,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     commit_error = None
+    commit_rejected = False
     try:
         commit = client.commit_checkpoint(
             run_id=runtime_run_id,
@@ -128,27 +134,20 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         commit_status = int(commit.state)
     except Exception as exc:  # noqa: BLE001
         commit_error = str(exc)
+        commit_rejected = True
         commit_status = None
-    restore = client.restore_latest(runtime_run_id)
-    restore_manifest = restore.manifest
 
-    client.close()
+    restore_latest_not_found = False
+    restore_error = None
+    restore_status = None
+    restore_latest = None
+    incomplete_checkpoint_restorable = None
 
-    return {
-        "requested_run_id": args.run_id,
-        "runtime_run_id": runtime_run_id,
-        "dataset_id": dataset_id,
-        "checkpoint_id": checkpoint_id,
-        "workers": workers,
-        "ranks_shards": assignments,
-        "artifacts": artifacts,
-        "expected_worker_count": len(workers),
-        "reported_artifact_count": len(artifacts),
-        "missing_workers": missing_workers,
-        "commit_status": commit_status,
-        "commit_error": commit_error,
-        "restore_status": int(restore_manifest.state),
-        "restore_latest": {
+    try:
+        restore = client.restore_latest(runtime_run_id)
+        restore_manifest = restore.manifest
+        restore_status = int(restore_manifest.state)
+        restore_latest = {
             "checkpoint_id": restore_manifest.checkpoint_id.value,
             "step": restore_manifest.step,
             "artifact_count": len(restore_manifest.artifacts),
@@ -161,7 +160,54 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                 }
                 for a in restore_manifest.artifacts
             ],
-        },
+        }
+        if report_count < len(workers):
+            incomplete_checkpoint_restorable = restore_manifest.checkpoint_id.value == checkpoint_id
+    except Exception as exc:  # noqa: BLE001
+        if grpc is not None and not isinstance(exc, grpc.RpcError):
+            raise
+        restore_error = exc.details() if hasattr(exc, "details") else str(exc)
+        status_code = exc.code() if hasattr(exc, "code") else None
+        if (
+            report_count < len(workers)
+            and commit_rejected
+            and (
+                (grpc is not None and status_code == grpc.StatusCode.NOT_FOUND)
+                or str(status_code).endswith("NOT_FOUND")
+            )
+        ):
+            restore_latest_not_found = True
+            incomplete_checkpoint_restorable = False
+        else:
+            raise
+
+    client.close()
+
+    if report_count < len(workers):
+        if not commit_rejected:
+            raise RuntimeError("incomplete checkpoint unexpectedly committed")
+        if incomplete_checkpoint_restorable is not False:
+            raise RuntimeError("incomplete checkpoint must not be restorable")
+
+    return {
+        "requested_run_id": args.run_id,
+        "runtime_run_id": runtime_run_id,
+        "dataset_id": dataset_id,
+        "checkpoint_id": checkpoint_id,
+        "workers": workers,
+        "ranks_shards": assignments,
+        "artifacts": artifacts,
+        "expected_worker_count": len(workers),
+        "reported_artifact_count": len(artifacts),
+        "missing_workers": missing_workers,
+        "commit_rejected": commit_rejected,
+        "commit_status": commit_status,
+        "commit_error": commit_error,
+        "restore_status": restore_status,
+        "restore_latest_not_found": restore_latest_not_found,
+        "restore_error": restore_error,
+        "incomplete_checkpoint_restorable": incomplete_checkpoint_restorable,
+        "restore_latest": restore_latest,
     }
 
 

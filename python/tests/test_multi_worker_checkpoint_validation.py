@@ -4,6 +4,8 @@ import importlib.util
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / "examples" / "multi_worker_checkpoint_validation.py"
 spec = importlib.util.spec_from_file_location("multi_worker_checkpoint_validation", MODULE_PATH)
 validation = importlib.util.module_from_spec(spec)
@@ -110,7 +112,20 @@ class IncompleteCommitFakeClient(FakeClient):
         return _Obj(state=4)
 
     def restore_latest(self, run_id: str):
-        return _Obj(manifest=_Obj(state=4, checkpoint_id=_Obj(value="previous-ckpt"), step=3, artifacts=[]))
+        raise _FakeRpcError("StatusCode.NOT_FOUND", "run has no committed checkpoint")
+
+
+class _FakeRpcError(Exception):
+    def __init__(self, code: str, details: str):
+        super().__init__()
+        self._code = code
+        self._details = details
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return self._details
 
 
 def test_multi_worker_incomplete_reports_subset_but_registers_all(monkeypatch, tmp_path: Path):
@@ -133,6 +148,53 @@ def test_multi_worker_incomplete_reports_subset_but_registers_all(monkeypatch, t
     assert result["reported_artifact_count"] == 3
     assert result["missing_workers"] == ["worker-3"]
     assert len(result["ranks_shards"]) == 4
+    assert result["commit_rejected"] is True
     assert result["commit_status"] is None
     assert "incomplete" in (result["commit_error"] or "").lower()
-    assert result["restore_latest"]["checkpoint_id"] != result["checkpoint_id"]
+    assert result["restore_latest_not_found"] is True
+    assert "no committed checkpoint" in (result["restore_error"] or "").lower()
+    assert result["incomplete_checkpoint_restorable"] is False
+    assert result["restore_latest"] is None
+
+
+class WorkerNotFoundArtifactClient(IncompleteCommitFakeClient):
+    def report_checkpoint_artifact(self, **kwargs):
+        raise RuntimeError("worker not found during artifact report")
+
+
+def test_multi_worker_incomplete_worker_not_found_is_failure(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(validation, "RuntimeClient", WorkerNotFoundArtifactClient)
+    args = Namespace(
+        coordinator_addr="127.0.0.1:50051",
+        run_id="integration-run",
+        checkpoint_id="global-ckpt-incomplete",
+        world_size=4,
+        shard_count=4,
+        step=4,
+        report_count=3,
+        output_dir=str(tmp_path),
+        json_out=str(tmp_path / "result.json"),
+    )
+    with pytest.raises(RuntimeError, match="worker not found"):
+        validation.run_validation(args)
+
+
+class RestoreNotFoundWithoutCommitRejectClient(FakeClient):
+    def restore_latest(self, run_id: str):
+        raise _FakeRpcError("StatusCode.NOT_FOUND", "run has no committed checkpoint")
+
+
+def test_restore_not_found_without_commit_rejection_is_failure(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(validation, "RuntimeClient", RestoreNotFoundWithoutCommitRejectClient)
+    args = Namespace(
+        coordinator_addr="127.0.0.1:50051",
+        run_id="integration-run",
+        checkpoint_id="global-ckpt",
+        world_size=4,
+        shard_count=4,
+        step=4,
+        output_dir=str(tmp_path),
+        json_out=str(tmp_path / "result.json"),
+    )
+    with pytest.raises(_FakeRpcError):
+        validation.run_validation(args)
