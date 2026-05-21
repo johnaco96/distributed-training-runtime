@@ -202,6 +202,10 @@ CREATE TABLE IF NOT EXISTS latest_checkpoints (
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let expected_worker_ids = artifacts
+            .iter()
+            .map(|artifact| artifact.worker_id.0.clone())
+            .collect::<Vec<_>>();
         Ok(Some(CoordinatorCheckpointRecord {
             checkpoint: CheckpointRecord {
                 run_id: DomainRunId(run_id.to_string()),
@@ -214,6 +218,8 @@ CREATE TABLE IF NOT EXISTS latest_checkpoints (
             },
             initiated_by_worker_id: initiator,
             committed_at_millis: Some(committed_at as u64),
+            expected_artifact_count: expected_worker_ids.len() as u32,
+            expected_worker_ids,
         }))
     }
 
@@ -345,6 +351,8 @@ mod tests {
             ),
             initiated_by_worker_id: "worker-0".to_string(),
             committed_at_millis: None,
+            expected_worker_ids: vec!["worker-0".to_string(), "worker-1".to_string()],
+            expected_artifact_count: 2,
         };
         store
             .save_checkpoint("run-1", "begin-a", &checkpoint)
@@ -405,6 +413,8 @@ mod tests {
             ),
             initiated_by_worker_id: "worker-0".to_string(),
             committed_at_millis: None,
+            expected_worker_ids: vec!["worker-0".to_string()],
+            expected_artifact_count: 1,
         };
         store
             .save_checkpoint("run-1", "idem-a", &committed)
@@ -422,6 +432,8 @@ mod tests {
             ),
             initiated_by_worker_id: "worker-1".to_string(),
             committed_at_millis: None,
+            expected_worker_ids: vec!["worker-1".to_string()],
+            expected_artifact_count: 1,
         };
         store.save_checkpoint("run-1", "idem-b", &partial).unwrap();
         store
