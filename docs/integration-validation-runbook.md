@@ -60,6 +60,14 @@ Then rerun:
 scripts/run_integration_validation.sh
 ```
 
+If MinIO env vars are set but `boto3` is missing, the script fails intentionally. Install MinIO validation deps with:
+
+```bash
+python -m pip install boto3
+# or from project extras:
+python -m pip install '.[dev,minio]'
+```
+
 ## 6) Artifacts produced
 
 The script writes results under:

@@ -18,6 +18,9 @@ dev = [
     "grpcio-tools",
     "pytest",
 ]
+minio = [
+    "boto3",
+]
 
 [tool.setuptools.packages.find]
 where = ["python"]
