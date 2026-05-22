@@ -5,6 +5,7 @@ from argparse import Namespace
 from pathlib import Path
 
 import pytest
+import grpc
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "examples" / "multi_worker_checkpoint_validation.py"
 spec = importlib.util.spec_from_file_location("multi_worker_checkpoint_validation", MODULE_PATH)
@@ -115,7 +116,7 @@ class IncompleteCommitFakeClient(FakeClient):
         raise _FakeRpcError("StatusCode.NOT_FOUND", "run has no committed checkpoint")
 
 
-class _FakeRpcError(Exception):
+class _FakeRpcError(grpc.RpcError):
     def __init__(self, code: str, details: str):
         super().__init__()
         self._code = code

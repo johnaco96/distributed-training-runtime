@@ -178,6 +178,15 @@ payload = {
 Path(sys.argv[1]).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
   curl -fsS "$METRICS_ADDR/metrics" > "$out/coordinator-metrics-after.prom"
+  python - <<'PY'
+try:
+    import boto3  # noqa: F401
+except ModuleNotFoundError as exc:
+    raise SystemExit(
+        "minio validation requires boto3. Install it with: "
+        "python -m pip install boto3 (or pip install .[dev,minio])"
+    ) from exc
+PY
   python - <<'PY' "$out/object-list.txt" "$object_prefix"
 import boto3, os
 import sys
