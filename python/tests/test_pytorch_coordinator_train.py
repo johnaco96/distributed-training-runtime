@@ -58,7 +58,9 @@ def test_smoke_with_checkpoint(tmp_path: Path) -> None:
     assert metrics["final_epoch"] == 1
     assert metrics["worker_metrics"]
     assert metrics["shard_assignments"]
-    assert (out_dir / "checkpoints" / "latest.json").exists()
+    latest = json.loads((out_dir / "checkpoints" / "latest.json").read_text(encoding="utf-8"))
+    assert len(latest["checkpoint_paths"]) == 2
+    assert metrics["latest_checkpoint_metadata"]["artifact_count"] == 2
 
 
 @requires_deps
