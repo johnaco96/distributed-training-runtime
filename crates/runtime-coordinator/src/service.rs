@@ -2483,9 +2483,12 @@ mod tests {
                 "artifact-key-2",
             )))
             .await
-            .unwrap();
-        assert!(third.get_ref().accepted);
-        assert_eq!(service.metrics_snapshot().storage_bytes_written, 30);
+            .unwrap_err();
+        assert_eq!(third.code(), tonic::Code::InvalidArgument);
+        assert!(third
+            .message()
+            .contains("worker already reported conflicting artifact metadata"));
+        assert_eq!(service.metrics_snapshot().storage_bytes_written, 10);
     }
 
     #[tokio::test]
