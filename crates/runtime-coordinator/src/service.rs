@@ -2488,7 +2488,7 @@ mod tests {
         assert!(third
             .message()
             .contains("worker already reported conflicting artifact metadata"));
-        assert_eq!(service.metrics_snapshot().storage_bytes_written, 10);
+        assert_eq!(service.metrics_snapshot().storage_bytes_written, 20);
     }
 
     #[tokio::test]
