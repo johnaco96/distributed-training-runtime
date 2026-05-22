@@ -250,6 +250,12 @@ def _worker_main(
         )
 
     except Exception as exc:
+        # Abort barriers so sibling workers don't hang waiting for this worker.
+        for barrier in (artifact_done_barrier, commit_done_barrier):
+            try:
+                barrier.abort()
+            except Exception:
+                pass
         result_queue.put(
             WorkerResult(
                 worker_id=f"worker-{rank}",

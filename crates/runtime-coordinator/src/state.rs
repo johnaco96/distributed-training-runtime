@@ -396,7 +396,10 @@ impl CoordinatorState {
             .get(&run_id)
             .and_then(|records| records.get(&checkpoint_id))
         {
-            if existing.initiated_by_worker_id == worker_id && existing.checkpoint.step == step {
+            // Any worker may join an in-progress checkpoint for the same step.
+            // This is the normal distributed case: N workers all call begin_checkpoint
+            // with the same checkpoint_id before streaming their artifacts.
+            if existing.checkpoint.step == step {
                 return Ok(existing.clone());
             }
             return Err(BeginCheckpointError::CheckpointConflict);
