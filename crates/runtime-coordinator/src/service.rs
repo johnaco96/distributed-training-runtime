@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use runtime_storage::{S3Storage, S3StorageConfig, StorageBackend};
 use runtime_proto::protocol_version;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
@@ -20,13 +21,15 @@ use crate::state::{
 };
 use crate::{RuntimeMetrics, RuntimeMetricsSnapshot};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CoordinatorServiceImpl {
     state: Arc<CoordinatorState>,
     metrics: Arc<RuntimeMetrics>,
     authorizer: Authorizer,
     audit: AuditLogger,
     storage_root: Option<Arc<PathBuf>>,
+    s3_backend: Option<Arc<dyn StorageBackend + Send + Sync>>,
+    s3_bucket: Option<String>,
 }
 
 impl CoordinatorServiceImpl {
@@ -69,12 +72,22 @@ impl CoordinatorServiceImpl {
             authorizer,
             audit,
             storage_root: None,
+            s3_backend: None,
+            s3_bucket: None,
         }
     }
 
     pub fn with_storage_root(mut self, root: PathBuf) -> Self {
         self.storage_root = Some(Arc::new(root));
         self
+    }
+
+    pub fn with_s3_backend(mut self, config: S3StorageConfig) -> Result<Self, String> {
+        let bucket = config.bucket.clone();
+        let backend = S3Storage::new(config).map_err(|e| format!("S3 backend init failed: {e}"))?;
+        self.s3_backend = Some(Arc::new(backend));
+        self.s3_bucket = Some(bucket);
+        Ok(self)
     }
 
     pub fn metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
@@ -825,6 +838,13 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let mut hasher = Sha256::new();
         let mut bytes_received: i64 = 0;
         let mut expected_seq: u64 = 0;
+        // Buffer bytes for S3 upload when backend is configured.
+        let upload_to_s3 = self.s3_backend.is_some();
+        let mut s3_buf: Vec<u8> = if upload_to_s3 {
+            Vec::with_capacity(meta.total_size_bytes.max(0) as usize)
+        } else {
+            Vec::new()
+        };
 
         // Consume chunk messages, writing each to disk as it arrives.
         while let Some(msg) = stream.message().await? {
@@ -840,6 +860,9 @@ impl CoordinatorService for CoordinatorServiceImpl {
                         Status::internal(format!("write failed at seq {}: {e}", chunk.sequence))
                     })?;
                     hasher.update(&chunk.data);
+                    if upload_to_s3 {
+                        s3_buf.extend_from_slice(&chunk.data);
+                    }
                     bytes_received += chunk.data.len() as i64;
                     expected_seq += 1;
                 }
@@ -860,7 +883,28 @@ impl CoordinatorService for CoordinatorServiceImpl {
         drop(file);
 
         let checksum = hex::encode(hasher.finalize());
-        let artifact_uri = artifact_key.as_str().to_string();
+
+        // Upload to S3 when backend is configured. The local file is written first
+        // for immediate coordinator-side availability; S3 provides durable object storage.
+        let artifact_uri = if let (Some(s3), Some(bucket)) = (&self.s3_backend, &self.s3_bucket) {
+            let s3 = Arc::clone(s3);
+            let key = artifact_key.clone();
+            tokio::task::spawn_blocking(move || s3.put(&key, &s3_buf))
+                .await
+                .map_err(|e| Status::internal(format!("S3 upload task panicked: {e}")))?
+                .map_err(|e| Status::internal(format!("S3 upload failed: {e}")))?;
+            info!(
+                run_id = %run_id,
+                worker_id = %worker_id,
+                checkpoint_id = %checkpoint_id,
+                bucket = %bucket,
+                key = %artifact_key.as_str(),
+                "stream_checkpoint_artifact: artifact uploaded to S3"
+            );
+            format!("s3://{}/{}", bucket, artifact_key.as_str())
+        } else {
+            artifact_key.as_str().to_string()
+        };
         let size_bytes = bytes_received.max(0) as u64;
 
         // Record the artifact in coordinator state — same path as ReportCheckpointArtifact

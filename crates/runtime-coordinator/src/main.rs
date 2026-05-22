@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 use runtime_coordinator::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome};
 use runtime_coordinator::auth::{AuthMode, Authorizer};
+use runtime_storage::S3StorageConfig;
 use runtime_coordinator::ha_lock::CoordinatorLockGuard;
 use runtime_coordinator::init_tracing_from_env;
 use runtime_coordinator::persistence::SqliteMetadataStore;
@@ -34,6 +35,11 @@ struct CoordinatorCliArgs {
     auth_mode: AuthMode,
     status_addr: Option<String>,
     metrics_addr: Option<String>,
+    s3_endpoint: Option<String>,
+    s3_bucket: Option<String>,
+    s3_access_key: Option<String>,
+    s3_secret_key: Option<String>,
+    s3_region: String,
     show_help: bool,
 }
 
@@ -76,6 +82,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(storage_root = %root.display(), "runtime-coordinator storage root configured");
         std::fs::create_dir_all(&root)?;
         service = service.with_storage_root(root);
+    }
+    if let (Some(bucket), Some(access_key), Some(secret_key)) =
+        (&args.s3_bucket, &args.s3_access_key, &args.s3_secret_key)
+    {
+        let s3_cfg = S3StorageConfig {
+            endpoint_url: args.s3_endpoint.clone(),
+            region: args.s3_region.clone(),
+            bucket: bucket.clone(),
+            access_key_id: access_key.clone(),
+            secret_access_key: secret_key.clone(),
+            force_path_style: args.s3_endpoint.is_some(),
+            key_prefix: None,
+        };
+        service = service
+            .with_s3_backend(s3_cfg)
+            .map_err(|e| format!("failed to initialise S3 backend: {e}"))?;
+        info!(bucket = %bucket, "runtime-coordinator S3 backend configured");
     }
     let metrics_service = service.clone();
     let coordinator_ready = Arc::new(AtomicBool::new(false));
@@ -202,18 +225,23 @@ fn load_tls_config(
 }
 
 fn print_usage() {
-    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--help|-h]");
+    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--help|-h]");
     println!("\nOptions:");
     println!("  --addr <ADDR>           Coordinator listen address (default: {DEFAULT_ADDR})");
     println!("  --metadata-db <PATH>    Enable SQLite metadata persistence at PATH");
-    println!("  --storage-root <PATH>   Enable coordinator-managed artifact storage at PATH (required for StreamCheckpointArtifact RPC)");
+    println!("  --storage-root <PATH>   Local staging area for StreamCheckpointArtifact (required)");
     println!("  --auth-mode <MODE>      Authorization mode: disabled|metadata (env: DTRUNTIME_AUTH_MODE)");
     println!("  --tls-cert <PATH>       Enable TLS with certificate chain PEM at PATH (requires --tls-key)");
     println!(
         "  --tls-key <PATH>        Enable TLS with private key PEM at PATH (requires --tls-cert)"
     );
     println!("  --tls-client-ca <PATH>  Require mTLS client certs signed by CA PEM at PATH");
-    println!("  --metrics-addr <ADDR>    Enable Prometheus /metrics endpoint at ADDR");
+    println!("  --metrics-addr <ADDR>   Enable Prometheus /metrics endpoint at ADDR");
+    println!("  --s3-endpoint <URL>     S3/MinIO endpoint URL (env: DTRUNTIME_S3_ENDPOINT)");
+    println!("  --s3-bucket <NAME>      S3 bucket for checkpoint artifact upload (env: DTRUNTIME_S3_BUCKET)");
+    println!("  --s3-access-key <KEY>   S3 access key ID (env: DTRUNTIME_S3_ACCESS_KEY)");
+    println!("  --s3-secret-key <SECRET> S3 secret access key (env: DTRUNTIME_S3_SECRET_KEY)");
+    println!("  --s3-region <REGION>    S3 region (default: us-east-1, env: DTRUNTIME_S3_REGION)");
     println!("  --help, -h              Show this help message");
 }
 
@@ -236,6 +264,12 @@ fn coordinator_args(
             .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
         status_addr: None,
         metrics_addr: None,
+        s3_endpoint: std::env::var("DTRUNTIME_S3_ENDPOINT").ok(),
+        s3_bucket: std::env::var("DTRUNTIME_S3_BUCKET").ok(),
+        s3_access_key: std::env::var("DTRUNTIME_S3_ACCESS_KEY").ok(),
+        s3_secret_key: std::env::var("DTRUNTIME_S3_SECRET_KEY").ok(),
+        s3_region: std::env::var("DTRUNTIME_S3_REGION")
+            .unwrap_or_else(|_| "us-east-1".to_string()),
         show_help: false,
     };
 
@@ -270,6 +304,16 @@ fn coordinator_args(
             parsed.status_addr = Some(args.next().ok_or("--status-addr requires an address")?);
         } else if arg == "--metrics-addr" {
             parsed.metrics_addr = Some(args.next().ok_or("--metrics-addr requires an address")?);
+        } else if arg == "--s3-endpoint" {
+            parsed.s3_endpoint = Some(args.next().ok_or("--s3-endpoint requires a URL")?);
+        } else if arg == "--s3-bucket" {
+            parsed.s3_bucket = Some(args.next().ok_or("--s3-bucket requires a name")?);
+        } else if arg == "--s3-access-key" {
+            parsed.s3_access_key = Some(args.next().ok_or("--s3-access-key requires a value")?);
+        } else if arg == "--s3-secret-key" {
+            parsed.s3_secret_key = Some(args.next().ok_or("--s3-secret-key requires a value")?);
+        } else if arg == "--s3-region" {
+            parsed.s3_region = args.next().ok_or("--s3-region requires a value")?;
         } else if arg == "--help" || arg == "-h" {
             parsed.show_help = true;
         } else {
@@ -304,6 +348,12 @@ mod tests {
                 status_addr: None,
                 metrics_addr: None,
                 storage_root: None,
+                s3_endpoint: std::env::var("DTRUNTIME_S3_ENDPOINT").ok(),
+                s3_bucket: std::env::var("DTRUNTIME_S3_BUCKET").ok(),
+                s3_access_key: std::env::var("DTRUNTIME_S3_ACCESS_KEY").ok(),
+                s3_secret_key: std::env::var("DTRUNTIME_S3_SECRET_KEY").ok(),
+                s3_region: std::env::var("DTRUNTIME_S3_REGION")
+                    .unwrap_or_else(|_| "us-east-1".to_string()),
                 show_help: false,
             }
         );

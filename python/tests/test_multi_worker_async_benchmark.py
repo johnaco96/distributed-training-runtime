@@ -44,6 +44,23 @@ def test_parse_args_defaults(bench):
     assert args.checkpoint_every_steps == 10
     assert args.checkpoint_bytes == 16 * 1024 * 1024
     assert args.coordinator_addr == "127.0.0.1:50051"
+    assert args.backend == "localfs"
+    assert args.chaos_rank == -1
+    assert args.chaos_at_step is None
+
+
+def test_parse_args_chaos_and_backend_flags(bench):
+    with patch("sys.argv", ["prog", "--backend", "s3", "--chaos-rank", "2", "--chaos-at-step", "20"]):
+        args = bench.parse_args()
+    assert args.backend == "s3"
+    assert args.chaos_rank == 2
+    assert args.chaos_at_step == 20
+
+
+def test_parse_args_backend_invalid(bench):
+    with patch("sys.argv", ["prog", "--backend", "nfs"]):
+        with pytest.raises(SystemExit):
+            bench.parse_args()
 
 
 def test_worker_result_dataclass(bench):
@@ -111,15 +128,33 @@ def test_module_uses_stream_checkpoint_artifact():
 
 def test_module_uses_multiprocessing_barrier():
     src = MODULE.read_text(encoding="utf-8")
-    assert "multiprocessing.Barrier" in src, (
-        "benchmark must use a Barrier for cross-worker commit coordination"
+    assert src.count("multiprocessing.Barrier") >= 2, (
+        "benchmark must use two Barriers: artifact_done_barrier and commit_done_barrier"
     )
+    assert "artifact_done_barrier" in src
+    assert "commit_done_barrier" in src
 
 
 def test_module_rank_zero_commits():
     src = MODULE.read_text(encoding="utf-8")
     assert "rank == 0" in src and "commit_checkpoint" in src, (
         "rank 0 must be the one calling commit_checkpoint"
+    )
+
+
+def test_module_chaos_injection_present():
+    src = MODULE.read_text(encoding="utf-8")
+    assert "chaos_rank" in src, "chaos_rank injection must be present in source"
+    assert "chaos_at_step" in src, "chaos_at_step injection must be present in source"
+    assert "barrier.abort()" in src, (
+        "barriers must be aborted on worker exception to prevent sibling hangs"
+    )
+
+
+def test_module_last_runtime_run_id_assigned():
+    src = MODULE.read_text(encoding="utf-8")
+    assert "_last_runtime_run_id = runtime_run_id" in src, (
+        "_last_runtime_run_id must be set inside run_benchmark so recovery can query the right run"
     )
 
 
