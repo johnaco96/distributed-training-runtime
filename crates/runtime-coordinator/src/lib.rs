@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+// tonic::Status is large by design; boxing it throughout the gRPC service layer
+// would add noise without benefit since Status is always the Err path, not the hot path.
+#![allow(clippy::result_large_err)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

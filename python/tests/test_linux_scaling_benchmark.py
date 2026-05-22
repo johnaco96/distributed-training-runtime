@@ -30,7 +30,7 @@ def test_summary_schema_and_comparison_csv(tmp_path: Path) -> None:
 
 def test_report_has_required_sections(tmp_path: Path) -> None:
     out_dir = tmp_path / "out2"
-    cmd = [sys.executable, str(MODULE), "--workers", "1", "--samples", "10", "--output-dir", str(out_dir)]
+    cmd = [sys.executable, str(MODULE), "--workers", "1", "--samples", "10", "--output-dir", str(out_dir), "--allow-invalid"]
     r = subprocess.run(cmd, env={**os.environ, "PYTHONPATH": "python"}, capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stderr
     report = (out_dir / "report.md").read_text(encoding="utf-8")

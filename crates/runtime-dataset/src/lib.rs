@@ -80,7 +80,7 @@ pub fn prefetch_dataset_shards_with_summary<B: StorageBackend + Sync>(
 ) -> Result<DatasetPrefetchBatchResult, StorageError> {
     policy.validate()?;
     let started = Instant::now();
-    let max = policy.max_concurrent_operations as usize;
+    let max = policy.max_concurrent_operations;
 
     let mut results = Vec::with_capacity(items.len());
     for chunk in items.chunks(max) {

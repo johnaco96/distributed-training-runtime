@@ -397,6 +397,7 @@ impl<B: StorageBackend> CheckpointStore<B> {
         Self { storage }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn write_artifact(
         &self,
         record: &mut CheckpointRecord,
