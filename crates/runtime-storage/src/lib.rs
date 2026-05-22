@@ -228,11 +228,15 @@ pub trait StorageBackend {
     fn delete(&self, key: &StorageKey) -> Result<(), StorageError>;
 }
 
+pub type PutManyResult = Result<Vec<(StorageKey, Result<(), StorageError>)>, StorageError>;
+pub type GetManyResult = Result<Vec<(StorageKey, Result<Vec<u8>, StorageError>)>, StorageError>;
+pub type ExistsManyResult = Result<Vec<(StorageKey, Result<bool, StorageError>)>, StorageError>;
+
 pub fn put_many<B>(
     backend: &B,
     items: Vec<(StorageKey, Vec<u8>)>,
     policy: StorageOperationPolicy,
-) -> Result<Vec<(StorageKey, Result<(), StorageError>)>, StorageError>
+) -> PutManyResult
 where
     B: StorageBackend + Sync,
 {
@@ -268,7 +272,7 @@ pub fn get_many<B>(
     backend: &B,
     keys: Vec<StorageKey>,
     policy: StorageOperationPolicy,
-) -> Result<Vec<(StorageKey, Result<Vec<u8>, StorageError>)>, StorageError>
+) -> GetManyResult
 where
     B: StorageBackend + Sync,
 {
@@ -299,7 +303,7 @@ pub fn exists_many<B>(
     backend: &B,
     keys: Vec<StorageKey>,
     policy: StorageOperationPolicy,
-) -> Result<Vec<(StorageKey, Result<bool, StorageError>)>, StorageError>
+) -> ExistsManyResult
 where
     B: StorageBackend + Sync,
 {

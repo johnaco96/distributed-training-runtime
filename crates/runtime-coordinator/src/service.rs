@@ -297,7 +297,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.require_admin(&request, "admin_request")?;
         let version = protocol_version();
         let capabilities = RuntimeCapabilities {
-            protocol_version: Some(version.clone()),
+            protocol_version: Some(version),
             features: RUNTIME_CAPABILITIES
                 .iter()
                 .map(|feature| (*feature).to_string())

@@ -57,6 +57,8 @@ def test_summary_schema_generation(tmp_path: Path) -> None:
         shard_count=1,
         backend="localfs",
         mode="baseline-blocking",
+        requested_run_id="test-run",
+        runtime_run_id=None,
     )
     p = tmp_path / "summary.json"
     p.write_text(json.dumps(result.__dict__))
@@ -109,7 +111,7 @@ def test_dtruntime_managed_uses_runtime_client_path(tmp_path: Path, monkeypatch:
 
     class FakeClient:
         def __init__(self, address: str) -> None:
-            assert address == "http://127.0.0.1:50051"
+            assert address == "127.0.0.1:50051"
             self._runtime_pb2 = SimpleNamespace(
                 ASSIGNMENT_POLICY_STATIC_RANK=1,
                 STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM=1,

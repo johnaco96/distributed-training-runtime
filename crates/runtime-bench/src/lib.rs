@@ -63,6 +63,7 @@ pub struct BenchmarkSummary {
 }
 
 impl BenchmarkSummary {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_samples(
         benchmark: impl Into<String>,
         environment: impl Into<String>,
@@ -870,6 +871,7 @@ fn resolve_logical_workers_coordinator_mode(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_logical_workers(
     target: Option<String>,
     workers: usize,
@@ -901,6 +903,7 @@ pub fn run_logical_workers(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_logical_workers_async(
     target: Option<String>,
     workers: usize,
@@ -1077,7 +1080,7 @@ async fn run_logical_workers_async(
                 retry_count: 0,
             });
         }
-        if checkpoint_every_secs > 0 && start.elapsed().as_secs() % checkpoint_every_secs == 0 {
+        if checkpoint_every_secs > 0 && start.elapsed().as_secs().is_multiple_of(checkpoint_every_secs) {
             checkpoint_seq += 1;
             let ckid = runtime_proto::runtime::v1::CheckpointId {
                 value: format!("ckpt-{checkpoint_seq}"),

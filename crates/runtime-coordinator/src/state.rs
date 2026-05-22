@@ -1072,6 +1072,7 @@ impl CoordinatorState {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn report_shard_progress(
         &self,
         run_id: &RunId,

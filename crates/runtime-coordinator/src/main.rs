@@ -445,19 +445,12 @@ fn serve_status_endpoint(
         };
         let header = if is_get_status {
             format!(
-                "HTTP/1.1 200 OK
-content-type: application/json
-content-length: {}
-
-",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len()
             )
         } else {
             format!(
-                "HTTP/1.1 405 Method Not Allowed
-content-length: {}
-
-",
+                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response.len()
             )
         };
@@ -532,7 +525,7 @@ fn build_metrics_http_response(
 
     format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     )
 }
 
