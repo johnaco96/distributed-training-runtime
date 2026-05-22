@@ -78,6 +78,9 @@ class BenchmarkSummary:
     checkpoints_committed: int
 
 
+_last_runtime_run_id: str = ""
+
+
 def percentile(values: list[float], q: float) -> float:
     if not values:
         return 0.0
@@ -173,6 +176,15 @@ def _worker_main(
 
             if step % args.checkpoint_every_steps == 0:
                 checkpoint_id = f"ckpt-{run_id}-step-{step}"
+
+                # Chaos injection: simulate a worker crash before streaming.
+                chaos_rank = getattr(args, "chaos_rank", -1)
+                chaos_step = getattr(args, "chaos_at_step", args.checkpoint_every_steps * 2)
+                if rank == chaos_rank and step == chaos_step:
+                    raise RuntimeError(
+                        f"worker-{rank}: injected chaos failure at step {step} — "
+                        "simulating node crash before artifact stream"
+                    )
 
                 # All workers call begin_checkpoint (idempotent on same checkpoint_id).
                 begin = client.begin_checkpoint(
@@ -277,6 +289,7 @@ def _worker_main(
 
 
 def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
+    global _last_runtime_run_id
     coordinator_addr = os.getenv("DTRUNTIME_COORDINATOR_ADDR", args.coordinator_addr)
 
     # Rank 0 registers the run — all workers share this run_id.
@@ -289,6 +302,7 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
         idempotency_key=f"mw-register-run-{args.run_id}",
     )
     runtime_run_id = run_response.run_id.value
+    _last_runtime_run_id = runtime_run_id
     admin_client.close()
 
     result_queue: multiprocessing.Queue = multiprocessing.Queue()
@@ -378,15 +392,60 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--coordinator-addr", default="127.0.0.1:50051")
     p.add_argument("--output-dir", default=".dtruntime-results/async-bench")
     p.add_argument("--json-out", default=None)
+    p.add_argument(
+        "--backend",
+        choices=["localfs", "s3"],
+        default="localfs",
+        help="Storage backend the coordinator is configured to use (for reporting only)",
+    )
+    p.add_argument(
+        "--chaos-rank",
+        type=int,
+        default=-1,
+        metavar="N",
+        help="Inject a crash in worker rank N to demonstrate failure handling (default: disabled)",
+    )
+    p.add_argument(
+        "--chaos-at-step",
+        type=int,
+        default=None,
+        metavar="STEP",
+        help="Step at which the chaos worker crashes (default: second checkpoint step)",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.chaos_at_step is None:
+        args.chaos_at_step = args.checkpoint_every_steps * 2
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    summary = run_benchmark(args)
+    coordinator_addr = os.getenv("DTRUNTIME_COORDINATOR_ADDR", args.coordinator_addr)
+
+    try:
+        summary = run_benchmark(args)
+    except RuntimeError as exc:
+        print(f"\n[FAILURE] Benchmark failed: {exc}")
+        # Show that the coordinator still holds the last committed checkpoint.
+        print("[RECOVERY] Querying coordinator for last committed checkpoint...")
+        try:
+            from dtruntime.client import RuntimeClient
+            client = RuntimeClient(coordinator_addr)
+            resp = client.restore_latest(run_id=_last_runtime_run_id or "")
+            client.close()
+            latest = {
+                "checkpoint_id": resp.checkpoint_id.value if resp.checkpoint_id else None,
+                "step": resp.step,
+                "artifact_count": len(resp.artifacts),
+            }
+            print(f"[RECOVERY] Last committed checkpoint: {json.dumps(latest, indent=2)}")
+        except Exception as e:
+            print(f"[RECOVERY] Could not query coordinator: {e}")
+        raise
+
     payload = asdict(summary)
+    payload["backend"] = args.backend
     out = json.dumps(payload, indent=2)
     print(out)
 

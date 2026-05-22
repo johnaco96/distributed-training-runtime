@@ -452,6 +452,8 @@ pub fn latest_pointer(run_id: &str) -> StorageKey {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(feature = "s3")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
