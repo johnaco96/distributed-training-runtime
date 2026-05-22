@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ def _load_module():
     spec = importlib.util.spec_from_file_location("pytorch_e2e_training_benchmark", module_path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 

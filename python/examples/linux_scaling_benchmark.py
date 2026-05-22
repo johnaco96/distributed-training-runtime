@@ -184,6 +184,14 @@ def _git_commit() -> str:
         return "unknown"
 
 
+
+
+def _git_branch() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
+
 def detect_tools() -> dict[str, bool]:
     names = ["perf", "pidstat", "mpstat", "iostat", "sar", "ss", "free", "df", "uname", "lscpu", "ps", "top", "py-spy"]
     return {name: shutil.which(name) is not None for name in names}
@@ -195,6 +203,7 @@ def build_summary(worker_results: list[RunResult], args: argparse.Namespace, too
         "benchmark_name": "linux-scaling-checkpoint-suite",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),
+        "git_branch": _git_branch(),
         "benchmark_parameters": vars(args),
         "measured_duration": all(r.measured_duration for r in worker_results),
         "coordinator_attached": any(r.coordinator_attached for r in worker_results),

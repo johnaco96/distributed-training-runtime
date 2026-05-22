@@ -204,7 +204,10 @@ def main() -> None:
 
     if args.resume and latest_local.exists():
         latest = json.loads(latest_local.read_text(encoding="utf-8"))
-        ckpt_path = checkpoints_dir / latest["checkpoint_path"]
+        checkpoint_paths = latest.get("checkpoint_paths") or ([latest["checkpoint_path"]] if "checkpoint_path" in latest else [])
+        if not checkpoint_paths:
+            raise RuntimeError("latest checkpoint metadata did not include checkpoint path")
+        ckpt_path = checkpoints_dir / checkpoint_paths[0]
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -293,7 +296,6 @@ def main() -> None:
                 scheduler.step()
 
                 if not args.no_checkpoint and (epoch % args.checkpoint_every == 0):
-                    ckpt_file = checkpoints_dir / f"epoch-{epoch:04d}.pt"
                     state = {
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -306,20 +308,25 @@ def main() -> None:
                         "final_loss": final_loss,
                         "final_accuracy": final_accuracy,
                     }
-                    torch.save(state, ckpt_file)
-                    begin = worker_clients[worker_ids[0]].begin_checkpoint(run_id=run_id, worker_id=worker_ids[0], step=global_step, idempotency_key=f"pt-begin-ckpt-{epoch}-{idempotency_suffix}")
+                    begin = admin_client.begin_checkpoint(run_id=run_id, worker_id=worker_ids[0], step=global_step, idempotency_key=f"pt-begin-ckpt-{epoch}-{idempotency_suffix}")
                     checkpoint_id = begin.checkpoint_id.value
-                    worker_clients[worker_ids[0]].report_checkpoint_artifact(
-                        run_id=run_id,
-                        worker_id=worker_ids[0],
-                        checkpoint_id=checkpoint_id,
-                        artifact_name=ckpt_file.name,
-                        artifact_uri=str(ckpt_file.resolve()),
-                        size_bytes=ckpt_file.stat().st_size,
-                        checksum=sha256_file(ckpt_file),
-                        checksum_algorithm="sha256",
-                        idempotency_key=f"pt-report-ckpt-{epoch}-{idempotency_suffix}",
-                    )
+                    worker_checkpoint_files: list[str] = []
+                    for worker_id in worker_ids:
+                        worker_ckpt_file = checkpoints_dir / f"epoch-{epoch:04d}-{worker_id}.pt"
+                        worker_state = {**state, "worker_id": worker_id}
+                        torch.save(worker_state, worker_ckpt_file)
+                        worker_clients[worker_id].report_checkpoint_artifact(
+                            run_id=run_id,
+                            worker_id=worker_id,
+                            checkpoint_id=checkpoint_id,
+                            artifact_name=worker_ckpt_file.name,
+                            artifact_uri=str(worker_ckpt_file.resolve()),
+                            size_bytes=worker_ckpt_file.stat().st_size,
+                            checksum=sha256_file(worker_ckpt_file),
+                            checksum_algorithm="sha256",
+                            idempotency_key=f"pt-report-ckpt-{epoch}-{worker_id}-{idempotency_suffix}",
+                        )
+                        worker_checkpoint_files.append(worker_ckpt_file.name)
                     admin_client.commit_checkpoint(run_id=run_id, checkpoint_id=checkpoint_id, idempotency_key=f"pt-commit-ckpt-{epoch}-{idempotency_suffix}")
                     rpc_summary["checkpoints_committed"] += 1
                     latest = admin_client.restore_latest(run_id=run_id)
@@ -332,7 +339,7 @@ def main() -> None:
                     latest_local.write_text(
                         json.dumps(
                             {
-                                "checkpoint_path": ckpt_file.name,
+                                "checkpoint_paths": worker_checkpoint_files,
                                 "epoch": epoch,
                                 "global_step": global_step,
                                 "checkpoint_id": latest.manifest.checkpoint_id.value or checkpoint_id,
@@ -342,7 +349,7 @@ def main() -> None:
                         ),
                         encoding="utf-8",
                     )
-                    checkpoint_path = str(ckpt_file)
+                    checkpoint_path = str((checkpoints_dir / worker_checkpoint_files[0])) if worker_checkpoint_files else None
                     restored_checkpoint_id = latest.manifest.checkpoint_id.value or checkpoint_id
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
