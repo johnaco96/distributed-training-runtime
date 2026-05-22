@@ -663,6 +663,7 @@ mod tests {
         assert_eq!(s.benchmark, "worker-rpc");
     }
 
+    #[test]
     fn logical_workers_with_target_and_no_start_coordinator_uses_external_mode() {
         let mode =
             resolve_logical_workers_coordinator_mode(Some("http://127.0.0.1:50051".into()), false)

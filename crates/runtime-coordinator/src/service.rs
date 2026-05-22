@@ -1,11 +1,14 @@
 #![forbid(unsafe_code)]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use runtime_proto::protocol_version;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
-use tonic::{Request, Response, Status};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
+use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 
 use crate::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome};
@@ -23,6 +26,7 @@ pub struct CoordinatorServiceImpl {
     metrics: Arc<RuntimeMetrics>,
     authorizer: Authorizer,
     audit: AuditLogger,
+    storage_root: Option<Arc<PathBuf>>,
 }
 
 impl CoordinatorServiceImpl {
@@ -64,7 +68,13 @@ impl CoordinatorServiceImpl {
             metrics,
             authorizer,
             audit,
+            storage_root: None,
         }
+    }
+
+    pub fn with_storage_root(mut self, root: PathBuf) -> Self {
+        self.storage_root = Some(Arc::new(root));
+        self
     }
 
     pub fn metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
@@ -271,12 +281,13 @@ fn already_exists(message: impl Into<String>) -> Status {
 }
 
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
-const RUNTIME_CAPABILITIES: [&str; 5] = [
+const RUNTIME_CAPABILITIES: [&str; 6] = [
     "checkpoint-cleanup-library",
     "idempotency-key-validation",
     "lease-active-worker-gate",
     "local-scaling-benchmarks",
     "s3-storage",
+    "stream-checkpoint-artifact",
 ];
 
 fn validate_idempotency_key(operation: &str, idempotency_key: &str) -> Result<(), Status> {
@@ -736,6 +747,173 @@ impl CoordinatorService for CoordinatorServiceImpl {
             state: CheckpointState::Initiated as i32,
             created_at: Some(created_at.into()),
             artifact_specs: Vec::new(),
+        }))
+    }
+
+    async fn stream_checkpoint_artifact(
+        &self,
+        request: Request<Streaming<StreamCheckpointArtifactRequest>>,
+    ) -> Result<Response<StreamCheckpointArtifactResponse>, Status> {
+        // Resolve storage root — coordinator must be started with --storage-root.
+        let storage_root = self.storage_root.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "coordinator storage root not configured; start with --storage-root <path>",
+            )
+        })?;
+
+        let mut stream = request.into_inner();
+
+        // First message must be the metadata header.
+        let meta = match stream.message().await? {
+            Some(msg) => match msg.payload {
+                Some(stream_checkpoint_artifact_request::Payload::Meta(m)) => m,
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "first message must be StreamCheckpointArtifactMeta",
+                    ))
+                }
+            },
+            None => return Err(Status::invalid_argument("stream closed before meta message")),
+        };
+
+        let run_id = meta
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?
+            .value;
+        let worker_id = meta
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
+            .value;
+        let checkpoint_id = meta
+            .checkpoint_id
+            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?
+            .value;
+        let artifact_name = meta.artifact_name;
+
+        if artifact_name.trim().is_empty() {
+            return Err(Status::invalid_argument("artifact_name must be non-empty"));
+        }
+
+        // Derive storage path from coordinator root.
+        // Layout: <root>/runs/<run_id>/checkpoints/<checkpoint_id>/workers/<worker_id>/<artifact_name>
+        let artifact_key = runtime_storage::checkpoint_worker_artifact(
+            &run_id,
+            &checkpoint_id,
+            &worker_id,
+            &artifact_name,
+        );
+        let artifact_path = {
+            let mut p = storage_root.as_ref().clone();
+            for segment in artifact_key.as_str().split('/') {
+                p.push(segment);
+            }
+            p
+        };
+
+        if let Some(parent) = artifact_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                Status::internal(format!("failed to create artifact directory: {e}"))
+            })?;
+        }
+
+        // Open file for writing. Streaming chunks arrive from the network and
+        // are written immediately — tokio::fs keeps the async executor unblocked.
+        let mut file = tokio::fs::File::create(&artifact_path).await.map_err(|e| {
+            Status::internal(format!("failed to create artifact file: {e}"))
+        })?;
+
+        let mut hasher = Sha256::new();
+        let mut bytes_received: i64 = 0;
+        let mut expected_seq: u64 = 0;
+
+        // Consume chunk messages, writing each to disk as it arrives.
+        while let Some(msg) = stream.message().await? {
+            match msg.payload {
+                Some(stream_checkpoint_artifact_request::Payload::Chunk(chunk)) => {
+                    if chunk.sequence != expected_seq {
+                        return Err(Status::invalid_argument(format!(
+                            "out-of-order chunk: expected seq {expected_seq}, got {}",
+                            chunk.sequence
+                        )));
+                    }
+                    file.write_all(&chunk.data).await.map_err(|e| {
+                        Status::internal(format!("write failed at seq {}: {e}", chunk.sequence))
+                    })?;
+                    hasher.update(&chunk.data);
+                    bytes_received += chunk.data.len() as i64;
+                    expected_seq += 1;
+                }
+                Some(stream_checkpoint_artifact_request::Payload::Meta(_)) => {
+                    return Err(Status::invalid_argument(
+                        "unexpected meta message after stream started",
+                    ));
+                }
+                None => {
+                    return Err(Status::invalid_argument("received message with empty payload"));
+                }
+            }
+        }
+
+        file.flush().await.map_err(|e| {
+            Status::internal(format!("failed to flush artifact file: {e}"))
+        })?;
+        drop(file);
+
+        let checksum = hex::encode(hasher.finalize());
+        let artifact_uri = artifact_key.as_str().to_string();
+        let size_bytes = bytes_received.max(0) as u64;
+
+        // Record the artifact in coordinator state — same path as ReportCheckpointArtifact
+        // but called internally after the coordinator has already written the bytes.
+        self.state
+            .report_checkpoint_artifact(
+                run_id.clone(),
+                worker_id.clone(),
+                checkpoint_id.clone(),
+                artifact_name,
+                artifact_uri.clone(),
+                size_bytes,
+                checksum.clone(),
+                "sha256".to_string(),
+                meta.idempotency_key,
+            )
+            .map_err(|error| match error {
+                ReportCheckpointArtifactError::RunNotFound => {
+                    not_found(format!("run {run_id} was not found"))
+                }
+                ReportCheckpointArtifactError::WorkerNotFound => {
+                    not_found(format!("worker {worker_id} was not found"))
+                }
+                ReportCheckpointArtifactError::CheckpointNotFound => {
+                    not_found(format!("checkpoint {checkpoint_id} was not found"))
+                }
+                ReportCheckpointArtifactError::InvalidInput(message) => {
+                    invalid_argument(message)
+                }
+                ReportCheckpointArtifactError::InvalidState => failed_precondition(
+                    "checkpoint is in terminal state or cannot accept artifacts",
+                ),
+            })?;
+
+        self.metrics.add_storage_bytes_written(size_bytes);
+        self.metrics.inc_checkpoint_artifacts_reported_total();
+
+        info!(
+            run_id = %run_id,
+            worker_id = %worker_id,
+            checkpoint_id = %checkpoint_id,
+            bytes_received,
+            "stream_checkpoint_artifact: artifact written and registered"
+        );
+
+        Ok(Response::new(StreamCheckpointArtifactResponse {
+            checkpoint_id: Some(CheckpointId {
+                value: checkpoint_id,
+            }),
+            artifact_uri,
+            bytes_received,
+            checksum,
+            checksum_algorithm: "sha256".to_string(),
         }))
     }
 
@@ -3236,5 +3414,50 @@ mod tests {
             .value
             .clone();
         assert_eq!(first, "shard-3");
+    }
+
+    // ── StreamCheckpointArtifact ──────────────────────────────────────────────
+    // The streaming RPC handler requires a live gRPC transport to construct
+    // tonic::Streaming<T>. Streaming behaviour is covered by the Python
+    // integration tests (scripts/run_integration_validation.sh and
+    // python/tests/test_multi_worker_async_benchmark.py). The tests below cover
+    // the service-level configuration that the handler depends on.
+
+    #[test]
+    fn stream_checkpoint_artifact_service_has_no_storage_root_by_default() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        assert!(service.storage_root.is_none());
+    }
+
+    #[test]
+    fn with_storage_root_sets_storage_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()))
+            .with_storage_root(tmp.path().to_path_buf());
+        assert!(service.storage_root.is_some());
+        assert_eq!(
+            service.storage_root.as_ref().unwrap().as_ref(),
+            tmp.path()
+        );
+    }
+
+    #[test]
+    fn with_storage_root_is_cloneable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()))
+            .with_storage_root(tmp.path().to_path_buf());
+        let cloned = service.clone();
+        assert_eq!(
+            cloned.storage_root.as_ref().unwrap().as_ref(),
+            tmp.path()
+        );
+    }
+
+    #[test]
+    fn runtime_capabilities_includes_stream_checkpoint_artifact() {
+        assert!(
+            RUNTIME_CAPABILITIES.contains(&"stream-checkpoint-artifact"),
+            "capabilities must advertise stream-checkpoint-artifact"
+        );
     }
 }

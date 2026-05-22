@@ -27,6 +27,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:50051";
 struct CoordinatorCliArgs {
     addr: String,
     metadata_db: Option<String>,
+    storage_root: Option<PathBuf>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     tls_client_ca: Option<PathBuf>,
@@ -68,8 +69,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_enabled = args.tls_cert.is_some();
     let mtls_enabled = args.tls_client_ca.is_some();
     let auth_mode = args.auth_mode;
-    let service =
+    let mut service =
         CoordinatorServiceImpl::with_authorizer(state.clone(), Authorizer::new(args.auth_mode));
+    if let Some(ref root) = args.storage_root {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        info!(storage_root = %root.display(), "runtime-coordinator storage root configured");
+        std::fs::create_dir_all(&root)?;
+        service = service.with_storage_root(root);
+    }
     let metrics_service = service.clone();
     let coordinator_ready = Arc::new(AtomicBool::new(false));
 
@@ -195,10 +202,11 @@ fn load_tls_config(
 }
 
 fn print_usage() {
-    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--help|-h]");
+    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--help|-h]");
     println!("\nOptions:");
     println!("  --addr <ADDR>           Coordinator listen address (default: {DEFAULT_ADDR})");
     println!("  --metadata-db <PATH>    Enable SQLite metadata persistence at PATH");
+    println!("  --storage-root <PATH>   Enable coordinator-managed artifact storage at PATH (required for StreamCheckpointArtifact RPC)");
     println!("  --auth-mode <MODE>      Authorization mode: disabled|metadata (env: DTRUNTIME_AUTH_MODE)");
     println!("  --tls-cert <PATH>       Enable TLS with certificate chain PEM at PATH (requires --tls-key)");
     println!(
@@ -216,6 +224,7 @@ fn coordinator_args(
     let mut parsed = CoordinatorCliArgs {
         addr: String::from(DEFAULT_ADDR),
         metadata_db: None,
+        storage_root: None,
         tls_cert: None,
         tls_key: None,
         tls_client_ca: None,
@@ -235,6 +244,10 @@ fn coordinator_args(
             parsed.addr = args.next().ok_or("--addr requires an address")?;
         } else if arg == "--metadata-db" {
             parsed.metadata_db = Some(args.next().ok_or("--metadata-db requires a path")?);
+        } else if arg == "--storage-root" {
+            parsed.storage_root = Some(PathBuf::from(
+                args.next().ok_or("--storage-root requires a path")?,
+            ));
         } else if arg == "--auth-mode" {
             parsed.auth_mode = args
                 .next()
@@ -290,6 +303,7 @@ mod tests {
                     .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
                 status_addr: None,
                 metrics_addr: None,
+                storage_root: None,
                 show_help: false,
             }
         );
