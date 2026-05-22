@@ -97,7 +97,7 @@ def _worker_main(
     args: argparse.Namespace,
     result_queue: multiprocessing.Queue,
     artifact_done_barrier: multiprocessing.Barrier,
-    commit_event: multiprocessing.Event,
+    commit_done_barrier: multiprocessing.Barrier,
 ) -> None:
     """Entry point for each worker process."""
     worker_id = f"worker-{rank}"
@@ -208,21 +208,21 @@ def _worker_main(
                 checkpoint_bytes_total += response.bytes_received
                 checkpoint_count += 1
 
-                # Barrier: all workers wait here until every worker has streamed
-                # its artifact for this step. Then rank 0 commits.
+                # Barrier 1: all workers wait until every worker has finished
+                # streaming its artifact for this step.
                 artifact_done_barrier.wait()
 
+                # Rank 0 commits; all other workers wait at barrier 2.
                 if rank == 0:
                     client.commit_checkpoint(
                         run_id=runtime_run_id,
                         checkpoint_id=resolved_checkpoint_id,
                         idempotency_key=f"mw-commit-ckpt-{run_id}-{step}",
                     )
-                    commit_event.set()
-                else:
-                    # Non-rank-0 workers wait for rank 0 to commit before continuing.
-                    commit_event.wait()
-                    commit_event.clear()
+
+                # Barrier 2: rank 0 arrives after committing; non-rank-0 workers
+                # arrive immediately. All proceed together — no Event race.
+                commit_done_barrier.wait()
 
         total_duration = time.perf_counter() - wall_start
         ckpt_mb = checkpoint_bytes_total / (1024 * 1024)
@@ -286,10 +286,10 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
     admin_client.close()
 
     result_queue: multiprocessing.Queue = multiprocessing.Queue()
-    # Barrier: all N workers must finish streaming before rank 0 commits.
+    # Barrier 1: all N workers must finish streaming before rank 0 commits.
     artifact_done_barrier = multiprocessing.Barrier(args.workers)
-    # Event: rank 0 signals non-rank-0 workers that commit is done.
-    commit_event = multiprocessing.Event()
+    # Barrier 2: all N workers rendezvous after rank 0 commits.
+    commit_done_barrier = multiprocessing.Barrier(args.workers)
 
     processes = []
     wall_start = time.perf_counter()
@@ -304,7 +304,7 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
                 args,
                 result_queue,
                 artifact_done_barrier,
-                commit_event,
+                commit_done_barrier,
             ),
             daemon=True,
         )
