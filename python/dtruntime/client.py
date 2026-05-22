@@ -248,6 +248,50 @@ class RuntimeClient:
         return self._stub.BeginCheckpoint(request, metadata=self.rpc_metadata(worker_id=worker_id))
 
 
+    def stream_checkpoint_artifact(
+        self,
+        run_id: str,
+        worker_id: str,
+        checkpoint_id: str,
+        artifact_name: str,
+        data: bytes,
+        chunk_size: int = 512 * 1024,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.StreamCheckpointArtifactResponse":
+        """Stream checkpoint artifact bytes to the coordinator for async storage.
+
+        The coordinator writes chunks to storage using its tokio async runtime as
+        they arrive — the caller's training loop is unblocked as soon as the stream
+        is accepted, while Rust handles all I/O concurrently.
+        """
+        total_size = len(data)
+
+        def _generate_requests():
+            yield self._runtime_pb2.StreamCheckpointArtifactRequest(
+                meta=self._runtime_pb2.StreamCheckpointArtifactMeta(
+                    run_id=self._runtime_pb2.RunId(value=run_id),
+                    worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+                    checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
+                    artifact_name=artifact_name,
+                    total_size_bytes=total_size,
+                    idempotency_key=idempotency_key,
+                )
+            )
+            seq = 0
+            for offset in range(0, total_size, chunk_size):
+                yield self._runtime_pb2.StreamCheckpointArtifactRequest(
+                    chunk=self._runtime_pb2.StreamCheckpointArtifactChunk(
+                        data=data[offset : offset + chunk_size],
+                        sequence=seq,
+                    )
+                )
+                seq += 1
+
+        return self._stub.StreamCheckpointArtifact(
+            _generate_requests(),
+            metadata=self.rpc_metadata(worker_id=worker_id),
+        )
+
     def report_checkpoint_artifact(
         self,
         run_id: str,

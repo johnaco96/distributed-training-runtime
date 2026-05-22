@@ -81,14 +81,23 @@ def _patch_grpc_import() -> None:
     PB2_GRPC_FILE.write_text(text, encoding="utf-8")
 
 
-def _parse_rpc_methods(proto_text: str) -> list[tuple[str, str, str]]:
+def _parse_rpc_methods(proto_text: str) -> list[tuple[str, str, str, bool, bool]]:
+    """Return (name, request_type, response_type, client_streaming, server_streaming)."""
     service_match = re.search(r"service\s+CoordinatorService\s*\{(?P<body>.*?)\n\}", proto_text, re.S)
     if service_match is None:
         raise RuntimeError("CoordinatorService was not found in proto/runtime.proto")
-    return re.findall(
-        r"rpc\s+(\w+)\s*\(\s*(\w+)\s*\)\s*returns\s*\(\s*(\w+)\s*\)\s*;",
+    results = []
+    for m in re.finditer(
+        r"rpc\s+(\w+)\s*\(\s*(stream\s+)?(\w+)\s*\)\s*returns\s*\(\s*(stream\s+)?(\w+)\s*\)\s*;",
         service_match.group("body"),
-    )
+    ):
+        name = m.group(1)
+        client_streaming = m.group(2) is not None
+        request_type = m.group(3)
+        server_streaming = m.group(4) is not None
+        response_type = m.group(5)
+        results.append((name, request_type, response_type, client_streaming, server_streaming))
+    return results
 
 
 def _generate_minimal_grpc_client() -> None:
@@ -112,10 +121,18 @@ def _generate_minimal_grpc_client() -> None:
         "            channel: A grpc.Channel.",
         '        """',
     ]
-    for name, request, response in methods:
+    for name, request, response, client_streaming, server_streaming in methods:
+        if client_streaming and not server_streaming:
+            channel_method = "channel.stream_unary"
+        elif not client_streaming and server_streaming:
+            channel_method = "channel.unary_stream"
+        elif client_streaming and server_streaming:
+            channel_method = "channel.stream_stream"
+        else:
+            channel_method = "channel.unary_unary"
         lines.extend(
             [
-                f"        self.{name} = channel.unary_unary(",
+                f"        self.{name} = {channel_method}(",
                 f"            '/runtime.v1.CoordinatorService/{name}',",
                 f"            request_serializer=runtime__pb2.{request}.SerializeToString,",
                 f"            response_deserializer=runtime__pb2.{response}.FromString,",

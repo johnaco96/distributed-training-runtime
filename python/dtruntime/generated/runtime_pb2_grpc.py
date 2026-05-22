@@ -37,6 +37,11 @@ class CoordinatorServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.GetRuntimeInfo = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/GetRuntimeInfo',
+                request_serializer=runtime__pb2.GetRuntimeInfoRequest.SerializeToString,
+                response_deserializer=runtime__pb2.GetRuntimeInfoResponse.FromString,
+                _registered_method=True)
         self.RegisterRun = channel.unary_unary(
                 '/runtime.v1.CoordinatorService/RegisterRun',
                 request_serializer=runtime__pb2.RegisterRunRequest.SerializeToString,
@@ -77,6 +82,11 @@ class CoordinatorServiceStub(object):
                 request_serializer=runtime__pb2.BeginCheckpointRequest.SerializeToString,
                 response_deserializer=runtime__pb2.BeginCheckpointResponse.FromString,
                 _registered_method=True)
+        self.StreamCheckpointArtifact = channel.stream_unary(
+                '/runtime.v1.CoordinatorService/StreamCheckpointArtifact',
+                request_serializer=runtime__pb2.StreamCheckpointArtifactRequest.SerializeToString,
+                response_deserializer=runtime__pb2.StreamCheckpointArtifactResponse.FromString,
+                _registered_method=True)
         self.ReportCheckpointArtifact = channel.unary_unary(
                 '/runtime.v1.CoordinatorService/ReportCheckpointArtifact',
                 request_serializer=runtime__pb2.ReportCheckpointArtifactRequest.SerializeToString,
@@ -104,6 +114,12 @@ class CoordinatorServiceServicer(object):
     helpers to coordinate runs, workers, shard leases, and checkpoints.
     Large dataset/checkpoint payload bytes stay on the data plane.
     """
+
+    def GetRuntimeInfo(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def RegisterRun(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -153,6 +169,12 @@ class CoordinatorServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def StreamCheckpointArtifact(self, request_iterator, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ReportCheckpointArtifact(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -180,6 +202,11 @@ class CoordinatorServiceServicer(object):
 
 def add_CoordinatorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'GetRuntimeInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetRuntimeInfo,
+                    request_deserializer=runtime__pb2.GetRuntimeInfoRequest.FromString,
+                    response_serializer=runtime__pb2.GetRuntimeInfoResponse.SerializeToString,
+            ),
             'RegisterRun': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterRun,
                     request_deserializer=runtime__pb2.RegisterRunRequest.FromString,
@@ -220,6 +247,11 @@ def add_CoordinatorServiceServicer_to_server(servicer, server):
                     request_deserializer=runtime__pb2.BeginCheckpointRequest.FromString,
                     response_serializer=runtime__pb2.BeginCheckpointResponse.SerializeToString,
             ),
+            'StreamCheckpointArtifact': grpc.stream_unary_rpc_method_handler(
+                    servicer.StreamCheckpointArtifact,
+                    request_deserializer=runtime__pb2.StreamCheckpointArtifactRequest.FromString,
+                    response_serializer=runtime__pb2.StreamCheckpointArtifactResponse.SerializeToString,
+            ),
             'ReportCheckpointArtifact': grpc.unary_unary_rpc_method_handler(
                     servicer.ReportCheckpointArtifact,
                     request_deserializer=runtime__pb2.ReportCheckpointArtifactRequest.FromString,
@@ -253,6 +285,33 @@ class CoordinatorService(object):
     helpers to coordinate runs, workers, shard leases, and checkpoints.
     Large dataset/checkpoint payload bytes stay on the data plane.
     """
+
+    @staticmethod
+    def GetRuntimeInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/GetRuntimeInfo',
+            runtime__pb2.GetRuntimeInfoRequest.SerializeToString,
+            runtime__pb2.GetRuntimeInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def RegisterRun(request,
@@ -460,6 +519,33 @@ class CoordinatorService(object):
             '/runtime.v1.CoordinatorService/BeginCheckpoint',
             runtime__pb2.BeginCheckpointRequest.SerializeToString,
             runtime__pb2.BeginCheckpointResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StreamCheckpointArtifact(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/runtime.v1.CoordinatorService/StreamCheckpointArtifact',
+            runtime__pb2.StreamCheckpointArtifactRequest.SerializeToString,
+            runtime__pb2.StreamCheckpointArtifactResponse.FromString,
             options,
             channel_credentials,
             insecure,
