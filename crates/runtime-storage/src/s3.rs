@@ -102,6 +102,10 @@ impl S3Storage {
     }
 
     /// Build the AWS SDK S3 client from a config. Used by both constructors.
+    ///
+    /// Builds the S3-specific config directly rather than inheriting from a
+    /// shared `SdkConfig` so that custom endpoint URLs (e.g. MinIO) and
+    /// `force_path_style` are guaranteed to take effect on the S3 client.
     async fn build_client(config: S3StorageConfig) -> Client {
         let credentials = Credentials::new(
             config.access_key_id,
@@ -110,17 +114,15 @@ impl S3Storage {
             None,
             "dtruntime-s3-storage",
         );
-        let mut loader = aws_config::defaults(BehaviorVersion::latest())
+        let mut s3_builder = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
             .region(Region::new(config.region))
-            .credentials_provider(credentials);
+            .credentials_provider(credentials)
+            .force_path_style(config.force_path_style);
         if let Some(endpoint) = config.endpoint_url {
-            loader = loader.endpoint_url(endpoint);
+            s3_builder = s3_builder.endpoint_url(endpoint);
         }
-        let shared = loader.load().await;
-        let s3_config = aws_sdk_s3::config::Builder::from(&shared)
-            .force_path_style(config.force_path_style)
-            .build();
-        Client::from_conf(s3_config)
+        Client::from_conf(s3_builder.build())
     }
 
     fn object_key_for(&self, key: &StorageKey) -> Result<String, StorageError> {
