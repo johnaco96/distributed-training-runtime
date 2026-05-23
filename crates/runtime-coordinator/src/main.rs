@@ -95,8 +95,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             force_path_style: args.s3_endpoint.is_some(),
             key_prefix: None,
         };
-        service = service
-            .with_s3_backend(s3_cfg)
+        // S3Storage::new() calls block_on internally (AWS SDK credential chain).
+        // block_in_place allows the current thread to block without panicking
+        // by temporarily moving other tasks to sibling worker threads.
+        service = tokio::task::block_in_place(|| service.with_s3_backend(s3_cfg))
             .map_err(|e| format!("failed to initialise S3 backend: {e}"))?;
         info!(bucket = %bucket, "runtime-coordinator S3 backend configured");
     }
