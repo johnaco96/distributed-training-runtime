@@ -10,3 +10,16 @@ members = [
     "crates/runtime-bench",
 ]
 resolver = "2"
+
+# Profile for performance profiling: release optimizations + DWARF line info.
+# debug = 1 keeps line tables (needed for perf/flamegraph symbol resolution)
+# without the ~10× size penalty of full debug info (debug = 2).
+# strip = "none" prevents cargo from discarding the debug sections.
+[profile.perf]
+inherits  = "release"
+debug     = 1
+strip     = "none"
+# Frame pointers allow perf to unwind user-space stacks from kernel context
+# (needed for call-graph captures of threads blocked in epoll_wait / write).
+[profile.perf.build-override]
+codegen-units = 1
