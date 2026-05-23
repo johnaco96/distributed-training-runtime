@@ -90,30 +90,6 @@ impl S3Storage {
     fn object_key_for(&self, key: &StorageKey) -> Result<String, StorageError> {
         storage_key_to_object_key(self.key_prefix.as_deref(), key)
     }
-
-    /// Upload bytes to S3 natively async.
-    ///
-    /// Prefer this over [`StorageBackend::put`] from async contexts — the
-    /// synchronous wrapper calls `block_on` on an inner runtime which panics
-    /// when called from a `spawn_blocking` thread that already carries a
-    /// Tokio context (nested-runtime detection fires).
-    pub async fn put_async(&self, key: &StorageKey, bytes: Vec<u8>) -> Result<(), StorageError> {
-        let object_key = self.object_key_for(key)?;
-        let _permit = self
-            .limiter
-            .acquire()
-            .await
-            .map_err(|e| StorageError::Io(std::io::Error::other(e.to_string())))?;
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(object_key)
-            .body(ByteStream::from(bytes))
-            .send()
-            .await
-            .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
-        Ok(())
-    }
 }
 
 impl StorageBackend for S3Storage {

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use runtime_storage::{S3Storage, S3StorageConfig};
+use runtime_storage::{S3Storage, S3StorageConfig, StorageBackend};
 use runtime_proto::protocol_version;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
@@ -28,7 +28,7 @@ pub struct CoordinatorServiceImpl {
     authorizer: Authorizer,
     audit: AuditLogger,
     storage_root: Option<Arc<PathBuf>>,
-    s3_backend: Option<Arc<S3Storage>>,
+    s3_backend: Option<Arc<dyn StorageBackend + Send + Sync>>,
     s3_bucket: Option<String>,
 }
 
@@ -887,10 +887,11 @@ impl CoordinatorService for CoordinatorServiceImpl {
         // Upload to S3 when backend is configured. The local file is written first
         // for immediate coordinator-side availability; S3 provides durable object storage.
         let artifact_uri = if let (Some(s3), Some(bucket)) = (&self.s3_backend, &self.s3_bucket) {
-            // put_async uses the AWS SDK client natively in the async context,
-            // avoiding the nested-runtime panic that spawn_blocking + block_on causes.
-            s3.put_async(&artifact_key, s3_buf)
+            let s3 = Arc::clone(s3);
+            let key = artifact_key.clone();
+            tokio::task::spawn_blocking(move || s3.put(&key, &s3_buf))
                 .await
+                .map_err(|e| Status::internal(format!("S3 upload task panicked: {e}")))?
                 .map_err(|e| Status::internal(format!("S3 upload failed: {e}")))?;
             info!(
                 run_id = %run_id,
