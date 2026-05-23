@@ -97,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         service = service
             .with_s3_backend(s3_cfg)
+            .await
             .map_err(|e| format!("failed to initialise S3 backend: {e}"))?;
         info!(bucket = %bucket, "runtime-coordinator S3 backend configured");
     }

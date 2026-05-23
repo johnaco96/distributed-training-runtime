@@ -82,9 +82,15 @@ impl CoordinatorServiceImpl {
         self
     }
 
-    pub fn with_s3_backend(mut self, config: S3StorageConfig) -> Result<Self, String> {
+    pub async fn with_s3_backend(mut self, config: S3StorageConfig) -> Result<Self, String> {
         let bucket = config.bucket.clone();
-        let backend = S3Storage::new(config).map_err(|e| format!("S3 backend init failed: {e}"))?;
+        // new_async builds the client inside the current Tokio runtime so the
+        // Hyper connection pool and the runtime are always co-located — avoids
+        // the nested-runtime panic that S3Storage::new() causes when called
+        // from within #[tokio::main].
+        let backend = S3Storage::new_async(config)
+            .await
+            .map_err(|e| format!("S3 backend init failed: {e}"))?;
         self.s3_backend = Some(Arc::new(backend));
         self.s3_bucket = Some(bucket);
         Ok(self)

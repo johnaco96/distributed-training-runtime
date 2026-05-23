@@ -434,10 +434,11 @@ def main() -> None:
             client = RuntimeClient(coordinator_addr)
             resp = client.restore_latest(run_id=_last_runtime_run_id or "")
             client.close()
+            m = resp.manifest
             latest = {
-                "checkpoint_id": resp.checkpoint_id.value if resp.checkpoint_id else None,
-                "step": resp.step,
-                "artifact_count": len(resp.artifacts),
+                "checkpoint_id": m.checkpoint_id.value if m.checkpoint_id else None,
+                "step": m.step,
+                "artifact_count": len(m.artifacts),
             }
             print(f"[RECOVERY] Last committed checkpoint: {json.dumps(latest, indent=2)}")
         except Exception as e:

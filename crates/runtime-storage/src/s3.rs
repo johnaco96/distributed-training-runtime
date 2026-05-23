@@ -45,46 +45,84 @@ pub struct S3Storage {
     client: Client,
     bucket: String,
     key_prefix: Option<String>,
-    rt: std::sync::Arc<tokio::runtime::Runtime>,
+    /// Present when constructed via [`S3Storage::new`] (sync / blocking path).
+    /// Absent when constructed via [`S3Storage::new_async`] (native async path);
+    /// in that case the sync [`StorageBackend`] methods are unavailable and
+    /// only [`S3Storage::put_async`] should be used.
+    rt: Option<std::sync::Arc<tokio::runtime::Runtime>>,
     policy: StorageOperationPolicy,
     limiter: std::sync::Arc<Semaphore>,
 }
 
 impl S3Storage {
+    /// Synchronous constructor — creates its own Tokio runtime internally.
+    ///
+    /// **Must not be called from within an async context** (panics with
+    /// "Cannot start a runtime from within a runtime"). Use
+    /// [`S3Storage::new_async`] instead when you are already inside a Tokio
+    /// runtime (e.g. from `#[tokio::main]`).
     pub fn new(config: S3StorageConfig) -> Result<Self, StorageError> {
         let policy = StorageOperationPolicy::default();
         policy.validate()?;
         config.validate()?;
         let key_prefix = config.normalized_key_prefix()?;
         let rt = tokio::runtime::Runtime::new().map_err(StorageError::Io)?;
-        let client = rt.block_on(async move {
-            let credentials = Credentials::new(
-                config.access_key_id,
-                config.secret_access_key,
-                None,
-                None,
-                "dtruntime-s3-storage",
-            );
-            let mut loader = aws_config::defaults(BehaviorVersion::latest())
-                .region(Region::new(config.region))
-                .credentials_provider(credentials);
-            if let Some(endpoint) = config.endpoint_url {
-                loader = loader.endpoint_url(endpoint);
-            }
-            let shared = loader.load().await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared)
-                .force_path_style(config.force_path_style)
-                .build();
-            Client::from_conf(s3_config)
-        });
+        let client = rt.block_on(Self::build_client(config.clone()));
         Ok(Self {
             client,
             bucket: config.bucket,
             key_prefix,
-            rt: std::sync::Arc::new(rt),
+            rt: Some(std::sync::Arc::new(rt)),
             limiter: std::sync::Arc::new(Semaphore::new(policy.max_concurrent_operations)),
             policy,
         })
+    }
+
+    /// Async constructor — builds the AWS SDK client in the caller's Tokio
+    /// runtime, so the connection pool is driven by that same runtime.
+    ///
+    /// Use this from `async` contexts (e.g. inside `#[tokio::main]`). The
+    /// returned [`S3Storage`] only supports [`S3Storage::put_async`] and the
+    /// other `*_async` helpers; calling the synchronous [`StorageBackend`]
+    /// methods will return an error.
+    pub async fn new_async(config: S3StorageConfig) -> Result<Self, StorageError> {
+        let policy = StorageOperationPolicy::default();
+        policy.validate()?;
+        config.validate()?;
+        let key_prefix = config.normalized_key_prefix()?;
+        let client = Self::build_client(config.clone()).await;
+        Ok(Self {
+            client,
+            bucket: config.bucket,
+            key_prefix,
+            rt: None,
+            limiter: std::sync::Arc::new(Semaphore::new(policy.max_concurrent_operations)),
+            policy,
+        })
+    }
+
+    /// Build the AWS SDK S3 client from a config. Used by both constructors.
+    ///
+    /// Builds the S3-specific config directly rather than inheriting from a
+    /// shared `SdkConfig` so that custom endpoint URLs (e.g. MinIO) and
+    /// `force_path_style` are guaranteed to take effect on the S3 client.
+    async fn build_client(config: S3StorageConfig) -> Client {
+        let credentials = Credentials::new(
+            config.access_key_id,
+            config.secret_access_key,
+            None,
+            None,
+            "dtruntime-s3-storage",
+        );
+        let mut s3_builder = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(config.region))
+            .credentials_provider(credentials)
+            .force_path_style(config.force_path_style);
+        if let Some(endpoint) = config.endpoint_url {
+            s3_builder = s3_builder.endpoint_url(endpoint);
+        }
+        Client::from_conf(s3_builder.build())
     }
 
     fn object_key_for(&self, key: &StorageKey) -> Result<String, StorageError> {
@@ -93,10 +131,10 @@ impl S3Storage {
 
     /// Upload bytes to S3 natively async.
     ///
-    /// Prefer this over [`StorageBackend::put`] from async contexts — the
-    /// synchronous wrapper calls `block_on` on an inner runtime which panics
-    /// when called from a `spawn_blocking` thread that already carries a
-    /// Tokio context (nested-runtime detection fires).
+    /// Works whether the instance was created via [`S3Storage::new`] or
+    /// [`S3Storage::new_async`]. The HTTP request is driven by the current
+    /// Tokio runtime (the one awaiting this future), so the client connection
+    /// pool and the runtime are always co-located.
     pub async fn put_async(&self, key: &StorageKey, bytes: Vec<u8>) -> Result<(), StorageError> {
         let object_key = self.object_key_for(key)?;
         let _permit = self
@@ -114,12 +152,22 @@ impl S3Storage {
             .map_err(|err| StorageError::Io(std::io::Error::other(err.to_string())))?;
         Ok(())
     }
+
+    fn sync_rt(&self) -> Result<&tokio::runtime::Runtime, StorageError> {
+        self.rt
+            .as_deref()
+            .ok_or_else(|| StorageError::Io(std::io::Error::other(
+                "S3Storage was created with new_async(); use put_async() instead of the \
+                 synchronous StorageBackend methods",
+            )))
+    }
 }
 
 impl StorageBackend for S3Storage {
     fn put(&self, key: &StorageKey, bytes: &[u8]) -> Result<(), StorageError> {
+        let rt = self.sync_rt()?;
         let object_key = self.object_key_for(key)?;
-        self.rt.block_on(async {
+        rt.block_on(async {
             run_with_timeout_retry(&self.policy, "s3-put", || async {
                 let _permit = self
                     .limiter
@@ -142,8 +190,9 @@ impl StorageBackend for S3Storage {
     }
 
     fn get(&self, key: &StorageKey) -> Result<Vec<u8>, StorageError> {
+        let rt = self.sync_rt()?;
         let object_key = self.object_key_for(key)?;
-        self.rt.block_on(async {
+        rt.block_on(async {
             run_with_timeout_retry(&self.policy, "s3-get", || async {
                 let _permit = self
                     .limiter
@@ -179,8 +228,9 @@ impl StorageBackend for S3Storage {
     }
 
     fn exists(&self, key: &StorageKey) -> Result<bool, StorageError> {
+        let rt = self.sync_rt()?;
         let object_key = self.object_key_for(key)?;
-        self.rt.block_on(async {
+        rt.block_on(async {
             run_with_timeout_retry(&self.policy, "s3-exists", || async {
                 let _permit = self
                     .limiter
@@ -211,8 +261,9 @@ impl StorageBackend for S3Storage {
     }
 
     fn list_prefix(&self, prefix: &StorageKey) -> Result<Vec<StorageKey>, StorageError> {
+        let rt = self.sync_rt()?;
         let object_prefix = self.object_key_for(prefix)?;
-        self.rt.block_on(async {
+        rt.block_on(async {
             let result = run_with_timeout_retry(&self.policy, "s3-list-prefix", || async {
                 let _permit = self
                     .limiter
@@ -246,8 +297,9 @@ impl StorageBackend for S3Storage {
     }
 
     fn delete(&self, key: &StorageKey) -> Result<(), StorageError> {
+        let rt = self.sync_rt()?;
         let object_key = self.object_key_for(key)?;
-        self.rt.block_on(async {
+        rt.block_on(async {
             run_with_timeout_retry(&self.policy, "s3-delete", || async {
                 let _permit = self
                     .limiter
