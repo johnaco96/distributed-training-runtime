@@ -1,0 +1,9 @@
+[package]
+name = "runtime-dataset"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+runtime-checkpoint = { path = "../runtime-checkpoint" }
+runtime-storage = { path = "../runtime-storage" }

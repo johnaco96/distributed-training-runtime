@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runtime-coordinator
+  namespace: dtruntime
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: runtime-coordinator
+  template:
+    metadata:
+      labels:
+        app: runtime-coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: distributed-training-runtime:local
+          imagePullPolicy: IfNotPresent
+          command: ["runtime-coordinator"]
+          args:
+            - "--addr"
+            - "0.0.0.0:50051"
+            - "--metrics-addr"
+            - "0.0.0.0:9090"
+            - "--auth-mode"
+            - "metadata"
+            - "--tls-cert"
+            - "/etc/dtruntime/tls/server/tls.crt"
+            - "--tls-key"
+            - "/etc/dtruntime/tls/server/tls.key"
+            - "--tls-client-ca"
+            - "/etc/dtruntime/tls/client-ca/ca.crt"
+          envFrom:
+            - secretRef:
+                name: dtruntime-auth
+                optional: false
+          ports:
+            - containerPort: 50051
+              name: grpc
+            - containerPort: 9090
+              name: metrics
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: server-tls
+              mountPath: /etc/dtruntime/tls/server
+              readOnly: true
+            - name: client-ca
+              mountPath: /etc/dtruntime/tls/client-ca
+              readOnly: true
+      volumes:
+        - name: server-tls
+          secret:
+            secretName: dtruntime-tls
+            optional: false
+        - name: client-ca
+          secret:
+            secretName: dtruntime-client-ca
+            optional: false

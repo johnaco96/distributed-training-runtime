@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runtime-coordinator
+  namespace: dtruntime
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: runtime-coordinator
+  template:
+    metadata:
+      labels:
+        app: runtime-coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: distributed-training-runtime:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--addr"
+            - "0.0.0.0:50051"
+            - "--storage-root"
+            - "/tmp/dtr-artifacts"
+            # --metadata-db-url wires the coordinator to PostgreSQL.
+            # Remove this arg (and the env var) to fall back to in-memory state.
+            - "--metadata-db-url"
+            - "$(DTRUNTIME_METADATA_DB_URL)"
+            # Raise the S3 semaphore so it never blocks at ≤128 concurrent workers.
+            - "--max-s3-concurrent-ops"
+            - "128"
+          env:
+            - name: DTRUNTIME_METADATA_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            # S3/MinIO: uncomment and populate to enable object storage.
+            # - name: DTRUNTIME_S3_ENDPOINT
+            #   value: "http://minio:9000"
+            # - name: DTRUNTIME_S3_BUCKET
+            #   value: "dtruntime"
+            # - name: DTRUNTIME_S3_ACCESS_KEY
+            #   valueFrom: { secretKeyRef: { name: minio-credentials, key: access_key } }
+            # - name: DTRUNTIME_S3_SECRET_KEY
+            #   valueFrom: { secretKeyRef: { name: minio-credentials, key: secret_key } }
+          ports:
+            - containerPort: 50051
+              name: grpc
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          startupProbe:
+            tcpSocket:
+              port: grpc
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

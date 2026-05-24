@@ -1,0 +1,107 @@
+# scale-test-job.yaml
+#
+# Drives the coordinator with up to 1000 logical workers over real gRPC from
+# inside the cluster.  Uses the `runtime-bench logical-workers` subcommand,
+# which simulates the full coordinator protocol (RegisterRun, RegisterWorker,
+# GetShardAssignment, Heartbeat, ReportShardProgress) for every logical worker
+# without touching the filesystem — it is a pure gRPC throughput benchmark.
+#
+# This is the correct tool for the 1000-worker scale question because:
+#   • A 1000-pod Indexed Job would require 1000 x torch/Python start-up
+#     overhead that Docker Desktop cannot absorb.
+#   • runtime-bench runs all 1000 logical workers inside a single Rust
+#     async runtime, saturating the coordinator with real gRPC calls at
+#     configurable concurrency.
+#
+# Prerequisites:
+#   - Coordinator is running (coordinator-deployment.yaml + coordinator-service.yaml).
+#   - The Docker image was built with `cargo build --release -p runtime-bench`
+#     (the updated Dockerfile does this automatically).
+#
+# Usage:
+#   # Build and load the image:
+#   docker build -t distributed-training-runtime:local .
+#
+#   # Apply:
+#   kubectl apply -f k8s/local/scale-test-job.yaml
+#
+#   # Stream results:
+#   kubectl logs -n dtruntime -l job-name=scale-test --follow
+#
+#   # Typical output (one line per benchmark):
+#   # benchmark=logical_workers ops=1000 success=998 fail=2 failure_rate=0.0020 \
+#   # bytes=0 elapsed_ms=45231.7 mb_per_sec=0.000 p50=31.2 p90=89.4 p99=201.7 retries=0
+#
+# Scaling guide
+# -------------
+#   --workers 100   : smoke test (~5 s on Docker Desktop)
+#   --workers 500   : moderate load (~20 s)
+#   --workers 1000  : full scale (~30-60 s; coordinator memory ~256-512 MiB)
+#
+# If the coordinator OOMs, raise memory in coordinator-deployment.yaml and
+# bump --max-s3-concurrent-ops to at least 256.
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scale-test
+  namespace: dtruntime
+  labels:
+    app: scale-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: scale-test
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-coordinator
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for coordinator at runtime-coordinator.dtruntime:50051 ..."
+              until nc -z runtime-coordinator.dtruntime.svc.cluster.local 50051; do
+                sleep 2
+              done
+              echo "Coordinator is up."
+      containers:
+        - name: scale-test
+          image: distributed-training-runtime:phase10
+          imagePullPolicy: IfNotPresent
+          # Override the coordinator entrypoint with the bench binary.
+          command: ["/usr/local/bin/runtime-bench"]
+          args:
+            - "logical-workers"
+            - "--target"
+            - "http://runtime-coordinator.dtruntime.svc.cluster.local:50051"
+            # Number of logical workers to simulate.  Each worker registers,
+            # requests shard assignments, sends heartbeats, and reports progress.
+            - "--workers"
+            - "1000"
+            # How long to run (seconds).  Workers loop until duration expires.
+            - "--duration-secs"
+            - "60"
+            # Concurrent gRPC calls in-flight at once.  A good starting point
+            # is 4 × coordinator CPU cores (coordinator has 0.5 CPU → 64).
+            - "--concurrency"
+            - "64"
+            # Number of logical shards registered per run.
+            - "--shards"
+            - "2000"
+            # Heartbeat interval per worker (ms).  Lower = more coordinator load.
+            - "--heartbeat-interval-ms"
+            - "5000"
+            # Write JSON results to stdout path (omit for console-only output).
+            # - "--out-json" - "/tmp/scale-test-results.json"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"

@@ -1,0 +1,87 @@
+# shard-prep-job.yaml
+#
+# One-time Job that writes shard .npz files to the shared hostPath volume
+# (/tmp/dtruntime-shards on the Docker Desktop node) and registers the
+# dataset with the running coordinator.
+#
+# Run this BEFORE worker-job.yaml.
+#
+# Usage:
+#   kubectl apply -f k8s/local/shard-prep-job.yaml
+#   kubectl wait --for=condition=complete job/shard-prep -n dtruntime --timeout=120s
+#
+# Adjust --samples, --shards, and --workers to match what worker-job.yaml uses.
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: shard-prep
+  namespace: dtruntime
+  labels:
+    app: shard-prep
+spec:
+  # Never retry on failure — bad data is worse than a clear error.
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: shard-prep
+    spec:
+      restartPolicy: Never
+      initContainers:
+        # Wait for the coordinator gRPC port to be reachable before writing data.
+        - name: wait-for-coordinator
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for coordinator at runtime-coordinator.dtruntime:50051 ..."
+              until nc -z runtime-coordinator.dtruntime.svc.cluster.local 50051; do
+                sleep 2
+              done
+              echo "Coordinator is up."
+      containers:
+        - name: shard-prep
+          image: distributed-training-runtime:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "python/examples/pytorch_coordinator_train.py"]
+          args:
+            - "--prep-only"
+            - "--addr"
+            - "runtime-coordinator.dtruntime.svc.cluster.local:50051"
+            # world-size must match worker-job.yaml --workers
+            - "--workers"
+            - "4"
+            - "--epochs"
+            - "3"
+            # Increase --samples for heavier data (each sample is ~64 bytes at
+            # default --input-dim 16 with float32 features + int64 label).
+            - "--samples"
+            - "4096"
+            - "--shards"
+            - "16"
+            - "--shard-dir"
+            - "/mnt/shards"
+          env:
+            - name: PYTHONPATH
+              value: /app/python
+          volumeMounts:
+            - name: shard-storage
+              mountPath: /mnt/shards
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+      volumes:
+        - name: shard-storage
+          # hostPath works on Docker Desktop because all pods land on the same
+          # single-node VM.  For a multi-node cluster, replace with an NFS or
+          # CSI volume that is accessible from every worker node.
+          hostPath:
+            path: /tmp/dtruntime-shards
+            type: DirectoryOrCreate

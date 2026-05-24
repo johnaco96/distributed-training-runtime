@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/runtime-proto",
+    "crates/runtime-coordinator",
+    "crates/runtime-core",
+    "crates/runtime-client",
+    "crates/runtime-storage",
+    "crates/runtime-dataset",
+    "crates/runtime-checkpoint",
+    "crates/runtime-bench",
+]
+resolver = "2"
+
+# Profile for performance profiling: release optimizations + DWARF line info.
+# debug = 1 keeps line tables (needed for perf/flamegraph symbol resolution)
+# without the ~10× size penalty of full debug info (debug = 2).
+# strip = "none" prevents cargo from discarding the debug sections.
+[profile.perf]
+inherits  = "release"
+debug     = 1
+strip     = "none"
+# debug = 1 keeps line tables for symbol resolution without full debug overhead.
+# Build with RUSTFLAGS="-C force-frame-pointers=yes" to enable reliable
+# --call-graph fp unwinding under WSL2 / Hyper-V (preferred over DWARF there).
+
+[profile.perf.build-override]
+codegen-units = 1

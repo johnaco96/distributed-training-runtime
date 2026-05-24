@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: dtruntime-coordinator
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9090"]
+
+# In Kubernetes production, target the coordinator Service DNS or use an optional ServiceMonitor (Prometheus Operator).
