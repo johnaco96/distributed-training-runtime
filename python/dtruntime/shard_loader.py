@@ -288,6 +288,9 @@ class ShardLoader:
 
             # Report full consumption back to the coordinator so it can
             # track data-plane progress and re-assign on worker failure.
+            # Use the lease_epoch the coordinator included in the assignment
+            # so the progress report is not rejected as stale.
+            lease_epoch = int(getattr(shard, "lease_epoch", 0))
             bytes_read = features.nbytes + labels.nbytes
             prog_key = (
                 f"{idempotency_key}-prog-{shard_id}" if idempotency_key else ""
@@ -297,7 +300,7 @@ class ShardLoader:
                 worker_id=self.worker_id,
                 dataset_id=self.dataset_id,
                 shard_id=shard_id,
-                lease_epoch=0,
+                lease_epoch=lease_epoch,
                 progress_offset=bytes_read,
                 is_complete=True,
                 idempotency_key=prog_key,
