@@ -1,0 +1,32 @@
+# Gap 4: Production PKI — coordinator TLS leaf certificate
+#
+# cert-manager automatically provisions and rotates this certificate.
+# The resulting Secret (dtruntime-coordinator-tls) is mounted into the
+# coordinator Deployment and passed via --tls-cert / --tls-key.
+#
+# Apply after cluster-issuer.yaml:
+#   kubectl apply -n dtruntime -f k8s/prod/cert-manager/coordinator-certificate.yaml
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dtruntime-coordinator-tls
+  namespace: dtruntime
+spec:
+  secretName: dtruntime-coordinator-tls
+  duration: 2160h       # 90 days
+  renewBefore: 360h     # renew 15 days before expiry
+  commonName: runtime-coordinator.dtruntime.svc.cluster.local
+  dnsNames:
+    - runtime-coordinator
+    - runtime-coordinator.dtruntime
+    - runtime-coordinator.dtruntime.svc
+    - runtime-coordinator.dtruntime.svc.cluster.local
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: dtruntime-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io

@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use runtime_coordinator::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome};
+use runtime_coordinator::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome, DbAuditSink};
 use runtime_coordinator::auth::{AuthMode, Authorizer};
 use runtime_storage::S3StorageConfig;
 use runtime_coordinator::ha_lock::CoordinatorLockGuard;
 use runtime_coordinator::init_tracing_from_env;
-use runtime_coordinator::persistence::SqliteMetadataStore;
+use runtime_coordinator::persistence::{MetadataStore, SqliteMetadataStore};
 use runtime_coordinator::pg_store::PostgresMetadataStore;
 use runtime_coordinator::service::CoordinatorServiceImpl;
 use runtime_coordinator::state::CoordinatorState;
@@ -61,7 +61,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let audit = AuditLogger::tracing();
+    // Gap 5: build the audit logger; upgraded to DbAuditSink once the metadata
+    // store is initialised below.  Start with tracing-only so startup events
+    // are always captured even if the DB initialisation fails.
+    let mut audit = AuditLogger::tracing();
+
     let addr: SocketAddr = args.addr.parse()?;
     info!(%addr, "runtime-coordinator configured listen address");
 
@@ -70,6 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // Coordinator HA advisory-lock key: "DTRNCOOR" in ASCII (fits i64).
+    const PG_HA_LOCK_KEY: i64 = 0x4452_544e_434f_4f52;
 
     let state = if let Some(ref url) = args.metadata_db_url {
         // PostgreSQL: distributed, HA-capable, allows multiple coordinator replicas.
@@ -84,12 +91,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init_schema()
             .await
             .map_err(|e| format!("failed to init postgres schema: {e}"))?;
+
+        // Gap 3: PostgreSQL advisory lock for coordinator HA.
+        // Only one replica holds the lock at a time.  The standby polls until
+        // the leader releases it (process exit / connection drop), then takes over.
+        // While in standby the gRPC port is not bound so the k8s readiness probe
+        // (tcpSocket:50051) fails → k8s routes no traffic to the standby.
+        loop {
+            match store.try_acquire_advisory_lock(PG_HA_LOCK_KEY).await {
+                Ok(true) => {
+                    info!("coordinator HA: acquired PostgreSQL advisory lock — this replica is the leader");
+                    break;
+                }
+                Ok(false) => {
+                    info!("coordinator HA: advisory lock held by another replica — standing by (retry in 5s)");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    return Err(format!("failed to check PostgreSQL advisory lock: {e}").into());
+                }
+            }
+        }
+
+        let store: Arc<dyn MetadataStore> = Arc::new(store);
+        // Gap 5: wire the durable DB audit sink now that the store is ready.
+        audit = AuditLogger::new(Arc::new(DbAuditSink::new(Arc::clone(&store))));
         Arc::new(CoordinatorState::with_metadata_store(store))
     } else if let Some(ref path) = args.metadata_db {
         // SQLite: single-node, local dev / small deployments.
         info!(metadata_db_path = %path, "runtime-coordinator using sqlite metadata store");
         let store = SqliteMetadataStore::open(path)?;
         store.init_schema()?;
+        let store: Arc<dyn MetadataStore> = Arc::new(store);
+        // Gap 5: wire the durable DB audit sink.
+        audit = AuditLogger::new(Arc::new(DbAuditSink::new(Arc::clone(&store))));
         Arc::new(CoordinatorState::with_metadata_store(store))
     } else {
         Arc::new(CoordinatorState::default())

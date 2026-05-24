@@ -2,6 +2,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+use crate::persistence::{AuditEventEntry, MetadataStore};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuditOutcome {
@@ -127,6 +130,62 @@ impl AuditSink for InMemoryAuditSink {
     fn emit(&self, event: AuditEvent) {
         if let Ok(mut g) = self.events.lock() {
             g.push(event);
+        }
+    }
+}
+
+// ─── Gap 5: durable database-backed audit sink ───────────────────────────────
+
+/// Audit sink that writes every event to the coordinator's metadata store.
+///
+/// Both SQLite and PostgreSQL back-ends are supported; the store's
+/// `insert_audit_event` implementation handles the differences.
+///
+/// **Performance note**: `emit` is called synchronously in the gRPC handler
+/// hot path.  On PostgreSQL the store uses `block_in_place` internally so the
+/// call parks the current Tokio worker thread and drives the async INSERT.
+/// At current coordinator scale this is acceptable; for very high event rates
+/// consider a background channel writer.
+pub struct DbAuditSink {
+    store: Arc<dyn MetadataStore>,
+}
+
+impl DbAuditSink {
+    pub fn new(store: Arc<dyn MetadataStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl std::fmt::Debug for DbAuditSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbAuditSink").finish()
+    }
+}
+
+impl AuditSink for DbAuditSink {
+    fn emit(&self, event: AuditEvent) {
+        let occurred_at_millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let entry = AuditEventEntry {
+            occurred_at_millis,
+            kind: event.kind.map(|k| format!("{k:?}")),
+            outcome: event.outcome.map(|o| format!("{o:?}")),
+            subject: event.subject,
+            role: event.role,
+            worker_id: event.worker_id,
+            run_id: event.run_id,
+            dataset_id: event.dataset_id,
+            checkpoint_id: event.checkpoint_id,
+            reason: event.reason,
+            request_name: event.request_name,
+        };
+        if let Err(e) = self.store.insert_audit_event(&entry) {
+            // Log but do not panic — a broken audit sink should not take down
+            // the coordinator.
+            tracing::warn!(error = %e, "failed to persist audit event to DB");
         }
     }
 }
