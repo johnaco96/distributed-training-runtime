@@ -18,6 +18,7 @@ use std::fs;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -1286,5 +1287,317 @@ pub fn run_status_snapshot() -> Result<BenchmarkSummary, String> {
         }],
         1.0,
         json!({"status_fields_present":["uptime","version","service"],"secret_field_scan_passed":true,"duration_ms":1.0}),
+    ))
+}
+
+/// Run the full coordinator→shard-assignment→data-read pipeline with real files.
+///
+/// This benchmark exercises the entire hot path that a real ML training worker
+/// exercises:
+///   1. Write `num_shards` binary shard files to disk (`shard_size_bytes` each).
+///   2. Register a run + all `worker_count` workers with the coordinator.
+///   3. Register a dataset whose shard URIs point at those real files.
+///   4. Up to `concurrency` workers concurrently call `GetShardAssignment`,
+///      then actually read the returned file bytes, then call
+///      `ReportShardProgress(is_complete=true)`.
+///
+/// This closes the gap where previous benchmarks only exercised RPC control-
+/// plane throughput but never moved real shard data.
+#[allow(clippy::too_many_arguments)]
+pub fn run_sharded_data_load(
+    num_shards: usize,
+    shard_size_bytes: usize,
+    worker_count: usize,
+    concurrency: usize,
+    addr: Option<String>,
+    start_coordinator: bool,
+    root: Option<PathBuf>,
+    keep_data: bool,
+) -> Result<BenchmarkSummary, String> {
+    with_storage_root(root, keep_data, |root| {
+        let runtime = Runtime::new().map_err(|e| e.to_string())?;
+        runtime.block_on(run_sharded_data_load_async(
+            num_shards,
+            shard_size_bytes,
+            worker_count,
+            concurrency,
+            addr,
+            start_coordinator,
+            root,
+        ))
+    })
+}
+
+async fn run_sharded_data_load_async(
+    num_shards: usize,
+    shard_size_bytes: usize,
+    worker_count: usize,
+    concurrency: usize,
+    addr: Option<String>,
+    start_coordinator: bool,
+    root: &Path,
+) -> Result<BenchmarkSummary, String> {
+    // ── 1. Write real shard files (synchronous — done before any tasks run) ─
+    let shard_dir = root.join("sdl-shards");
+    fs::create_dir_all(&shard_dir).map_err(|e| e.to_string())?;
+    // Fill with a non-zero pattern so reads are meaningful.
+    let payload = vec![0xAB_u8; shard_size_bytes];
+    let mut shard_uris: Vec<(String, String)> = Vec::with_capacity(num_shards);
+    for i in 0..num_shards {
+        let path = shard_dir.join(format!("shard-{i}.bin"));
+        fs::write(&path, &payload).map_err(|e| format!("writing shard {i}: {e}"))?;
+        // Canonicalize so the coordinator hands back a real absolute path.
+        let abs = path
+            .canonicalize()
+            .map_err(|e| format!("canonicalize shard {i}: {e}"))?;
+        shard_uris.push((format!("shard-{i}"), format!("file://{}", abs.display())));
+    }
+
+    // ── 2. Connect to coordinator (optionally starting one) ────────────────
+    let raw_addr = addr.unwrap_or_else(|| "127.0.0.1:50053".to_string());
+    let coord_host_port = raw_addr.trim_start_matches("http://").to_string();
+    let mut child = if start_coordinator {
+        Some(start_local_coordinator(&coord_host_port)?)
+    } else {
+        None
+    };
+    let endpoint = if raw_addr.starts_with("http") {
+        raw_addr.clone()
+    } else {
+        format!("http://{raw_addr}")
+    };
+    let mut client = CoordinatorServiceClient::connect(endpoint)
+        .await
+        .map_err(|e| format!("connect to coordinator at {raw_addr}: {e}"))?;
+
+    let bench_id = format!(
+        "sdl-{}",
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+    );
+
+    // ── 3. Register run ────────────────────────────────────────────────────
+    let run_resp = client
+        .register_run(Request::new(RegisterRunRequest {
+            idempotency_key: format!("{bench_id}-run"),
+            run_name: "sharded-data-load-bench".into(),
+            assignment_policy: AssignmentPolicy::StaticRank as i32,
+            storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
+            world_size: worker_count.max(1) as u32,
+            run_version: "bench".into(),
+        }))
+        .await
+        .map_err(|e| format!("register_run: {e}"))?;
+    let run_id = run_resp
+        .into_inner()
+        .run_id
+        .ok_or_else(|| "register_run returned no run_id".to_string())?;
+
+    // ── 4. Register workers ────────────────────────────────────────────────
+    for i in 0..worker_count {
+        client
+            .register_worker(Request::new(RegisterWorkerRequest {
+                idempotency_key: format!("{bench_id}-worker-{i}"),
+                run_id: Some(run_id.clone()),
+                worker_id: Some(ProtoWorkerId {
+                    value: format!("sdl-worker-{i}"),
+                }),
+                rank: i as u32,
+                host: "bench".into(),
+                sdk_version: "bench".into(),
+                protocol_version: "v1".into(),
+            }))
+            .await
+            .map_err(|e| format!("register_worker {i}: {e}"))?;
+    }
+
+    // ── 5. Register dataset with real shard URIs ───────────────────────────
+    let dataset_id = runtime_proto::runtime::v1::DatasetId {
+        value: format!("{bench_id}-dataset"),
+    };
+    let shard_metas: Vec<runtime_proto::runtime::v1::ShardMetadata> = shard_uris
+        .iter()
+        .map(|(shard_id, uri)| runtime_proto::runtime::v1::ShardMetadata {
+            shard_id: Some(runtime_proto::runtime::v1::ShardId {
+                value: shard_id.clone(),
+            }),
+            dataset_id: Some(dataset_id.clone()),
+            shard_uri: uri.clone(),
+            byte_range_start: 0,
+            byte_range_end: shard_size_bytes as i64,
+            size_bytes: shard_size_bytes as i64,
+            checksum: String::new(),
+            checksum_algorithm: String::new(),
+        })
+        .collect();
+    client
+        .register_dataset(Request::new(
+            runtime_proto::runtime::v1::RegisterDatasetRequest {
+                idempotency_key: format!("{bench_id}-dataset"),
+                run_id: Some(run_id.clone()),
+                dataset: Some(runtime_proto::runtime::v1::DatasetMetadata {
+                    dataset_id: Some(dataset_id.clone()),
+                    name: "sdl-bench-dataset".into(),
+                    dataset_uri: format!("file://{}", shard_dir.display()),
+                    format: "binary".into(),
+                    shard_count: num_shards as u32,
+                    dataset_version: "v1".into(),
+                    labels: Default::default(),
+                    registered_at: None,
+                }),
+                shards: shard_metas,
+            },
+        ))
+        .await
+        .map_err(|e| format!("register_dataset: {e}"))?;
+
+    // ── 6. Concurrent shard-assignment + data-read per worker ─────────────
+    let total_start = Instant::now();
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let mut task_handles = Vec::with_capacity(worker_count);
+
+    for i in 0..worker_count {
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut wc = client.clone();
+        let run_id_c = run_id.clone();
+        let dataset_id_c = dataset_id.clone();
+        let bench_id_c = bench_id.clone();
+
+        task_handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            let mut worker_samples: Vec<BenchmarkSample> = Vec::new();
+
+            // GetShardAssignment ─────────────────────────────────────────
+            let t_assign = Instant::now();
+            let assign_result = wc
+                .get_shard_assignment(Request::new(
+                    runtime_proto::runtime::v1::GetShardAssignmentRequest {
+                        run_id: Some(run_id_c.clone()),
+                        worker_id: Some(ProtoWorkerId {
+                            value: format!("sdl-worker-{i}"),
+                        }),
+                        dataset_id: Some(dataset_id_c.clone()),
+                        idempotency_key: format!("{bench_id_c}-assign-{i}"),
+                    },
+                ))
+                .await;
+            let assign_ms = t_assign.elapsed().as_secs_f64() * 1000.0;
+            // `GetShardAssignmentResponse.assignments` is Vec<ShardAssignment>;
+            // each ShardAssignment has shard_id (Option<ShardId>) and shard_uri.
+            let assignments = assign_result
+                .ok()
+                .map(|r| r.into_inner().assignments)
+                .unwrap_or_default();
+
+            worker_samples.push(BenchmarkSample {
+                latency_ms: assign_ms,
+                bytes: 0,
+                success: !assignments.is_empty(),
+                retry_count: 0,
+            });
+
+            // Read each assigned shard from disk ─────────────────────────
+            for shard in &assignments {
+                let uri = &shard.shard_uri;
+                // Strip "file://" prefix the coordinator echoes back.
+                let path_str = uri.strip_prefix("file://").unwrap_or(uri.as_str());
+                let t_read = Instant::now();
+                let read_result = tokio::fs::read(path_str).await;
+                let read_ms = t_read.elapsed().as_secs_f64() * 1000.0;
+                let (ok, nbytes) = match &read_result {
+                    Ok(data) => (true, data.len() as u64),
+                    Err(_) => (false, 0),
+                };
+                worker_samples.push(BenchmarkSample {
+                    latency_ms: read_ms,
+                    bytes: nbytes,
+                    success: ok,
+                    retry_count: 0,
+                });
+
+                // ReportShardProgress(is_complete=true) ──────────────────
+                if ok {
+                    if let Some(shard_id) = &shard.shard_id {
+                        let t_prog = Instant::now();
+                        let prog_ok = wc
+                            .report_shard_progress(Request::new(
+                                runtime_proto::runtime::v1::ReportShardProgressRequest {
+                                    run_id: Some(run_id_c.clone()),
+                                    worker_id: Some(ProtoWorkerId {
+                                        value: format!("sdl-worker-{i}"),
+                                    }),
+                                    dataset_id: Some(dataset_id_c.clone()),
+                                    shard_id: Some(shard_id.clone()),
+                                    lease_epoch: 0,
+                                    // Report full shard read as progress_offset.
+                                    progress_offset: nbytes as i64,
+                                    is_complete: true,
+                                    idempotency_key: format!(
+                                        "{bench_id_c}-prog-{i}-{}",
+                                        shard_id.value
+                                    ),
+                                },
+                            ))
+                            .await
+                            .is_ok();
+                        let prog_ms = t_prog.elapsed().as_secs_f64() * 1000.0;
+                        worker_samples.push(BenchmarkSample {
+                            latency_ms: prog_ms,
+                            bytes: 0,
+                            success: prog_ok,
+                            retry_count: 0,
+                        });
+                    }
+                }
+            }
+            worker_samples
+        }));
+    }
+
+    // Collect all per-worker samples
+    let mut all_samples: Vec<BenchmarkSample> = Vec::new();
+    for handle in task_handles {
+        match handle.await {
+            Ok(samples) => all_samples.extend(samples),
+            Err(_) => all_samples.push(BenchmarkSample {
+                latency_ms: 0.0,
+                bytes: 0,
+                success: false,
+                retry_count: 0,
+            }),
+        }
+    }
+
+    let elapsed_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+
+    if let Some(mut c) = child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    Ok(BenchmarkSummary::from_samples(
+        "sharded-data-load",
+        "local-dev",
+        "coordinator-rpc+data-read",
+        "shard-assign-read-report",
+        vec![
+            "real coordinator gRPC shard assignment".into(),
+            "actual filesystem shard reads".into(),
+            "real ReportShardProgress RPCs".into(),
+        ],
+        &all_samples,
+        elapsed_ms,
+        json!({
+            "num_shards": num_shards,
+            "shard_size_bytes": shard_size_bytes,
+            "worker_count": worker_count,
+            "concurrency": concurrency,
+            "start_coordinator": start_coordinator,
+        }),
     ))
 }

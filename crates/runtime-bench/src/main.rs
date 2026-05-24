@@ -4,8 +4,9 @@ use clap::{Parser, Subcommand};
 use runtime_bench::{
     parse_workers_list, run_auth_audit_overhead, run_cache_aware_placement, run_checkpoint_restore,
     run_checkpoint_write, run_dataset_prefetch, run_dataset_read, run_logical_workers,
-    run_scaling_workers, run_status_snapshot, run_worker_rpc, validate_worker_counts,
-    write_outputs, write_outputs_many, DEFAULT_SCALING_WORKERS, DEFAULT_SIMULATED_SCALING_WORKERS,
+    run_scaling_workers, run_sharded_data_load, run_status_snapshot, run_worker_rpc,
+    validate_worker_counts, write_outputs, write_outputs_many, DEFAULT_SCALING_WORKERS,
+    DEFAULT_SIMULATED_SCALING_WORKERS,
 };
 use std::path::PathBuf;
 
@@ -163,6 +164,42 @@ enum Command {
         addr: Option<String>,
         #[arg(long, default_value_t = true)]
         start_coordinator: bool,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+        #[arg(long)]
+        out_json: Option<PathBuf>,
+    },
+
+    /// End-to-end benchmark: coordinator assigns real shard URIs, workers read
+    /// actual file bytes, and progress is reported back via gRPC.
+    ///
+    /// Unlike other benchmarks this exercises the full data-plane:
+    ///   coordinator RPC → shard assignment → filesystem read → progress report.
+    ShardedDataLoad {
+        /// Number of shard files to create (default 64, ~1 MiB each = 64 MiB total).
+        #[arg(long, default_value_t = 64)]
+        num_shards: usize,
+        /// Bytes per shard file written to disk.
+        #[arg(long, default_value_t = 1_048_576)]
+        shard_size_bytes: usize,
+        /// Simulated worker count (each worker calls GetShardAssignment + reads).
+        #[arg(long, default_value_t = 8)]
+        worker_count: usize,
+        /// Max concurrent worker tasks (limits parallelism, not worker count).
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+        /// Coordinator address; defaults to 127.0.0.1:50053.
+        #[arg(long)]
+        addr: Option<String>,
+        /// When true, spawn a local coordinator subprocess automatically.
+        #[arg(long, default_value_t = true)]
+        start_coordinator: bool,
+        /// Directory root for shard files; uses a tempdir if omitted.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Keep shard files after the benchmark finishes.
+        #[arg(long, default_value_t = false)]
+        keep_data: bool,
         #[arg(long)]
         out_csv: Option<PathBuf>,
         #[arg(long)]
@@ -345,6 +382,31 @@ fn main() -> Result<(), String> {
             out_csv,
             out_json,
         ),
+        Command::ShardedDataLoad {
+            num_shards,
+            shard_size_bytes,
+            worker_count,
+            concurrency,
+            addr,
+            start_coordinator,
+            root,
+            keep_data,
+            out_csv,
+            out_json,
+        } => (
+            vec![run_sharded_data_load(
+                num_shards,
+                shard_size_bytes,
+                worker_count,
+                concurrency,
+                addr,
+                start_coordinator,
+                root,
+                keep_data,
+            )?],
+            out_csv,
+            out_json,
+        ),
     };
 
     for summary in &summaries {
@@ -487,6 +549,65 @@ mod tests {
                 assert!(start_coordinator);
             }
             _ => panic!("expected logical-workers subcommand"),
+        }
+    }
+
+    #[test]
+    fn sharded_data_load_subcommand_parses_defaults() {
+        let cli = Cli::parse_from(["runtime-bench", "sharded-data-load"]);
+        match cli.cmd {
+            Command::ShardedDataLoad {
+                num_shards,
+                shard_size_bytes,
+                worker_count,
+                concurrency,
+                addr,
+                start_coordinator,
+                ..
+            } => {
+                assert_eq!(num_shards, 64);
+                assert_eq!(shard_size_bytes, 1_048_576);
+                assert_eq!(worker_count, 8);
+                assert_eq!(concurrency, 16);
+                assert!(addr.is_none());
+                assert!(start_coordinator);
+            }
+            _ => panic!("expected sharded-data-load subcommand"),
+        }
+    }
+
+    #[test]
+    fn sharded_data_load_subcommand_parses_custom() {
+        let cli = Cli::parse_from([
+            "runtime-bench",
+            "sharded-data-load",
+            "--num-shards",
+            "32",
+            "--shard-size-bytes",
+            "65536",
+            "--worker-count",
+            "4",
+            "--concurrency",
+            "4",
+            "--addr",
+            "127.0.0.1:50053",
+        ]);
+        match cli.cmd {
+            Command::ShardedDataLoad {
+                num_shards,
+                shard_size_bytes,
+                worker_count,
+                concurrency,
+                addr,
+                ..
+            } => {
+                assert_eq!(num_shards, 32);
+                assert_eq!(shard_size_bytes, 65536);
+                assert_eq!(worker_count, 4);
+                assert_eq!(concurrency, 4);
+                assert_eq!(addr.as_deref(), Some("127.0.0.1:50053"));
+            }
+            _ => panic!("expected sharded-data-load subcommand"),
         }
     }
 }

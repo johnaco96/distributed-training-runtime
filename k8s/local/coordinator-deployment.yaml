@@ -37,15 +37,15 @@ spec:
                 secretKeyRef:
                   name: postgres-credentials
                   key: DATABASE_URL
-            # Optional S3 / MinIO settings — leave unset for local-only storage.
-            - name: DTRUNTIME_S3_ENDPOINT
-              value: ""
-            - name: DTRUNTIME_S3_BUCKET
-              value: ""
-            - name: DTRUNTIME_S3_ACCESS_KEY
-              value: ""
-            - name: DTRUNTIME_S3_SECRET_KEY
-              value: ""
+            # S3/MinIO: uncomment and populate to enable object storage.
+            # - name: DTRUNTIME_S3_ENDPOINT
+            #   value: "http://minio:9000"
+            # - name: DTRUNTIME_S3_BUCKET
+            #   value: "dtruntime"
+            # - name: DTRUNTIME_S3_ACCESS_KEY
+            #   valueFrom: { secretKeyRef: { name: minio-credentials, key: access_key } }
+            # - name: DTRUNTIME_S3_SECRET_KEY
+            #   valueFrom: { secretKeyRef: { name: minio-credentials, key: secret_key } }
           ports:
             - containerPort: 50051
               name: grpc

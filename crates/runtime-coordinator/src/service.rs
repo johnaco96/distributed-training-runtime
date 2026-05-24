@@ -30,6 +30,11 @@ pub struct CoordinatorServiceImpl {
     storage_root: Option<Arc<PathBuf>>,
     s3_backend: Option<Arc<S3Storage>>,
     s3_bucket: Option<String>,
+    /// When `true`, every streamed checkpoint artifact is re-read from disk
+    /// immediately after writing and its SHA-256 is verified against the
+    /// inline checksum computed during the stream.  Detects partial writes,
+    /// silent truncation, and filesystem corruption.  Default: `true`.
+    verify_checkpoint_artifacts: bool,
 }
 
 impl CoordinatorServiceImpl {
@@ -74,7 +79,20 @@ impl CoordinatorServiceImpl {
             storage_root: None,
             s3_backend: None,
             s3_bucket: None,
+            verify_checkpoint_artifacts: true,
         }
+    }
+
+    /// Enable or disable post-write checksum verification for checkpoint artifacts.
+    ///
+    /// When enabled (the default), every artifact written by
+    /// `stream_checkpoint_artifact` is immediately re-read from disk and its
+    /// SHA-256 is compared to the inline checksum computed during streaming.
+    /// Disable only when I/O overhead is measurably unacceptable and storage
+    /// reliability is otherwise guaranteed.
+    pub fn with_artifact_verification(mut self, enabled: bool) -> Self {
+        self.verify_checkpoint_artifacts = enabled;
+        self
     }
 
     pub fn with_storage_root(mut self, root: PathBuf) -> Self {
@@ -889,6 +907,27 @@ impl CoordinatorService for CoordinatorServiceImpl {
         drop(file);
 
         let checksum = hex::encode(hasher.finalize());
+
+        // Post-write integrity verification: re-read the stored file from disk
+        // and confirm its SHA-256 matches the inline checksum computed while
+        // streaming.  Catches partial writes, silent truncation, and filesystem
+        // corruption before the coordinator reports the artifact as accepted.
+        if self.verify_checkpoint_artifacts {
+            let stored = tokio::fs::read(&artifact_path).await.map_err(|e| {
+                Status::data_loss(format!(
+                    "artifact verification: could not re-read {}: {e}",
+                    artifact_path.display()
+                ))
+            })?;
+            let stored_checksum = hex::encode(Sha256::digest(&stored));
+            if stored_checksum != checksum {
+                return Err(Status::data_loss(format!(
+                    "artifact checksum mismatch after write \
+                     (stream_sha256={checksum} disk_sha256={stored_checksum}); \
+                     artifact may be corrupt — rejecting to prevent silent data loss"
+                )));
+            }
+        }
 
         // Upload to S3 when backend is configured. The local file is written first
         // for immediate coordinator-side availability; S3 provides durable object storage.
