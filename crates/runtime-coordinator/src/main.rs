@@ -43,6 +43,11 @@ struct CoordinatorCliArgs {
     s3_secret_key: Option<String>,
     s3_region: String,
     max_s3_concurrent_ops: Option<usize>,
+    /// Re-read each streamed artifact from disk after write and verify its
+    /// SHA-256 matches the inline checksum.  Defaults to `true`.  Disable
+    /// with `--no-verify-checkpoint-artifacts` for maximum throughput when
+    /// storage reliability is otherwise guaranteed.
+    verify_checkpoint_artifacts: bool,
     show_help: bool,
 }
 
@@ -94,7 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mtls_enabled = args.tls_client_ca.is_some();
     let auth_mode = args.auth_mode;
     let mut service =
-        CoordinatorServiceImpl::with_authorizer(state.clone(), Authorizer::new(args.auth_mode));
+        CoordinatorServiceImpl::with_authorizer(state.clone(), Authorizer::new(args.auth_mode))
+            .with_artifact_verification(args.verify_checkpoint_artifacts);
+    if args.verify_checkpoint_artifacts {
+        info!("runtime-coordinator checkpoint artifact post-write verification enabled");
+    } else {
+        info!("runtime-coordinator checkpoint artifact post-write verification DISABLED");
+    }
     if let Some(ref root) = args.storage_root {
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
         info!(storage_root = %root.display(), "runtime-coordinator storage root configured");
@@ -266,6 +277,9 @@ fn print_usage() {
     println!("  --s3-region <REGION>       S3 region (default: us-east-1, env: DTRUNTIME_S3_REGION)");
     println!("  --max-s3-concurrent-ops N  Max concurrent S3 operations (default: 64).");
     println!("                             Set >= world_size to avoid semaphore stalls at scale.");
+    println!("  --no-verify-checkpoint-artifacts");
+    println!("                             Disable post-write SHA-256 re-read of checkpoint");
+    println!("                             artifacts (default: verification on).");
     println!("  --help, -h                 Show this help message");
 }
 
@@ -296,6 +310,7 @@ fn coordinator_args(
         s3_region: std::env::var("DTRUNTIME_S3_REGION")
             .unwrap_or_else(|_| "us-east-1".to_string()),
         max_s3_concurrent_ops: None,
+        verify_checkpoint_artifacts: true,
         show_help: false,
     };
 
@@ -354,6 +369,8 @@ fn coordinator_args(
         } else if arg == "--metadata-db-url" {
             parsed.metadata_db_url =
                 Some(args.next().ok_or("--metadata-db-url requires a URL")?);
+        } else if arg == "--no-verify-checkpoint-artifacts" {
+            parsed.verify_checkpoint_artifacts = false;
         } else if arg == "--help" || arg == "-h" {
             parsed.show_help = true;
         } else {
@@ -396,6 +413,7 @@ mod tests {
                 s3_region: std::env::var("DTRUNTIME_S3_REGION")
                     .unwrap_or_else(|_| "us-east-1".to_string()),
                 max_s3_concurrent_ops: None,
+                verify_checkpoint_artifacts: true,
                 show_help: false,
             }
         );

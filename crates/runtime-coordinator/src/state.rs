@@ -2,8 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
+
+use dashmap::DashMap;
 
 use runtime_checkpoint::{
     ArtifactRecord, CheckpointError, CheckpointId as DomainCheckpointId, CheckpointRecord,
@@ -29,12 +31,42 @@ pub enum DatasetPlacementPolicy {
     CacheAware,
 }
 
-/// Shared coordinator state.
+/// Shared coordinator state — lock-free at the collection level via DashMap.
 ///
-/// This is intentionally in-memory only for the MVP coordinator. It is not
-/// persisted and will be lost when the process exits.
+/// Each top-level map is a [`DashMap`] that shards keys across independent
+/// read-write locks.  Nested per-run collections (workers, datasets,
+/// checkpoints) are stored as `Arc<RwLock<HashMap>>`, so operations on
+/// different runs are fully concurrent: a heartbeat for run A does not block
+/// any operation for run B.
+///
+/// Concurrency properties:
+/// - Different-run operations: non-contending (separate DashMap shards + per-run locks)
+/// - Same-run reads (shard assignment, heartbeat read): concurrent via `RwLock::read`
+/// - Same-run writes (heartbeat update, begin_checkpoint): serialised per run
+/// - Shard progress updates: lock-free per shard via DashMap
+/// - Idempotency checks: atomic via `DashMap::entry()` shard-level locking
 pub struct CoordinatorState {
-    inner: RwLock<CoordinatorStateInner>,
+    // Run registry — read-mostly after registration
+    runs: DashMap<String, RunRecord>,
+    run_idempotency_keys: DashMap<String, String>,
+
+    // Per-run worker state.  Arc<RwLock<...>> gives per-run serialisation
+    // while allowing concurrent access across different runs.
+    workers_by_run: DashMap<String, Arc<RwLock<HashMap<String, WorkerRecord>>>>,
+    worker_idempotency_keys: DashMap<String, String>,
+
+    // Per-run dataset + shard metadata
+    datasets_by_run: DashMap<String, Arc<RwLock<HashMap<String, DatasetRecord>>>>,
+    dataset_idempotency_keys: DashMap<String, String>,
+
+    // Per-shard progress — lock-free concurrent updates via DashMap
+    shard_progress: DashMap<ShardProgressKey, ShardProgressRecord>,
+
+    // Per-run checkpoint records
+    checkpoints_by_run: DashMap<String, Arc<RwLock<HashMap<String, CoordinatorCheckpointRecord>>>>,
+    checkpoint_idempotency_keys: DashMap<String, String>,
+    checkpoint_artifact_idempotency_keys: DashMap<String, String>,
+
     placement_policy: DatasetPlacementPolicy,
     /// Optional persistence back-end.  Either [`SqliteMetadataStore`] (single-
     /// node) or [`crate::pg_store::PostgresMetadataStore`] (distributed HA).
@@ -46,19 +78,7 @@ pub struct CoordinatorState {
     next_checkpoint_id: AtomicU64,
 }
 
-#[derive(Debug, Default)]
-struct CoordinatorStateInner {
-    runs: HashMap<String, RunRecord>,
-    run_idempotency_keys: HashMap<String, String>,
-    workers_by_run: HashMap<String, HashMap<String, WorkerRecord>>,
-    worker_idempotency_keys: HashMap<String, String>,
-    datasets_by_run: HashMap<String, HashMap<String, DatasetRecord>>,
-    dataset_idempotency_keys: HashMap<String, String>,
-    shard_progress: HashMap<ShardProgressKey, ShardProgressRecord>,
-    checkpoints_by_run: HashMap<String, HashMap<String, CoordinatorCheckpointRecord>>,
-    checkpoint_idempotency_keys: HashMap<String, String>,
-    checkpoint_artifact_idempotency_keys: HashMap<String, String>,
-}
+// ─── record types ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunRecord {
@@ -207,6 +227,8 @@ pub struct CoordinatorCheckpointRecord {
     pub expected_artifact_count: u32,
 }
 
+// ─── error types ─────────────────────────────────────────────────────────────
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BeginCheckpointError {
     RunNotFound,
@@ -283,10 +305,21 @@ pub enum ReportShardProgressError {
     WorkerNotActive,
 }
 
+// ─── CoordinatorState implementation ─────────────────────────────────────────
+
 impl Default for CoordinatorState {
     fn default() -> Self {
         Self {
-            inner: RwLock::new(CoordinatorStateInner::default()),
+            runs: DashMap::new(),
+            run_idempotency_keys: DashMap::new(),
+            workers_by_run: DashMap::new(),
+            worker_idempotency_keys: DashMap::new(),
+            datasets_by_run: DashMap::new(),
+            dataset_idempotency_keys: DashMap::new(),
+            shard_progress: DashMap::new(),
+            checkpoints_by_run: DashMap::new(),
+            checkpoint_idempotency_keys: DashMap::new(),
+            checkpoint_artifact_idempotency_keys: DashMap::new(),
             metadata_store: None,
             next_run_id: AtomicU64::new(0),
             next_worker_id: AtomicU64::new(0),
@@ -306,6 +339,13 @@ impl CoordinatorState {
         }
     }
 
+    pub fn with_metadata_store(metadata_store: impl MetadataStore + 'static) -> Self {
+        Self {
+            metadata_store: Some(Box::new(metadata_store)),
+            ..Self::default()
+        }
+    }
+
     fn ensure_worker_active_for_lease_actions(worker: &WorkerRecord) -> Result<(), WorkerState> {
         if worker.state == WorkerState::Active as i32 {
             return Ok(());
@@ -313,12 +353,7 @@ impl CoordinatorState {
         Err(WorkerState::try_from(worker.state).unwrap_or(WorkerState::Unspecified))
     }
 
-    pub fn with_metadata_store(metadata_store: impl MetadataStore + 'static) -> Self {
-        Self {
-            metadata_store: Some(Box::new(metadata_store)),
-            ..Self::default()
-        }
-    }
+    // ── persistence helpers ──────────────────────────────────────────────────
 
     fn persist_run(&self, run: &RunRecord) {
         if let Some(store) = &self.metadata_store {
@@ -352,6 +387,8 @@ impl CoordinatorState {
         }
     }
 
+    // ── public state methods ─────────────────────────────────────────────────
+
     pub fn begin_checkpoint(
         &self,
         run_id: String,
@@ -363,29 +400,31 @@ impl CoordinatorState {
         if worker_id.trim().is_empty() {
             return Err(BeginCheckpointError::InvalidWorkerId);
         }
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
-        if !inner.runs.contains_key(&run_id) {
+        if !self.runs.contains_key(&run_id) {
             return Err(BeginCheckpointError::RunNotFound);
         }
-        if !inner
+        if !self
             .workers_by_run
             .get(&run_id)
-            .is_some_and(|workers| workers.contains_key(&worker_id))
+            .is_some_and(|arc| arc.read().unwrap().contains_key(&worker_id))
         {
             return Err(BeginCheckpointError::WorkerNotFound);
         }
 
-        let scoped_idempotency_key = checkpoint_idempotency_key(&run_id, &idempotency_key);
-        if let Some(existing_checkpoint_id) =
-            idempotency_lookup(&inner.checkpoint_idempotency_keys, &scoped_idempotency_key)
-        {
-            let record = inner
-                .checkpoints_by_run
-                .get(&run_id)
-                .and_then(|records| records.get(&existing_checkpoint_id))
-                .cloned()
-                .expect("checkpoint idempotency key must reference an existing checkpoint");
-            return Ok(record);
+        let scoped_key = checkpoint_idempotency_key(&run_id, &idempotency_key);
+
+        // Atomic idempotency check via DashMap entry shard lock.
+        // If the key already exists, return the previously-created checkpoint.
+        if !scoped_key.is_empty() {
+            if let Some(existing_id) = self.checkpoint_idempotency_keys.get(&scoped_key) {
+                let existing_id = existing_id.clone();
+                let record = self
+                    .checkpoints_by_run
+                    .get(&run_id)
+                    .and_then(|arc| arc.read().unwrap().get(&existing_id).cloned())
+                    .expect("checkpoint idempotency key must reference an existing checkpoint");
+                return Ok(record);
+            }
         }
 
         let checkpoint_id = if checkpoint_id.trim().is_empty() {
@@ -394,14 +433,17 @@ impl CoordinatorState {
             checkpoint_id
         };
 
-        if let Some(existing) = inner
+        // Get or create the per-run checkpoint map.
+        let checkpoints_arc = self
             .checkpoints_by_run
-            .get(&run_id)
-            .and_then(|records| records.get(&checkpoint_id))
-        {
+            .entry(run_id.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+            .value()
+            .clone();
+        let mut checkpoints = checkpoints_arc.write().unwrap();
+
+        if let Some(existing) = checkpoints.get(&checkpoint_id) {
             // Any worker may join an in-progress checkpoint for the same step.
-            // This is the normal distributed case: N workers all call begin_checkpoint
-            // with the same checkpoint_id before streaming their artifacts.
             if existing.checkpoint.step == step {
                 return Ok(existing.clone());
             }
@@ -409,17 +451,19 @@ impl CoordinatorState {
         }
 
         let now_millis = now_millis();
-        let expected_worker_ids = inner
+        let expected_worker_ids = self
             .workers_by_run
             .get(&run_id)
-            .map(|workers| {
-                workers
+            .map(|arc| {
+                arc.read()
+                    .unwrap()
                     .values()
-                    .filter(|worker| worker.state == WorkerState::Active as i32)
-                    .map(|worker| worker.worker_id.clone())
+                    .filter(|w| w.state == WorkerState::Active as i32)
+                    .map(|w| w.worker_id.clone())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+
         let record = CoordinatorCheckpointRecord {
             checkpoint: CheckpointRecord::new(
                 DomainRunId(run_id.clone()),
@@ -432,16 +476,12 @@ impl CoordinatorState {
             expected_artifact_count: expected_worker_ids.len() as u32,
             expected_worker_ids,
         };
-        inner
-            .checkpoints_by_run
-            .entry(run_id.clone())
-            .or_default()
-            .insert(checkpoint_id.clone(), record.clone());
+        checkpoints.insert(checkpoint_id.clone(), record.clone());
+        drop(checkpoints);
 
         if !idempotency_key.is_empty() {
-            inner
-                .checkpoint_idempotency_keys
-                .insert(scoped_idempotency_key, checkpoint_id);
+            self.checkpoint_idempotency_keys
+                .insert(scoped_key, checkpoint_id);
         }
         Ok(record)
     }
@@ -451,13 +491,11 @@ impl CoordinatorState {
         run_id: &RunId,
         checkpoint_id: &str,
     ) -> Option<CoordinatorCheckpointRecord> {
-        let inner = self.inner.read().expect("coordinator state lock poisoned");
-        inner
-            .checkpoints_by_run
+        self.checkpoints_by_run
             .get(&run_id.value)
-            .and_then(|records| records.get(checkpoint_id))
-            .cloned()
+            .and_then(|arc| arc.read().unwrap().get(checkpoint_id).cloned())
     }
+
     #[allow(clippy::too_many_arguments)]
     pub fn report_checkpoint_artifact(
         &self,
@@ -481,36 +519,43 @@ impl CoordinatorState {
                 "artifact_uri must be non-empty",
             ));
         }
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
-        if !inner.runs.contains_key(&run_id) {
+        if !self.runs.contains_key(&run_id) {
             return Err(ReportCheckpointArtifactError::RunNotFound);
         }
-        if !inner
+        if !self
             .workers_by_run
             .get(&run_id)
-            .is_some_and(|workers| workers.contains_key(&worker_id))
+            .is_some_and(|arc| arc.read().unwrap().contains_key(&worker_id))
         {
             return Err(ReportCheckpointArtifactError::WorkerNotFound);
         }
+
         let scoped_idempotency_key =
             checkpoint_artifact_idempotency_key(&run_id, &checkpoint_id, &idempotency_key);
         if !idempotency_key.is_empty()
-            && inner
+            && self
                 .checkpoint_artifact_idempotency_keys
                 .contains_key(&scoped_idempotency_key)
         {
-            return inner
+            return self
                 .checkpoints_by_run
                 .get(&run_id)
-                .and_then(|records| records.get(&checkpoint_id))
-                .cloned()
+                .and_then(|arc| arc.read().unwrap().get(&checkpoint_id).cloned())
                 .ok_or(ReportCheckpointArtifactError::CheckpointNotFound);
         }
-        let record = inner
+
+        let checkpoints_arc = self
             .checkpoints_by_run
-            .get_mut(&run_id)
-            .and_then(|records| records.get_mut(&checkpoint_id))
+            .get(&run_id)
+            .ok_or(ReportCheckpointArtifactError::CheckpointNotFound)?
+            .value()
+            .clone();
+        let mut checkpoints = checkpoints_arc.write().unwrap();
+
+        let record = checkpoints
+            .get_mut(&checkpoint_id)
             .ok_or(ReportCheckpointArtifactError::CheckpointNotFound)?;
+
         let now_millis = now_millis();
         if record.checkpoint.state == DomainCheckpointState::Initiated {
             record
@@ -537,7 +582,7 @@ impl CoordinatorState {
             .checkpoint
             .artifacts
             .iter()
-            .filter(|artifact| artifact.worker_id.0 == worker_id)
+            .filter(|a| a.worker_id.0 == worker_id)
             .count();
         if duplicate_reports > 1 {
             let latest = record
@@ -550,7 +595,7 @@ impl CoordinatorState {
                 .checkpoint
                 .artifacts
                 .iter()
-                .find(|artifact| artifact.worker_id.0 == worker_id)
+                .find(|a| a.worker_id.0 == worker_id)
                 .expect("worker artifact must exist");
             if first != &latest {
                 return Err(ReportCheckpointArtifactError::InvalidInput(
@@ -560,13 +605,14 @@ impl CoordinatorState {
             record.checkpoint.artifacts.pop();
         }
         let response = record.clone();
+        drop(checkpoints);
+
         if let Some(last) = response.checkpoint.artifacts.last() {
             self.persist_artifact(&run_id, &checkpoint_id, last);
         }
         self.persist_checkpoint(&run_id, "", &response);
         if !idempotency_key.is_empty() {
-            inner
-                .checkpoint_artifact_idempotency_keys
+            self.checkpoint_artifact_idempotency_keys
                 .insert(scoped_idempotency_key, checkpoint_id);
         }
         Ok(response)
@@ -588,15 +634,20 @@ impl CoordinatorState {
                 "checkpoint_id must be non-empty",
             ));
         }
-
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
-        if !inner.runs.contains_key(&run_id) {
+        if !self.runs.contains_key(&run_id) {
             return Err(CommitCheckpointError::RunNotFound);
         }
-        let record = inner
+
+        let checkpoints_arc = self
             .checkpoints_by_run
-            .get_mut(&run_id)
-            .and_then(|records| records.get_mut(&checkpoint_id))
+            .get(&run_id)
+            .ok_or(CommitCheckpointError::CheckpointNotFound)?
+            .value()
+            .clone();
+        let mut checkpoints = checkpoints_arc.write().unwrap();
+
+        let record = checkpoints
+            .get_mut(&checkpoint_id)
             .ok_or(CommitCheckpointError::CheckpointNotFound)?;
 
         if record.checkpoint.artifacts.is_empty() {
@@ -612,7 +663,7 @@ impl CoordinatorState {
             .checkpoint
             .artifacts
             .iter()
-            .map(|artifact| artifact.worker_id.0.clone())
+            .map(|a| a.worker_id.0.clone())
             .collect();
         let expected_workers: std::collections::BTreeSet<String> =
             record.expected_worker_ids.iter().cloned().collect();
@@ -653,12 +704,16 @@ impl CoordinatorState {
         };
 
         let response = record.clone();
-        if let Some(run) = inner.runs.get_mut(&run_id) {
+        drop(checkpoints);
+
+        // Update the run's latest checkpoint pointer.
+        if let Some(mut run) = self.runs.get_mut(&run_id) {
             run.latest_checkpoint_id = Some(CheckpointId {
-                value: checkpoint_id,
+                value: checkpoint_id.clone(),
             });
             run.latest_checkpoint_state = CheckpointState::Committed as i32;
         }
+
         if let Some(store) = &self.metadata_store {
             store
                 .mark_checkpoint_committed(
@@ -684,6 +739,7 @@ impl CoordinatorState {
             ));
         }
 
+        // Try the persistence back-end first (survives coordinator restarts).
         if let Some(store) = &self.metadata_store {
             if let Some(record) = store
                 .load_latest_checkpoint(&run_id)
@@ -693,21 +749,22 @@ impl CoordinatorState {
             }
         }
 
-        let inner = self.inner.read().expect("coordinator state lock poisoned");
-        let run = inner
+        let run = self
             .runs
             .get(&run_id)
             .ok_or(GetLatestCheckpointError::RunNotFound)?;
         let latest_checkpoint_id = run
             .latest_checkpoint_id
             .as_ref()
-            .ok_or(GetLatestCheckpointError::NoCommittedCheckpoint)?;
+            .ok_or(GetLatestCheckpointError::NoCommittedCheckpoint)?
+            .value
+            .clone();
+        drop(run);
 
-        let record = inner
+        let record = self
             .checkpoints_by_run
             .get(&run_id)
-            .and_then(|records| records.get(&latest_checkpoint_id.value))
-            .cloned()
+            .and_then(|arc| arc.read().unwrap().get(&latest_checkpoint_id).cloned())
             .ok_or(GetLatestCheckpointError::LatestCheckpointMissing)?;
 
         if record.checkpoint.state != DomainCheckpointState::Committed {
@@ -718,21 +775,21 @@ impl CoordinatorState {
     }
 
     pub fn register_run(&self, request: RegisterRunRequest) -> RegisteredRun {
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
-
-        if let Some(run_id) =
-            idempotency_lookup(&inner.run_idempotency_keys, &request.idempotency_key)
-        {
-            let record = inner
-                .runs
-                .get(&run_id)
-                .expect("idempotency key must reference an existing run");
-            return RegisteredRun {
-                run_id: RunId {
-                    value: record.run_id.clone(),
-                },
-                registered_at: record.registered_at,
-            };
+        // Atomic idempotency check.
+        if !request.idempotency_key.is_empty() {
+            if let Some(run_id) = self.run_idempotency_keys.get(&request.idempotency_key) {
+                let run_id = run_id.clone();
+                let record = self
+                    .runs
+                    .get(&run_id)
+                    .expect("idempotency key must reference an existing run");
+                return RegisteredRun {
+                    run_id: RunId {
+                        value: record.run_id.clone(),
+                    },
+                    registered_at: record.registered_at,
+                };
+            }
         }
 
         let run_id = self.generate_run_id();
@@ -750,12 +807,11 @@ impl CoordinatorState {
             latest_checkpoint_state: CheckpointState::Unspecified as i32,
         };
 
+        self.runs.insert(run_id.clone(), record.clone());
         if !request.idempotency_key.is_empty() {
-            inner
-                .run_idempotency_keys
+            self.run_idempotency_keys
                 .insert(request.idempotency_key, run_id.clone());
         }
-        inner.runs.insert(run_id.clone(), record.clone());
         self.persist_run(&record);
 
         RegisteredRun {
@@ -765,39 +821,44 @@ impl CoordinatorState {
     }
 
     pub fn get_run(&self, run_id: &RunId) -> Option<RunRecord> {
-        let inner = self.inner.read().expect("coordinator state lock poisoned");
-        inner.runs.get(&run_id.value).cloned()
+        self.runs.get(&run_id.value).map(|r| r.clone())
     }
 
     pub fn worker_counts(&self, run_id: &RunId) -> Option<(u64, u64)> {
-        let inner = self.inner.read().expect("coordinator state lock poisoned");
-        let workers = inner.workers_by_run.get(&run_id.value)?;
+        let arc = self.workers_by_run.get(&run_id.value)?;
+        let workers = arc.read().unwrap();
         let active = workers
             .values()
-            .filter(|worker| worker.state == WorkerState::Active as i32)
+            .filter(|w| w.state == WorkerState::Active as i32)
             .count() as u64;
         let stale = workers
             .values()
-            .filter(|worker| worker.state == WorkerState::Stale as i32)
+            .filter(|w| w.state == WorkerState::Stale as i32)
             .count() as u64;
         Some((active, stale))
     }
 
     pub fn status_snapshot(&self) -> CoordinatorStatusSnapshot {
-        let inner = self.inner.read().expect("coordinator state lock poisoned");
-        let run_count = inner.runs.len();
-        let worker_count = inner.workers_by_run.values().map(HashMap::len).sum();
-        let active_worker_count = inner
-            .workers_by_run
-            .values()
-            .flat_map(|workers| workers.values())
-            .filter(|worker| worker.state == WorkerState::Active as i32)
-            .count() as u64;
-        let checkpoint_count = inner.checkpoints_by_run.values().map(HashMap::len).sum();
-        let latest_checkpoint_id = inner
+        let run_count = self.runs.len();
+        let mut worker_count = 0usize;
+        let mut active_worker_count = 0u64;
+        for entry in self.workers_by_run.iter() {
+            let workers = entry.value().read().unwrap();
+            worker_count += workers.len();
+            active_worker_count += workers
+                .values()
+                .filter(|w| w.state == WorkerState::Active as i32)
+                .count() as u64;
+        }
+        let checkpoint_count = self
+            .checkpoints_by_run
+            .iter()
+            .map(|e| e.value().read().unwrap().len())
+            .sum();
+        let latest_checkpoint_id = self
             .runs
-            .values()
-            .filter_map(|run| run.latest_checkpoint_id.as_ref().map(|id| id.value.clone()))
+            .iter()
+            .filter_map(|e| e.latest_checkpoint_id.as_ref().map(|id| id.value.clone()))
             .max();
 
         CoordinatorStatusSnapshot {
@@ -811,84 +872,42 @@ impl CoordinatorState {
 
     /// Reconciles in-memory worker liveness against the current server time.
     ///
-    /// The MVP coordinator marks active workers stale when heartbeat deadlines
-    /// pass and stale workers failed when the longer failure deadline passes.
-    /// It does not remove or recover workers and it does not revoke shard
-    /// leases.
+    /// Marks active workers stale when heartbeat deadlines pass and stale
+    /// workers failed when the longer failure deadline passes.
     pub fn reconcile_worker_liveness(&self) {
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
-        reconcile_worker_liveness(&mut inner, SystemTime::now());
-    }
-
-    #[cfg(test)]
-    pub fn set_worker_heartbeat_deadline_for_test(
-        &self,
-        run_id: &RunId,
-        worker_id: &WorkerId,
-        deadline: SystemTime,
-    ) -> bool {
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
-        inner
-            .workers_by_run
-            .get_mut(&run_id.value)
-            .and_then(|workers| workers.get_mut(&worker_id.value))
-            .map(|worker| {
-                worker.next_heartbeat_deadline = deadline;
-            })
-            .is_some()
-    }
-
-    #[cfg(test)]
-    pub fn set_worker_failure_deadline_for_test(
-        &self,
-        run_id: &RunId,
-        worker_id: &WorkerId,
-        deadline: SystemTime,
-    ) -> bool {
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
-        inner
-            .workers_by_run
-            .get_mut(&run_id.value)
-            .and_then(|workers| workers.get_mut(&worker_id.value))
-            .map(|worker| {
-                worker.failure_deadline = deadline;
-            })
-            .is_some()
+        reconcile_worker_liveness(&self.runs, &self.workers_by_run, SystemTime::now());
     }
 
     pub fn get_dataset(&self, run_id: &RunId, dataset_id: &DatasetId) -> Option<DatasetRecord> {
-        let inner = self.inner.read().expect("coordinator state lock poisoned");
-        inner
-            .datasets_by_run
+        self.datasets_by_run
             .get(&run_id.value)
-            .and_then(|datasets| datasets.get(&dataset_id.value))
-            .cloned()
+            .and_then(|arc| arc.read().unwrap().get(&dataset_id.value).cloned())
     }
 
     pub fn register_dataset(&self, request: RegisterDatasetRequest) -> Option<RegisteredDataset> {
         let run_id = request.run_id.as_ref()?.value.clone();
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
 
-        if !inner.runs.contains_key(&run_id) {
+        if !self.runs.contains_key(&run_id) {
             return None;
         }
 
         let idempotency_key = dataset_idempotency_key(&run_id, &request.idempotency_key);
-        if let Some(dataset_id) =
-            idempotency_lookup(&inner.dataset_idempotency_keys, &idempotency_key)
-        {
-            let record = inner
-                .datasets_by_run
-                .get(&run_id)
-                .and_then(|datasets| datasets.get(&dataset_id))
-                .expect("dataset idempotency key must reference an existing dataset");
-            return Some(RegisteredDataset {
-                dataset_id: DatasetId {
-                    value: record.dataset_id.clone(),
-                },
-                accepted_shard_count: record.shards.len() as u32,
-                registered_at: record.registered_at,
-            });
+        if !idempotency_key.is_empty() {
+            if let Some(dataset_id) = self.dataset_idempotency_keys.get(&idempotency_key) {
+                let dataset_id = dataset_id.clone();
+                let record = self
+                    .datasets_by_run
+                    .get(&run_id)
+                    .and_then(|arc| arc.read().unwrap().get(&dataset_id).cloned())
+                    .expect("dataset idempotency key must reference an existing dataset");
+                return Some(RegisteredDataset {
+                    dataset_id: DatasetId {
+                        value: record.dataset_id.clone(),
+                    },
+                    accepted_shard_count: record.shards.len() as u32,
+                    registered_at: record.registered_at,
+                });
+            }
         }
 
         let dataset = request.dataset.unwrap_or_default();
@@ -915,15 +934,19 @@ impl CoordinatorState {
         };
         let accepted_shard_count = record.shards.len() as u32;
 
-        inner
+        let datasets_arc = self
             .datasets_by_run
             .entry(run_id.clone())
-            .or_default()
+            .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+            .value()
+            .clone();
+        datasets_arc
+            .write()
+            .unwrap()
             .insert(dataset_id.clone(), record.clone());
 
         if !request.idempotency_key.is_empty() {
-            inner
-                .dataset_idempotency_keys
+            self.dataset_idempotency_keys
                 .insert(idempotency_key, dataset_id.clone());
         }
 
@@ -942,21 +965,22 @@ impl CoordinatorState {
         dataset_id: &DatasetId,
         cached_shard_hints: Option<&[String]>,
     ) -> Result<ShardAssignments, GetShardAssignmentsError> {
-        let inner = self.inner.read().expect("coordinator state lock poisoned");
-        let run = inner
+        let run = self
             .runs
             .get(&run_id.value)
-            .ok_or(GetShardAssignmentsError::RunNotFound)?;
+            .ok_or(GetShardAssignmentsError::RunNotFound)?
+            .clone();
 
-        let worker = inner
+        let worker = self
             .workers_by_run
             .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
+            .and_then(|arc| arc.read().unwrap().get(&worker_id.value).cloned())
             .ok_or(GetShardAssignmentsError::WorkerNotFound)?;
-        let dataset = inner
+
+        let dataset = self
             .datasets_by_run
             .get(&run_id.value)
-            .and_then(|datasets| datasets.get(&dataset_id.value))
+            .and_then(|arc| arc.read().unwrap().get(&dataset_id.value).cloned())
             .ok_or(GetShardAssignmentsError::DatasetNotFound)?;
 
         if run.world_size == 0 {
@@ -967,12 +991,13 @@ impl CoordinatorState {
         let lease_expires_at = server_time + SHARD_LEASE_DURATION;
         let world_size = run.world_size as usize;
         let worker_rank = worker.rank as usize;
-        let mut candidate_shards: Vec<&ShardRecord> = dataset
+
+        let mut candidate_shards: Vec<ShardRecord> = dataset
             .shards
             .iter()
             .enumerate()
             .filter(|(shard_index, _)| *shard_index % world_size == worker_rank)
-            .map(|(_, shard)| shard)
+            .map(|(_, shard)| shard.clone())
             .collect();
 
         if self.placement_policy == DatasetPlacementPolicy::CacheAware {
@@ -983,9 +1008,9 @@ impl CoordinatorState {
                 .collect();
             candidate_shards.sort_by_key(|shard| {
                 if hint_set.contains(shard.shard_id.as_str()) {
-                    0
+                    0usize
                 } else {
-                    1
+                    1usize
                 }
             });
         }
@@ -1000,16 +1025,16 @@ impl CoordinatorState {
                 lease_epoch: 1,
                 lease_state: ShardLeaseState::Leased as i32,
                 lease_expires_at,
-                progress_offset: inner
+                progress_offset: self
                     .shard_progress
                     .get(&ShardProgressKey {
                         run_id: run.run_id.clone(),
                         dataset_id: dataset.dataset_id.clone(),
                         shard_id: shard.shard_id.clone(),
                     })
-                    .map(|progress| progress.progress_offset)
+                    .map(|p| p.progress_offset)
                     .unwrap_or_default(),
-                shard_uri: shard.shard_uri.clone(),
+                shard_uri: shard.shard_uri,
             })
             .collect();
 
@@ -1027,28 +1052,30 @@ impl CoordinatorState {
         shard_id: &ShardId,
         lease_epoch: u64,
     ) -> Result<RenewedShardLease, RenewShardLeaseError> {
-        let inner = self.inner.read().expect("coordinator state lock poisoned");
-        let run = inner
+        let run = self
             .runs
             .get(&run_id.value)
-            .ok_or(RenewShardLeaseError::RunNotFound)?;
+            .ok_or(RenewShardLeaseError::RunNotFound)?
+            .clone();
 
-        let worker = inner
+        let worker = self
             .workers_by_run
             .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
+            .and_then(|arc| arc.read().unwrap().get(&worker_id.value).cloned())
             .ok_or(RenewShardLeaseError::WorkerNotFound)?;
 
-        let (shard_index, _) = inner
+        let shard_index = self
             .datasets_by_run
             .get(&run_id.value)
-            .and_then(|datasets| {
+            .and_then(|arc| {
+                let datasets = arc.read().unwrap();
                 datasets.values().find_map(|dataset| {
                     dataset
                         .shards
                         .iter()
                         .enumerate()
                         .find(|(_, shard)| shard.shard_id == shard_id.value)
+                        .map(|(i, _)| i)
                 })
             })
             .ok_or(RenewShardLeaseError::ShardNotFound)?;
@@ -1062,7 +1089,7 @@ impl CoordinatorState {
         if shard_index % world_size != worker_rank {
             return Err(RenewShardLeaseError::NotShardOwner);
         }
-        Self::ensure_worker_active_for_lease_actions(worker)
+        Self::ensure_worker_active_for_lease_actions(&worker)
             .map_err(|_| RenewShardLeaseError::WorkerNotActive)?;
 
         if lease_epoch != 1 {
@@ -1089,29 +1116,42 @@ impl CoordinatorState {
         progress_offset: i64,
         is_complete: bool,
     ) -> Result<ReportedShardProgress, ReportShardProgressError> {
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
-        let run = inner
+        let run = self
             .runs
             .get(&run_id.value)
-            .ok_or(ReportShardProgressError::RunNotFound)?;
+            .ok_or(ReportShardProgressError::RunNotFound)?
+            .clone();
 
-        let worker = inner
+        let worker = self
             .workers_by_run
             .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
+            .and_then(|arc| arc.read().unwrap().get(&worker_id.value).cloned())
             .ok_or(ReportShardProgressError::WorkerNotFound)?;
 
-        let dataset = inner
+        let (shard_index, _) = self
             .datasets_by_run
             .get(&run_id.value)
-            .and_then(|datasets| datasets.get(&dataset_id.value))
-            .ok_or(ReportShardProgressError::DatasetNotFound)?;
-
-        let shard_index = dataset
-            .shards
-            .iter()
-            .position(|shard| shard.shard_id == shard_id.value)
+            .and_then(|arc| {
+                let datasets = arc.read().unwrap();
+                datasets.get(&dataset_id.value).and_then(|dataset| {
+                    dataset
+                        .shards
+                        .iter()
+                        .enumerate()
+                        .find(|(_, shard)| shard.shard_id == shard_id.value)
+                        .map(|(i, s)| (i, s.clone()))
+                })
+            })
             .ok_or(ReportShardProgressError::ShardNotFound)?;
+
+        // Verify the dataset exists (separate from the shard check above).
+        if !self
+            .datasets_by_run
+            .get(&run_id.value)
+            .is_some_and(|arc| arc.read().unwrap().contains_key(&dataset_id.value))
+        {
+            return Err(ReportShardProgressError::DatasetNotFound);
+        }
 
         if run.world_size == 0 {
             return Err(ReportShardProgressError::EmptyWorldSize);
@@ -1122,7 +1162,7 @@ impl CoordinatorState {
         if shard_index % world_size != worker_rank {
             return Err(ReportShardProgressError::NotShardOwner);
         }
-        Self::ensure_worker_active_for_lease_actions(worker)
+        Self::ensure_worker_active_for_lease_actions(&worker)
             .map_err(|_| ReportShardProgressError::WorkerNotActive)?;
 
         if lease_epoch != 1 {
@@ -1144,7 +1184,7 @@ impl CoordinatorState {
             is_complete,
             updated_at: SystemTime::now(),
         };
-        inner.shard_progress.insert(key, record);
+        self.shard_progress.insert(key, record);
 
         Ok(ReportedShardProgress {
             accepted: true,
@@ -1159,55 +1199,56 @@ impl CoordinatorState {
         dataset_id: &DatasetId,
         shard_id: &ShardId,
     ) -> Option<ShardProgressRecord> {
-        let inner = self.inner.read().expect("coordinator state lock poisoned");
-        inner
-            .shard_progress
+        self.shard_progress
             .get(&ShardProgressKey {
                 run_id: run_id.value.clone(),
                 dataset_id: dataset_id.value.clone(),
                 shard_id: shard_id.value.clone(),
             })
-            .cloned()
+            .map(|r| r.clone())
     }
 
     pub fn register_worker(&self, request: RegisterWorkerRequest) -> Option<RegisteredWorker> {
         let run_id = request.run_id.as_ref()?.value.clone();
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
 
-        if !inner.runs.contains_key(&run_id) {
+        if !self.runs.contains_key(&run_id) {
             return None;
         }
 
-        let world_size = inner
+        let world_size = self
             .runs
             .get(&run_id)
             .expect("run must exist when registering worker")
             .world_size;
+
         let idempotency_key = worker_idempotency_key(&run_id, &request.idempotency_key);
-        if let Some(worker_id) =
-            idempotency_lookup(&inner.worker_idempotency_keys, &idempotency_key)
-        {
-            let record = inner
-                .workers_by_run
-                .get(&run_id)
-                .and_then(|workers| workers.get(&worker_id))
-                .expect("worker idempotency key must reference an existing worker");
-            return Some(RegisteredWorker {
-                worker_id: WorkerId {
-                    value: record.worker_id.clone(),
-                },
-                state: record.state,
-                lease_renewal_deadline: record.registered_at + HEARTBEAT_INTERVAL,
-                server_time: record.registered_at,
-                is_new: false,
-            });
+        if !idempotency_key.is_empty() {
+            if let Some(existing_worker_id) =
+                self.worker_idempotency_keys.get(&idempotency_key)
+            {
+                let existing_worker_id = existing_worker_id.clone();
+                let record = self
+                    .workers_by_run
+                    .get(&run_id)
+                    .and_then(|arc| arc.read().unwrap().get(&existing_worker_id).cloned())
+                    .expect("worker idempotency key must reference an existing worker");
+                return Some(RegisteredWorker {
+                    worker_id: WorkerId {
+                        value: record.worker_id.clone(),
+                    },
+                    state: record.state,
+                    lease_renewal_deadline: record.registered_at + HEARTBEAT_INTERVAL,
+                    server_time: record.registered_at,
+                    is_new: false,
+                });
+            }
         }
 
         let worker_id = request
             .worker_id
             .as_ref()
-            .map(|worker_id| worker_id.value.as_str())
-            .filter(|worker_id| !worker_id.is_empty())
+            .map(|w| w.value.as_str())
+            .filter(|v| !v.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| self.generate_worker_id());
         let now = SystemTime::now();
@@ -1227,16 +1268,21 @@ impl CoordinatorState {
             failure_deadline,
         };
 
-        inner
+        let workers_arc = self
             .workers_by_run
             .entry(run_id.clone())
-            .or_default()
+            .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+            .value()
+            .clone();
+        workers_arc
+            .write()
+            .unwrap()
             .insert(worker_id.clone(), worker.clone());
-        refresh_active_worker_count(&mut inner, &run_id);
+
+        refresh_active_worker_count(&self.runs, &self.workers_by_run, &run_id);
 
         if !request.idempotency_key.is_empty() {
-            inner
-                .worker_idempotency_keys
+            self.worker_idempotency_keys
                 .insert(idempotency_key, worker_id.clone());
         }
 
@@ -1256,16 +1302,14 @@ impl CoordinatorState {
         run_id: &RunId,
         worker_id: &WorkerId,
     ) -> Option<WorkerHeartbeat> {
-        let mut inner = self.inner.write().expect("coordinator state lock poisoned");
-
-        if !inner.runs.contains_key(&run_id.value) {
+        if !self.runs.contains_key(&run_id.value) {
             return None;
         }
 
-        let worker = inner
-            .workers_by_run
-            .get_mut(&run_id.value)
-            .and_then(|workers| workers.get_mut(&worker_id.value))?;
+        let workers_arc = self.workers_by_run.get(&run_id.value)?;
+        let mut workers = workers_arc.write().unwrap();
+        let worker = workers.get_mut(&worker_id.value)?;
+
         let now = SystemTime::now();
         let next_heartbeat_deadline = now + HEARTBEAT_INTERVAL;
         let failure_deadline = now + WORKER_FAILURE_INTERVAL;
@@ -1275,13 +1319,15 @@ impl CoordinatorState {
         worker.state = WorkerState::Active as i32;
         let state = worker.state;
         let worker_snapshot = worker.clone();
-        let world_size = inner
+        drop(workers);
+
+        let world_size = self
             .runs
             .get(&run_id.value)
             .expect("run must exist when recording heartbeat")
             .world_size;
 
-        refresh_active_worker_count(&mut inner, &run_id.value);
+        refresh_active_worker_count(&self.runs, &self.workers_by_run, &run_id.value);
         self.persist_worker(&worker_snapshot, world_size);
 
         Some(WorkerHeartbeat {
@@ -1290,6 +1336,64 @@ impl CoordinatorState {
             server_time: now,
         })
     }
+
+    // ── test helpers ─────────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    pub fn set_worker_heartbeat_deadline_for_test(
+        &self,
+        run_id: &RunId,
+        worker_id: &WorkerId,
+        deadline: SystemTime,
+    ) -> bool {
+        self.workers_by_run
+            .get(&run_id.value)
+            .and_then(|arc| {
+                arc.write()
+                    .unwrap()
+                    .get_mut(&worker_id.value)
+                    .map(|w| { w.next_heartbeat_deadline = deadline; })
+            })
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub fn set_worker_failure_deadline_for_test(
+        &self,
+        run_id: &RunId,
+        worker_id: &WorkerId,
+        deadline: SystemTime,
+    ) -> bool {
+        self.workers_by_run
+            .get(&run_id.value)
+            .and_then(|arc| {
+                arc.write()
+                    .unwrap()
+                    .get_mut(&worker_id.value)
+                    .map(|w| { w.failure_deadline = deadline; })
+            })
+            .is_some()
+    }
+
+    /// Test helper: read a single worker record without going through the gRPC layer.
+    #[cfg(test)]
+    pub fn get_worker_for_test(
+        &self,
+        run_id: &RunId,
+        worker_id: &WorkerId,
+    ) -> Option<WorkerRecord> {
+        self.workers_by_run
+            .get(&run_id.value)
+            .and_then(|arc| arc.read().unwrap().get(&worker_id.value).cloned())
+    }
+
+    /// Test helper: total number of registered runs.
+    #[cfg(test)]
+    pub fn run_count_for_test(&self) -> usize {
+        self.runs.len()
+    }
+
+    // ── ID generators ────────────────────────────────────────────────────────
 
     fn generate_run_id(&self) -> String {
         let id = self.next_run_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1310,6 +1414,7 @@ impl CoordinatorState {
         let id = self.next_shard_id.fetch_add(1, Ordering::Relaxed) + 1;
         format!("shard-{id}")
     }
+
     fn generate_checkpoint_id(&self) -> String {
         let id = self.next_checkpoint_id.fetch_add(1, Ordering::Relaxed) + 1;
         format!("checkpoint-{id}")
@@ -1319,15 +1424,15 @@ impl CoordinatorState {
         let shard_id = shard
             .shard_id
             .as_ref()
-            .map(|shard_id| shard_id.value.as_str())
-            .filter(|shard_id| !shard_id.is_empty())
+            .map(|s| s.value.as_str())
+            .filter(|v| !v.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| self.generate_shard_id());
         let shard_dataset_id = shard
             .dataset_id
             .as_ref()
-            .map(|dataset_id| dataset_id.value.as_str())
-            .filter(|dataset_id| !dataset_id.is_empty())
+            .map(|d| d.value.as_str())
+            .filter(|v| !v.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| dataset_id.to_string());
 
@@ -1344,57 +1449,61 @@ impl CoordinatorState {
     }
 }
 
-fn idempotency_lookup(
-    idempotency_keys: &HashMap<String, String>,
-    idempotency_key: &str,
-) -> Option<String> {
-    if idempotency_key.is_empty() {
-        return None;
-    }
+// ─── free helper functions ────────────────────────────────────────────────────
 
-    idempotency_keys.get(idempotency_key).cloned()
-}
-
-fn reconcile_worker_liveness(inner: &mut CoordinatorStateInner, now: SystemTime) {
+fn reconcile_worker_liveness(
+    runs: &DashMap<String, RunRecord>,
+    workers_by_run: &DashMap<String, Arc<RwLock<HashMap<String, WorkerRecord>>>>,
+    now: SystemTime,
+) {
     let mut changed_run_ids = Vec::new();
 
-    for (run_id, workers) in &mut inner.workers_by_run {
+    for run_entry in workers_by_run.iter() {
+        let run_id = run_entry.key().clone();
+        let workers_arc = run_entry.value().clone();
         let mut changed = false;
-        for worker in workers.values_mut() {
-            if worker.state == WorkerState::Active as i32 {
-                if worker.next_heartbeat_deadline < now {
-                    worker.state = WorkerState::Stale as i32;
+        {
+            let mut workers = workers_arc.write().unwrap();
+            for worker in workers.values_mut() {
+                if worker.state == WorkerState::Active as i32 {
+                    if worker.next_heartbeat_deadline < now {
+                        worker.state = WorkerState::Stale as i32;
+                        changed = true;
+                    }
+                } else if worker.state == WorkerState::Stale as i32
+                    && worker.failure_deadline < now
+                {
+                    worker.state = WorkerState::Failed as i32;
                     changed = true;
                 }
-            } else if worker.state == WorkerState::Stale as i32 && worker.failure_deadline < now {
-                worker.state = WorkerState::Failed as i32;
-                changed = true;
             }
         }
-
         if changed {
-            changed_run_ids.push(run_id.clone());
+            changed_run_ids.push(run_id);
         }
     }
 
     for run_id in changed_run_ids {
-        refresh_active_worker_count(inner, &run_id);
+        refresh_active_worker_count(runs, workers_by_run, &run_id);
     }
 }
 
-fn refresh_active_worker_count(inner: &mut CoordinatorStateInner, run_id: &str) {
-    let active_worker_count = inner
-        .workers_by_run
+fn refresh_active_worker_count(
+    runs: &DashMap<String, RunRecord>,
+    workers_by_run: &DashMap<String, Arc<RwLock<HashMap<String, WorkerRecord>>>>,
+    run_id: &str,
+) {
+    let active_worker_count = workers_by_run
         .get(run_id)
-        .map(|workers| {
-            workers
+        .map(|arc| {
+            arc.read()
+                .unwrap()
                 .values()
-                .filter(|worker| worker.state == WorkerState::Active as i32)
+                .filter(|w| w.state == WorkerState::Active as i32)
                 .count() as u32
         })
         .unwrap_or_default();
-
-    if let Some(run) = inner.runs.get_mut(run_id) {
+    if let Some(mut run) = runs.get_mut(run_id) {
         run.active_worker_count = active_worker_count;
     }
 }
@@ -1406,9 +1515,11 @@ fn worker_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
 fn dataset_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
     scoped_idempotency_key(run_id, idempotency_key)
 }
+
 fn checkpoint_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
     scoped_idempotency_key(run_id, idempotency_key)
 }
+
 fn checkpoint_artifact_idempotency_key(
     run_id: &str,
     checkpoint_id: &str,
@@ -1419,6 +1530,7 @@ fn checkpoint_artifact_idempotency_key(
     }
     format!("{run_id}:{checkpoint_id}:{idempotency_key}")
 }
+
 fn map_checkpoint_error(error: CheckpointError) -> ReportCheckpointArtifactError {
     match error {
         CheckpointError::InvalidArtifact(_) => ReportCheckpointArtifactError::InvalidInput(
@@ -1430,6 +1542,7 @@ fn map_checkpoint_error(error: CheckpointError) -> ReportCheckpointArtifactError
         _ => ReportCheckpointArtifactError::InvalidState,
     }
 }
+
 fn map_commit_checkpoint_error(error: CheckpointError) -> CommitCheckpointError {
     match error {
         CheckpointError::InvalidTransition { .. } | CheckpointError::TerminalState { .. } => {
@@ -1438,6 +1551,7 @@ fn map_commit_checkpoint_error(error: CheckpointError) -> CommitCheckpointError 
         _ => CommitCheckpointError::InvalidState,
     }
 }
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -1449,7 +1563,6 @@ fn scoped_idempotency_key(run_id: &str, idempotency_key: &str) -> String {
     if idempotency_key.is_empty() {
         return String::new();
     }
-
     format!("{run_id}:{idempotency_key}")
 }
 
@@ -1457,10 +1570,12 @@ fn dataset_id_from_metadata(dataset: &DatasetMetadata) -> Option<String> {
     dataset
         .dataset_id
         .as_ref()
-        .map(|dataset_id| dataset_id.value.as_str())
-        .filter(|dataset_id| !dataset_id.is_empty())
+        .map(|d| d.value.as_str())
+        .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned)
 }
+
+// ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1545,13 +1660,7 @@ mod tests {
 
         let record = state.get_run(&run_id).expect("run should exist");
         let worker = state
-            .inner
-            .read()
-            .unwrap()
-            .workers_by_run
-            .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
-            .cloned()
+            .get_worker_for_test(&run_id, &worker_id)
             .expect("worker should exist");
         assert_eq!(record.active_worker_count, 1);
         assert_eq!(worker.state, WorkerState::Active as i32);
@@ -1576,13 +1685,7 @@ mod tests {
 
         let record = state.get_run(&run_id).expect("run should exist");
         let worker = state
-            .inner
-            .read()
-            .unwrap()
-            .workers_by_run
-            .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
-            .cloned()
+            .get_worker_for_test(&run_id, &worker_id)
             .expect("worker should exist");
         assert_eq!(worker.state, WorkerState::Stale as i32);
         assert_eq!(record.active_worker_count, 0);
@@ -1637,13 +1740,7 @@ mod tests {
 
         let record = state.get_run(&run_id).expect("run should exist");
         let worker = state
-            .inner
-            .read()
-            .unwrap()
-            .workers_by_run
-            .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
-            .cloned()
+            .get_worker_for_test(&run_id, &worker_id)
             .expect("worker should exist");
         assert_eq!(worker.state, WorkerState::Failed as i32);
         assert_eq!(record.active_worker_count, 0);
@@ -1676,13 +1773,7 @@ mod tests {
 
         let record = state.get_run(&run_id).expect("run should exist");
         let worker = state
-            .inner
-            .read()
-            .unwrap()
-            .workers_by_run
-            .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
-            .cloned()
+            .get_worker_for_test(&run_id, &worker_id)
             .expect("worker should exist");
         assert_eq!(heartbeat.state, WorkerState::Active as i32);
         assert_eq!(worker.state, WorkerState::Active as i32);
@@ -1714,13 +1805,7 @@ mod tests {
         state.reconcile_worker_liveness();
 
         let stale_worker = state
-            .inner
-            .read()
-            .unwrap()
-            .workers_by_run
-            .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
-            .cloned()
+            .get_worker_for_test(&run_id, &worker_id)
             .expect("worker should exist");
         assert_eq!(stale_worker.state, WorkerState::Stale as i32);
 
@@ -1732,13 +1817,7 @@ mod tests {
         state.reconcile_worker_liveness();
 
         let failed_worker = state
-            .inner
-            .read()
-            .unwrap()
-            .workers_by_run
-            .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
-            .cloned()
+            .get_worker_for_test(&run_id, &worker_id)
             .expect("worker should exist");
         assert_eq!(failed_worker.state, WorkerState::Failed as i32);
     }
@@ -1791,14 +1870,7 @@ mod tests {
         ));
         state.reconcile_worker_liveness();
 
-        let worker = state
-            .inner
-            .read()
-            .unwrap()
-            .workers_by_run
-            .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
-            .cloned();
+        let worker = state.get_worker_for_test(&run_id, &worker_id);
         assert!(worker.is_some(), "failed worker record should be retained");
     }
 
@@ -1828,13 +1900,7 @@ mod tests {
             .record_heartbeat(&run_id, &worker_id)
             .expect("failed worker heartbeat should succeed");
         let worker = state
-            .inner
-            .read()
-            .unwrap()
-            .workers_by_run
-            .get(&run_id.value)
-            .and_then(|workers| workers.get(&worker_id.value))
-            .cloned()
+            .get_worker_for_test(&run_id, &worker_id)
             .expect("worker should exist");
         let run = state.get_run(&run_id).expect("run should exist");
 
@@ -2238,7 +2304,7 @@ mod tests {
         });
 
         assert_eq!(first, second);
-        assert_eq!(state.inner.read().unwrap().runs.len(), 1);
+        assert_eq!(state.run_count_for_test(), 1);
     }
 
     #[test]
@@ -2249,7 +2315,7 @@ mod tests {
         let second = state.register_run(register_request(""));
 
         assert_ne!(first.run_id, second.run_id);
-        assert_eq!(state.inner.read().unwrap().runs.len(), 2);
+        assert_eq!(state.run_count_for_test(), 2);
     }
 
     #[test]
