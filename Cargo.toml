@@ -19,7 +19,9 @@ resolver = "2"
 inherits  = "release"
 debug     = 1
 strip     = "none"
-# Frame pointers allow perf to unwind user-space stacks from kernel context
-# (needed for call-graph captures of threads blocked in epoll_wait / write).
+# debug = 1 keeps line tables for symbol resolution without full debug overhead.
+# Build with RUSTFLAGS="-C force-frame-pointers=yes" to enable reliable
+# --call-graph fp unwinding under WSL2 / Hyper-V (preferred over DWARF there).
+
 [profile.perf.build-override]
 codegen-units = 1

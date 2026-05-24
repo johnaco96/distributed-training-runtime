@@ -201,3 +201,81 @@ theoretical limit of a fully synchronous two-phase barrier protocol.
 To escape the 50 % stall ceiling, the commit protocol could be made
 asynchronous: allow workers to advance training while rank 0 commits in the
 background, then only synchronise before the *next* checkpoint barrier.
+
+---
+
+## Phase 12 — 500-Worker gRPC Scale Flamegraph (2026-05-24)
+
+**Binary**: `RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile perf`  
+**Profiler**: `perf record -g -F 997 --call-graph fp` (frame-pointer unwinding)  
+**Load**: 500 logical workers, 30 s duration, 64 concurrent gRPC calls, 1000 shards, 2 s heartbeat interval  
+**Samples**: 4,202 samples, 1.4 MB perf.data → 1.4 MB SVG with full Rust async stacks  
+**Flamegraph**: [docs/perf/coordinator-flamegraph.svg](perf/coordinator-flamegraph.svg)
+
+Frame-pointer unwinding produces complete Rust async call stacks on WSL2/Hyper-V.
+Earlier DWARF-based recording collapsed all user-space frames to `[unknown]`
+inside the async runtime — frame pointers resolve this because the kernel can
+walk the `%rbp` chain across the user/kernel boundary.
+
+### Hot Leaf Functions (% of sampled CPU cycles)
+
+| % CPU | Symbol | Layer |
+|-------|--------|-------|
+| 24.5% | `[libc.so.6]` thread-start/park | Tokio worker idle (epoll_wait / futex) |
+| 4.2%  | `clone` | Per-request data cloning (gRPC request bodies) |
+| 2.0%  | `cfree` | Allocator deallocation (request/response buffers) |
+| 1.5%  | `malloc` | Per-request allocation |
+| 1.2%  | `__rust_alloc` | Rust global allocator shim |
+| 1.2%  | `__rust_dealloc` | Rust global allocator shim |
+| 0.9%  | `{closure#0}` | Tokio task polling |
+| 0.7%  | `try_allocate_in` | Vec/HashMap growth (h2 stream table, shard maps) |
+| 0.5%  | `write` syscall | TCP write path |
+| 0.4%  | `lock` | Mutex acquisition (shared `RunState`) |
+| 0.4%  | `__tcp_transmit_skb` [k] | Network I/O |
+| 0.4%  | `tcp_recvmsg_locked` [k] | Network I/O |
+| 0.4%  | `atomic_load<usize>` | Tokio task Arc reference counting |
+
+### Key Findings (500-Worker Scale)
+
+**Allocator pressure dominates (6.7% combined).**
+`malloc`, `cfree`, `__rust_alloc`, `__rust_dealloc`, and `try_allocate_in`
+together account for the largest non-idle CPU cost. Each gRPC request
+allocates/frees request and response buffers, h2 frame storage, and
+shard-map lookup results. Under 64 concurrent calls the glibc arena lock
+begins contending.
+
+**Coordinator is I/O-bound, not CPU-bound.**
+24.5% of samples are idle thread parks vs. 6.7% allocator time. This is
+healthy — it means the coordinator scales further before hitting a CPU wall.
+Scale-test result confirms: 0% failure rate, p99 = 3.3 ms at 500 workers.
+
+**Mutex is not yet hot (0.4%).**
+`lock` appears in `RegisterWorker`, `GetShardAssignment`, and `Heartbeat`
+paths but at 0.4% is not a bottleneck at 500 workers. This will become
+limiting above ~2000 concurrent workers.
+
+**Network kernel time is small (~1.1%).**
+`tcp_transmit_skb` + `tcp_recvmsg_locked` together are under 1.1% — the
+coordinator is not network-saturated at 500 workers on a local cluster.
+
+### Updated Optimization Priorities
+
+| Priority | Change | Evidence | Expected gain |
+|----------|--------|----------|---------------|
+| **P1** | Switch to jemalloc/mimalloc | 6.7% allocator CPU at 500 workers | Reduce to ~2%; 15-30% p99 improvement |
+| **P2** | Pre-size h2 stream table to `world_size * 2` | `try_allocate_in` spikes at benchmark start | Eliminate HashMap rehashes |
+| **P3** | `RwLock` for read-heavy handlers | `lock` will spike at >1000 workers | Allow concurrent `GetShardAssignment`/`Heartbeat` reads |
+
+**jemalloc recipe** (P1):
+
+```toml
+# crates/runtime-coordinator/Cargo.toml
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+```
+
+```rust
+// crates/runtime-coordinator/src/main.rs
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+```
