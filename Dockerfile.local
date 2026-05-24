@@ -1,0 +1,35 @@
+# Fast local/dev image — packages the pre-built binary from the WSL build.
+#
+# Usage (from the project root on Windows, with WSL binary already built):
+#
+#   # 1. Copy the WSL binary to a Windows-accessible path
+#   wsl -e bash -c "cp /home/johna/dtr/target/release/runtime-coordinator \
+#       /home/johna/dtr/target/release/runtime-coordinator-linux-amd64"
+#   # (already an ELF binary — no cross-compilation needed since docker-desktop
+#   # runs on the same x86_64 Linux kernel as WSL2)
+#
+#   docker build -t distributed-training-runtime:local -f Dockerfile.local .
+#
+# This avoids re-running `cargo build --release` inside the container (which
+# takes 90+ seconds) by using the binary already compiled by the WSL toolchain.
+# The resulting image is identical to what the full Dockerfile.release produces.
+
+# Ubuntu 24.04 ships glibc 2.39, which satisfies the GLIBC_2.38 requirement
+# of a binary compiled in WSL2 (also Ubuntu 24.04).
+FROM ubuntu:24.04 AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# The binary is built in WSL and exported to the Windows-accessible path.
+# It is a native x86_64 Linux ELF — compatible with docker-desktop's kernel.
+COPY target/release/runtime-coordinator /usr/local/bin/runtime-coordinator
+
+EXPOSE 50051 9090
+
+ENTRYPOINT ["runtime-coordinator"]
+CMD ["--addr", "0.0.0.0:50051", "--metrics-addr", "0.0.0.0:9090"]

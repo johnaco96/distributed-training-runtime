@@ -1,5 +1,5 @@
 # Local/dev container image for distributed-training-runtime Phase 20E.
-FROM rust:1.89-bookworm AS rust-builder
+FROM rust:1.95-bookworm AS rust-builder
 WORKDIR /build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

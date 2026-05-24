@@ -66,8 +66,11 @@ impl PostgresMetadataStore {
     }
 
     /// Create all required tables (idempotent — safe to call on every startup).
+    ///
+    /// Uses `sqlx::raw_sql` (sqlx 0.8+) which accepts multiple semicolon-
+    /// separated DDL statements without wrapping them in a prepared statement.
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::raw_sql(
             r#"
 CREATE TABLE IF NOT EXISTS runs (
   run_id               TEXT PRIMARY KEY,
