@@ -18,6 +18,11 @@ pub struct S3StorageConfig {
     pub secret_access_key: String,
     pub force_path_style: bool,
     pub key_prefix: Option<String>,
+    /// Override the number of concurrent S3 operations allowed by the semaphore.
+    /// `None` uses [`StorageOperationPolicy::default`] (currently 64).
+    /// Pass `Some(N)` to tune for your worker count — a value of `world_size`
+    /// or higher eliminates semaphore stalls at checkpoint time.
+    pub max_concurrent_operations: Option<usize>,
 }
 
 impl S3StorageConfig {
@@ -62,7 +67,7 @@ impl S3Storage {
     /// [`S3Storage::new_async`] instead when you are already inside a Tokio
     /// runtime (e.g. from `#[tokio::main]`).
     pub fn new(config: S3StorageConfig) -> Result<Self, StorageError> {
-        let policy = StorageOperationPolicy::default();
+        let policy = Self::policy_from_config(&config);
         policy.validate()?;
         config.validate()?;
         let key_prefix = config.normalized_key_prefix()?;
@@ -86,7 +91,7 @@ impl S3Storage {
     /// other `*_async` helpers; calling the synchronous [`StorageBackend`]
     /// methods will return an error.
     pub async fn new_async(config: S3StorageConfig) -> Result<Self, StorageError> {
-        let policy = StorageOperationPolicy::default();
+        let policy = Self::policy_from_config(&config);
         policy.validate()?;
         config.validate()?;
         let key_prefix = config.normalized_key_prefix()?;
@@ -99,6 +104,18 @@ impl S3Storage {
             limiter: std::sync::Arc::new(Semaphore::new(policy.max_concurrent_operations)),
             policy,
         })
+    }
+
+    /// Resolve the effective [`StorageOperationPolicy`] from a config.
+    ///
+    /// Starts from the global default and applies any per-config override for
+    /// `max_concurrent_operations` (set via `--max-s3-concurrent-ops`).
+    fn policy_from_config(config: &S3StorageConfig) -> StorageOperationPolicy {
+        let mut policy = StorageOperationPolicy::default();
+        if let Some(n) = config.max_concurrent_operations {
+            policy.max_concurrent_operations = n;
+        }
+        policy
     }
 
     /// Build the AWS SDK S3 client from a config. Used by both constructors.
@@ -334,6 +351,7 @@ mod tests {
             secret_access_key: "y".into(),
             force_path_style: true,
             key_prefix: None,
+            max_concurrent_operations: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -348,6 +366,7 @@ mod tests {
             secret_access_key: "y".into(),
             force_path_style: true,
             key_prefix: None,
+            max_concurrent_operations: None,
         };
         assert!(cfg.validate().is_err());
     }

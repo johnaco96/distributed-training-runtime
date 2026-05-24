@@ -1,0 +1,142 @@
+# PostgreSQL metadata store for the coordinator.
+#
+# Provides the distributed, HA-capable metadata back-end that replaces the
+# single-node SQLite store. Multiple coordinator replicas can share this
+# PostgreSQL instance concurrently (unlike SQLite which uses a file lock).
+#
+# Deploy order:
+#   kubectl apply -f k8s/local/namespace.yaml
+#   kubectl apply -f k8s/local/postgres.yaml
+#   # Wait for postgres to be Ready, then:
+#   kubectl apply -f k8s/local/coordinator-deployment.yaml
+---
+# Credentials for the dtruntime database.
+# In production replace with an ExternalSecret / Vault reference.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+  namespace: dtruntime
+type: Opaque
+stringData:
+  POSTGRES_USER: dtruntime
+  POSTGRES_PASSWORD: dtruntime_secret
+  POSTGRES_DB: dtruntime
+  DATABASE_URL: "postgres://dtruntime:dtruntime_secret@postgres:5432/dtruntime"
+---
+# StatefulSet: single PostgreSQL 16 replica with persistent storage.
+# Bumping replicas alone does NOT give HA — that requires pg_auto_failover or
+# Patroni. For multi-replica HA, switch to the Postgres Operator (CrunchyData
+# or Zalando) and set spec.numberOfInstances >= 2.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: dtruntime
+  labels:
+    app: postgres
+    component: metadata-store
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        component: metadata-store
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_DB
+            # Write-ahead log settings tuned for a checkpoint-heavy workload.
+            # max_wal_size keeps WAL from bloating during burst checkpoint writes.
+            - name: POSTGRES_INITDB_ARGS
+              value: "--encoding=UTF8 --locale=C"
+          args:
+            - "-c"
+            - "max_connections=200"
+            - "-c"
+            - "shared_buffers=256MB"
+            - "-c"
+            - "wal_level=replica"
+            - "-c"
+            - "max_wal_size=1GB"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "dtruntime", "-d", "dtruntime"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "dtruntime", "-d", "dtruntime"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # docker-desktop ships "hostpath" (alias: standard); adjust for your cluster.
+        storageClassName: hostpath
+        resources:
+          requests:
+            storage: 5Gi
+---
+# Headless service for stable DNS: postgres.dtruntime.svc.cluster.local:5432
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: dtruntime
+  labels:
+    app: postgres
+    component: metadata-store
+spec:
+  # ClusterIP: None → headless, gives each pod a stable DNS A record.
+  # Use ClusterIP if you need a single stable VIP instead.
+  clusterIP: None
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app: postgres

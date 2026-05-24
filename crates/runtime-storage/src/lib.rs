@@ -154,7 +154,11 @@ impl Default for StorageOperationPolicy {
             max_retries: 3,
             retry_initial_backoff: Duration::from_millis(100),
             retry_max_backoff: Duration::from_secs(2),
-            max_concurrent_operations: 16,
+            // 64 concurrent S3 operations allows ~64 simultaneous workers before
+            // throttling kicks in. The old default of 16 was a hard ceiling that
+            // collapsed throughput at >16 workers on S3-backed deployments.
+            // Override at runtime via --max-s3-concurrent-ops <N>.
+            max_concurrent_operations: 64,
         }
     }
 }
@@ -561,7 +565,7 @@ mod tests {
         assert_eq!(policy.max_retries, 3);
         assert_eq!(policy.retry_initial_backoff, Duration::from_millis(100));
         assert_eq!(policy.retry_max_backoff, Duration::from_secs(2));
-        assert_eq!(policy.max_concurrent_operations, 16);
+        assert_eq!(policy.max_concurrent_operations, 64);
     }
 
     #[test]
