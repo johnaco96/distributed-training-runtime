@@ -15,6 +15,7 @@ use runtime_storage::S3StorageConfig;
 use runtime_coordinator::ha_lock::CoordinatorLockGuard;
 use runtime_coordinator::init_tracing_from_env;
 use runtime_coordinator::persistence::SqliteMetadataStore;
+use runtime_coordinator::pg_store::PostgresMetadataStore;
 use runtime_coordinator::service::CoordinatorServiceImpl;
 use runtime_coordinator::state::CoordinatorState;
 use runtime_coordinator::telemetry::render_prometheus_metrics;
@@ -28,6 +29,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:50051";
 struct CoordinatorCliArgs {
     addr: String,
     metadata_db: Option<String>,
+    metadata_db_url: Option<String>,
     storage_root: Option<PathBuf>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -40,6 +42,7 @@ struct CoordinatorCliArgs {
     s3_access_key: Option<String>,
     s3_secret_key: Option<String>,
     s3_region: String,
+    max_s3_concurrent_ops: Option<usize>,
     show_help: bool,
 }
 
@@ -63,7 +66,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let state = if let Some(ref path) = args.metadata_db {
+    let state = if let Some(ref url) = args.metadata_db_url {
+        // PostgreSQL: distributed, HA-capable, allows multiple coordinator replicas.
+        info!(
+            url = %redact_pg_url(url),
+            "runtime-coordinator using postgres metadata store"
+        );
+        let store = PostgresMetadataStore::connect(url)
+            .await
+            .map_err(|e| format!("failed to connect to postgres metadata store: {e}"))?;
+        store
+            .init_schema()
+            .await
+            .map_err(|e| format!("failed to init postgres schema: {e}"))?;
+        Arc::new(CoordinatorState::with_metadata_store(store))
+    } else if let Some(ref path) = args.metadata_db {
+        // SQLite: single-node, local dev / small deployments.
         info!(metadata_db_path = %path, "runtime-coordinator using sqlite metadata store");
         let store = SqliteMetadataStore::open(path)?;
         store.init_schema()?;
@@ -94,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             secret_access_key: secret_key.clone(),
             force_path_style: args.s3_endpoint.is_some(),
             key_prefix: None,
+            max_concurrent_operations: args.max_s3_concurrent_ops,
         };
         service = service
             .with_s3_backend(s3_cfg)
@@ -226,24 +245,28 @@ fn load_tls_config(
 }
 
 fn print_usage() {
-    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--help|-h]");
+    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--metadata-db-url <URL>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--max-s3-concurrent-ops <N>] [--help|-h]");
     println!("\nOptions:");
-    println!("  --addr <ADDR>           Coordinator listen address (default: {DEFAULT_ADDR})");
-    println!("  --metadata-db <PATH>    Enable SQLite metadata persistence at PATH");
-    println!("  --storage-root <PATH>   Local staging area for StreamCheckpointArtifact (required)");
-    println!("  --auth-mode <MODE>      Authorization mode: disabled|metadata (env: DTRUNTIME_AUTH_MODE)");
-    println!("  --tls-cert <PATH>       Enable TLS with certificate chain PEM at PATH (requires --tls-key)");
+    println!("  --addr <ADDR>              Coordinator listen address (default: {DEFAULT_ADDR})");
+    println!("  --metadata-db <PATH>       Enable SQLite metadata persistence at PATH (single-node)");
+    println!("  --metadata-db-url <URL>    PostgreSQL DSN for HA metadata (env: DTRUNTIME_METADATA_DB_URL)");
+    println!("                             Example: postgres://user:pass@host:5432/dtruntime");
+    println!("  --storage-root <PATH>      Local staging area for StreamCheckpointArtifact (required)");
+    println!("  --auth-mode <MODE>         Authorization mode: disabled|metadata (env: DTRUNTIME_AUTH_MODE)");
+    println!("  --tls-cert <PATH>          Enable TLS with certificate chain PEM at PATH (requires --tls-key)");
     println!(
-        "  --tls-key <PATH>        Enable TLS with private key PEM at PATH (requires --tls-cert)"
+        "  --tls-key <PATH>           Enable TLS with private key PEM at PATH (requires --tls-cert)"
     );
-    println!("  --tls-client-ca <PATH>  Require mTLS client certs signed by CA PEM at PATH");
-    println!("  --metrics-addr <ADDR>   Enable Prometheus /metrics endpoint at ADDR");
-    println!("  --s3-endpoint <URL>     S3/MinIO endpoint URL (env: DTRUNTIME_S3_ENDPOINT)");
-    println!("  --s3-bucket <NAME>      S3 bucket for checkpoint artifact upload (env: DTRUNTIME_S3_BUCKET)");
-    println!("  --s3-access-key <KEY>   S3 access key ID (env: DTRUNTIME_S3_ACCESS_KEY)");
-    println!("  --s3-secret-key <SECRET> S3 secret access key (env: DTRUNTIME_S3_SECRET_KEY)");
-    println!("  --s3-region <REGION>    S3 region (default: us-east-1, env: DTRUNTIME_S3_REGION)");
-    println!("  --help, -h              Show this help message");
+    println!("  --tls-client-ca <PATH>     Require mTLS client certs signed by CA PEM at PATH");
+    println!("  --metrics-addr <ADDR>      Enable Prometheus /metrics endpoint at ADDR");
+    println!("  --s3-endpoint <URL>        S3/MinIO endpoint URL (env: DTRUNTIME_S3_ENDPOINT)");
+    println!("  --s3-bucket <NAME>         S3 bucket for checkpoint artifact upload (env: DTRUNTIME_S3_BUCKET)");
+    println!("  --s3-access-key <KEY>      S3 access key ID (env: DTRUNTIME_S3_ACCESS_KEY)");
+    println!("  --s3-secret-key <SECRET>   S3 secret access key (env: DTRUNTIME_S3_SECRET_KEY)");
+    println!("  --s3-region <REGION>       S3 region (default: us-east-1, env: DTRUNTIME_S3_REGION)");
+    println!("  --max-s3-concurrent-ops N  Max concurrent S3 operations (default: 64).");
+    println!("                             Set >= world_size to avoid semaphore stalls at scale.");
+    println!("  --help, -h                 Show this help message");
 }
 
 fn coordinator_args(
@@ -253,6 +276,7 @@ fn coordinator_args(
     let mut parsed = CoordinatorCliArgs {
         addr: String::from(DEFAULT_ADDR),
         metadata_db: None,
+        metadata_db_url: std::env::var("DTRUNTIME_METADATA_DB_URL").ok(),
         storage_root: None,
         tls_cert: None,
         tls_key: None,
@@ -271,6 +295,7 @@ fn coordinator_args(
         s3_secret_key: std::env::var("DTRUNTIME_S3_SECRET_KEY").ok(),
         s3_region: std::env::var("DTRUNTIME_S3_REGION")
             .unwrap_or_else(|_| "us-east-1".to_string()),
+        max_s3_concurrent_ops: None,
         show_help: false,
     };
 
@@ -315,6 +340,20 @@ fn coordinator_args(
             parsed.s3_secret_key = Some(args.next().ok_or("--s3-secret-key requires a value")?);
         } else if arg == "--s3-region" {
             parsed.s3_region = args.next().ok_or("--s3-region requires a value")?;
+        } else if arg == "--max-s3-concurrent-ops" {
+            let raw = args
+                .next()
+                .ok_or("--max-s3-concurrent-ops requires a value")?;
+            let n: usize = raw
+                .parse()
+                .map_err(|_| "--max-s3-concurrent-ops must be a positive integer")?;
+            if n == 0 {
+                return Err("--max-s3-concurrent-ops must be greater than zero".into());
+            }
+            parsed.max_s3_concurrent_ops = Some(n);
+        } else if arg == "--metadata-db-url" {
+            parsed.metadata_db_url =
+                Some(args.next().ok_or("--metadata-db-url requires a URL")?);
         } else if arg == "--help" || arg == "-h" {
             parsed.show_help = true;
         } else {
@@ -337,6 +376,7 @@ mod tests {
             CoordinatorCliArgs {
                 addr: DEFAULT_ADDR.to_string(),
                 metadata_db: None,
+                metadata_db_url: std::env::var("DTRUNTIME_METADATA_DB_URL").ok(),
                 tls_cert: None,
                 tls_key: None,
                 tls_client_ca: None,
@@ -355,6 +395,7 @@ mod tests {
                 s3_secret_key: std::env::var("DTRUNTIME_S3_SECRET_KEY").ok(),
                 s3_region: std::env::var("DTRUNTIME_S3_REGION")
                     .unwrap_or_else(|_| "us-east-1".to_string()),
+                max_s3_concurrent_ops: None,
                 show_help: false,
             }
         );
@@ -465,6 +506,17 @@ mod ha_lock_tests {
         let _first = CoordinatorLockGuard::acquire(&db).expect("first lock");
         let second = CoordinatorLockGuard::acquire(&db);
         assert!(second.is_err());
+    }
+}
+
+/// Strip credentials from a PostgreSQL DSN before emitting it to logs.
+fn redact_pg_url(url: &str) -> String {
+    if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.rfind('@')) {
+        let scheme = &url[..scheme_end + 3];
+        let host_onwards = &url[at_pos..];
+        format!("{scheme}***{host_onwards}")
+    } else {
+        url.to_string()
     }
 }
 

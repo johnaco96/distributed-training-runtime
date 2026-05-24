@@ -13,6 +13,55 @@ use runtime_checkpoint::{
     CheckpointState as DomainCheckpointState, RunId as DomainRunId, WorkerId as DomainWorkerId,
 };
 
+/// Boxed error returned by all [`MetadataStore`] methods.
+///
+/// Using a boxed trait object keeps the trait object-safe and avoids forcing a
+/// single error type on SQLite and PostgreSQL implementations.
+pub type PersistResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
+
+/// Trait that abstracts over the coordinator's metadata persistence back-end.
+///
+/// Both [`SqliteMetadataStore`] (single-node, local dev) and
+/// [`crate::pg_store::PostgresMetadataStore`] (distributed, production)
+/// implement this trait so [`crate::state::CoordinatorState`] can hold a
+/// `Box<dyn MetadataStore>` without caring which back-end is in use.
+pub trait MetadataStore: Send + Sync {
+    fn save_run(&self, run: &RunRecord) -> PersistResult<()>;
+    fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> PersistResult<()>;
+    fn load_workers_for_run(
+        &self,
+        run_id: &str,
+    ) -> PersistResult<Vec<(String, u32, u32, i32)>>;
+    fn save_dataset(&self, d: &DatasetRecord) -> PersistResult<()>;
+    fn save_checkpoint(
+        &self,
+        run_id: &str,
+        idempotency_key: &str,
+        rec: &CoordinatorCheckpointRecord,
+    ) -> PersistResult<()>;
+    fn save_checkpoint_artifact(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+        a: &ArtifactRecord,
+    ) -> PersistResult<()>;
+    fn mark_checkpoint_committed(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+        committed_at_millis: u64,
+    ) -> PersistResult<()>;
+    fn load_latest_checkpoint(
+        &self,
+        run_id: &str,
+    ) -> PersistResult<Option<CoordinatorCheckpointRecord>>;
+    fn load_dataset(
+        &self,
+        run_id: &str,
+        dataset_id: &str,
+    ) -> PersistResult<Option<(String, Vec<ShardRecord>)>>;
+}
+
 #[derive(Clone, Debug)]
 pub struct SqliteMetadataStore {
     conn: Arc<Mutex<Connection>>,
@@ -253,6 +302,68 @@ CREATE TABLE IF NOT EXISTS latest_checkpoints (
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some((name, shards)))
+    }
+}
+
+/// Implement the unified [`MetadataStore`] trait for `SqliteMetadataStore`.
+///
+/// Each method is a thin delegation that boxes any `rusqlite::Error` into the
+/// trait's `PersistResult` error type.
+impl MetadataStore for SqliteMetadataStore {
+    fn save_run(&self, run: &RunRecord) -> PersistResult<()> {
+        self.save_run(run).map_err(|e| Box::new(e) as _)
+    }
+    fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> PersistResult<()> {
+        self.save_worker(w, world_size).map_err(|e| Box::new(e) as _)
+    }
+    fn load_workers_for_run(
+        &self,
+        run_id: &str,
+    ) -> PersistResult<Vec<(String, u32, u32, i32)>> {
+        self.load_workers_for_run(run_id).map_err(|e| Box::new(e) as _)
+    }
+    fn save_dataset(&self, d: &DatasetRecord) -> PersistResult<()> {
+        self.save_dataset(d).map_err(|e| Box::new(e) as _)
+    }
+    fn save_checkpoint(
+        &self,
+        run_id: &str,
+        idempotency_key: &str,
+        rec: &CoordinatorCheckpointRecord,
+    ) -> PersistResult<()> {
+        self.save_checkpoint(run_id, idempotency_key, rec)
+            .map_err(|e| Box::new(e) as _)
+    }
+    fn save_checkpoint_artifact(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+        a: &ArtifactRecord,
+    ) -> PersistResult<()> {
+        self.save_checkpoint_artifact(run_id, checkpoint_id, a)
+            .map_err(|e| Box::new(e) as _)
+    }
+    fn mark_checkpoint_committed(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+        committed_at_millis: u64,
+    ) -> PersistResult<()> {
+        self.mark_checkpoint_committed(run_id, checkpoint_id, committed_at_millis)
+            .map_err(|e| Box::new(e) as _)
+    }
+    fn load_latest_checkpoint(
+        &self,
+        run_id: &str,
+    ) -> PersistResult<Option<CoordinatorCheckpointRecord>> {
+        self.load_latest_checkpoint(run_id).map_err(|e| Box::new(e) as _)
+    }
+    fn load_dataset(
+        &self,
+        run_id: &str,
+        dataset_id: &str,
+    ) -> PersistResult<Option<(String, Vec<ShardRecord>)>> {
+        self.load_dataset(run_id, dataset_id).map_err(|e| Box::new(e) as _)
     }
 }
 

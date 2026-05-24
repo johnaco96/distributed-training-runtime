@@ -9,6 +9,7 @@ pub mod audit;
 pub mod auth;
 pub mod ha_lock;
 pub mod persistence;
+pub mod pg_store;
 pub mod service;
 pub mod state;
 pub mod telemetry;

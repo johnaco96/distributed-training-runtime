@@ -19,6 +19,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const WORKER_FAILURE_INTERVAL: Duration = Duration::from_secs(90);
 const SHARD_LEASE_DURATION: Duration = Duration::from_secs(30);
 
+use crate::persistence::MetadataStore;
+#[cfg(test)]
 use crate::persistence::SqliteMetadataStore;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,11 +33,12 @@ pub enum DatasetPlacementPolicy {
 ///
 /// This is intentionally in-memory only for the MVP coordinator. It is not
 /// persisted and will be lost when the process exits.
-#[derive(Debug)]
 pub struct CoordinatorState {
     inner: RwLock<CoordinatorStateInner>,
     placement_policy: DatasetPlacementPolicy,
-    metadata_store: Option<SqliteMetadataStore>,
+    /// Optional persistence back-end.  Either [`SqliteMetadataStore`] (single-
+    /// node) or [`crate::pg_store::PostgresMetadataStore`] (distributed HA).
+    metadata_store: Option<Box<dyn MetadataStore>>,
     next_run_id: AtomicU64,
     next_worker_id: AtomicU64,
     next_dataset_id: AtomicU64,
@@ -310,9 +313,9 @@ impl CoordinatorState {
         Err(WorkerState::try_from(worker.state).unwrap_or(WorkerState::Unspecified))
     }
 
-    pub fn with_metadata_store(metadata_store: SqliteMetadataStore) -> Self {
+    pub fn with_metadata_store(metadata_store: impl MetadataStore + 'static) -> Self {
         Self {
-            metadata_store: Some(metadata_store),
+            metadata_store: Some(Box::new(metadata_store)),
             ..Self::default()
         }
     }
