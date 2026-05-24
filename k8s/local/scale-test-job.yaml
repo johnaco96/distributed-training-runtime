@@ -71,7 +71,7 @@ spec:
               echo "Coordinator is up."
       containers:
         - name: scale-test
-          image: distributed-training-runtime:local
+          image: distributed-training-runtime:phase10
           imagePullPolicy: IfNotPresent
           # Override the coordinator entrypoint with the bench binary.
           command: ["/usr/local/bin/runtime-bench"]

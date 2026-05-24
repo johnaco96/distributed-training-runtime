@@ -285,8 +285,20 @@ def maybe_start_coordinator(
         return
     port = find_free_port()
     addr = f"127.0.0.1:{port}"
+    # Prefer the pre-built release binary so we never pay a cargo compilation
+    # round-trip (which can take 30+ s and blow the readiness timeout).
+    _project_root = Path(__file__).resolve().parent.parent.parent
+    _release_bin = _project_root / "target" / "release" / "runtime-coordinator"
+    if _release_bin.exists():
+        coordinator_cmd = [str(_release_bin), "--addr", addr]
+    else:
+        # Fall back to cargo run --release when no binary is present (CI/fresh clone).
+        coordinator_cmd = [
+            "cargo", "run", "--release", "-p", "runtime-coordinator",
+            "--", "--addr", addr,
+        ]
     proc = subprocess.Popen(
-        ["cargo", "run", "-p", "runtime-coordinator", "--", "--addr", addr],
+        coordinator_cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -319,6 +331,7 @@ def wait_for_dataset(
     run_id: str,
     dataset_id: str,
     timeout_seconds: float = 120.0,
+    worker_id: str = "probe",
 ) -> None:
     """Block until the coordinator has the dataset registered.
 
@@ -331,7 +344,7 @@ def wait_for_dataset(
             # A successful shard assignment proves the dataset exists.
             resp = client.request_shard(
                 run_id=run_id,
-                worker_id="probe",
+                worker_id=worker_id,
                 dataset_id=dataset_id,
                 idempotency_key="",
             )
@@ -708,6 +721,19 @@ def run_single_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
         run_id = run_resp.run_id.value
         print(f"[rank {rank}] run_id={run_id}")
 
+        # Register this worker early so wait_for_dataset can probe with a real
+        # registered worker_id instead of the "probe" placeholder the coordinator rejects.
+        registered = client.register_worker(
+            run_id=run_id,
+            worker_id=worker_id,
+            rank=rank,
+            host=socket.gethostname(),
+            idempotency_key=f"pt-register-worker-{rank}-{idempotency_suffix}",
+        )
+        actual_worker_id = registered.worker_id.value or worker_id
+        rpc_summary["registered_workers"] += 1
+        print(f"[rank {rank}] registered as worker_id={actual_worker_id}")
+
         # Rank 0: write shard files (if not already present) and register the dataset.
         # Idempotent: if a shard-prep-job already wrote the files, reuse them.
         # Other ranks: wait for the dataset to appear in the coordinator.
@@ -742,21 +768,21 @@ def run_single_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
             )
             print(f"[rank 0] dataset registered ({len(shard_metadata)} shards)")
         else:
-            print(f"[rank {rank}] waiting for dataset to be registered by rank 0 …")
-            wait_for_dataset(client, run_id, dataset_id)
-            print(f"[rank {rank}] dataset is available")
-
-        # Register this worker
-        registered = client.register_worker(
-            run_id=run_id,
-            worker_id=worker_id,
-            rank=rank,
-            host=socket.gethostname(),
-            idempotency_key=f"pt-register-worker-{rank}-{idempotency_suffix}",
-        )
-        actual_worker_id = registered.worker_id.value or worker_id
-        rpc_summary["registered_workers"] += 1
-        print(f"[rank {rank}] registered as worker_id={actual_worker_id}")
+            # Shards are pre-created on the shared volume (by shard-prep-job or rank 0).
+            # Re-registering with the same idempotency key is a coordinator no-op if
+            # rank 0 already registered the dataset — no polling probe needed.
+            shard_metadata = shard_metadata_from_existing(shard_dir)
+            client.register_dataset(
+                run_id=run_id,
+                name="training-shards",
+                uri=str(shard_dir.resolve()),
+                format="npz",
+                shards=shard_metadata,
+                dataset_id=dataset_id,
+                dataset_version="v1",
+                idempotency_key=f"pt-dataset-{idempotency_suffix}",
+            )
+            print(f"[rank {rank}] dataset available")
 
         # Resume from checkpoint if requested (rank 0 saves, all ranks load)
         if args.resume and latest_local.exists():

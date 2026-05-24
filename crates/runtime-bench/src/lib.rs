@@ -828,13 +828,32 @@ async fn run_worker_rpc_async(
 }
 
 fn start_local_coordinator(addr: &str) -> Result<Child, String> {
-    let mut child = Command::new("cargo")
-        .args(["run", "-p", "runtime-coordinator", "--", "--addr", addr])
+    // Prefer a pre-built release (or debug) binary sitting next to this
+    // executable so we never pay a `cargo run` compilation round-trip.
+    // Fall back to `cargo run` only when neither binary is found.
+    let coordinator_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("runtime-coordinator")))
+        .filter(|p| p.exists());
+
+    let mut cmd = if let Some(bin) = coordinator_bin {
+        let mut c = Command::new(bin);
+        c.args(["--addr", addr]);
+        c
+    } else {
+        let mut c = Command::new("cargo");
+        c.args(["run", "--release", "-p", "runtime-coordinator", "--", "--addr", addr]);
+        c
+    };
+
+    let mut child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| e.to_string())?;
-    for _ in 0..80 {
+
+    // Poll for up to 15 s (150 × 100 ms); the release binary starts in < 1 s.
+    for _ in 0..150 {
         if TcpStream::connect(addr).is_ok() {
             return Ok(child);
         }
