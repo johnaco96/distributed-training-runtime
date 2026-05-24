@@ -1,0 +1,109 @@
+# worker-job.yaml
+#
+# Indexed Job: each pod is one real distributed-training worker.
+# The pod index (JOB_COMPLETION_INDEX) is passed as --rank.
+#
+# Prerequisites:
+#   1. Coordinator is running:
+#      kubectl apply -f k8s/local/namespace.yaml
+#      kubectl apply -f k8s/local/postgres.yaml        # optional, removes --metadata-db-url
+#      kubectl apply -f k8s/local/coordinator-deployment.yaml
+#      kubectl apply -f k8s/local/coordinator-service.yaml
+#
+#   2. Shard files are already on /tmp/dtruntime-shards (either from shard-prep-job
+#      or written by rank-0 on the first run):
+#      kubectl apply -f k8s/local/shard-prep-job.yaml
+#      kubectl wait --for=condition=complete job/shard-prep -n dtruntime --timeout=120s
+#
+# Usage:
+#   kubectl apply -f k8s/local/worker-job.yaml
+#   kubectl logs -n dtruntime -l job-name=dtruntime-workers --prefix --follow
+#
+# --workers (world_size) must equal spec.completions and spec.parallelism.
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dtruntime-workers
+  namespace: dtruntime
+  labels:
+    app: dtruntime-workers
+spec:
+  # One completion per worker rank.  Match --workers below.
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: dtruntime-workers
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-coordinator
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for coordinator at runtime-coordinator.dtruntime:50051 ..."
+              until nc -z runtime-coordinator.dtruntime.svc.cluster.local 50051; do
+                sleep 2
+              done
+              echo "Coordinator is up."
+      containers:
+        - name: worker
+          image: distributed-training-runtime:local
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - python/examples/pytorch_coordinator_train.py
+          args:
+            - "--addr"
+            - "runtime-coordinator.dtruntime.svc.cluster.local:50051"
+            # --rank is passed from the Indexed Job completion index.
+            # The shell expansion below is done by the container entrypoint.
+            - "--rank"
+            - "$(JOB_COMPLETION_INDEX)"
+            # world_size: must equal spec.completions above
+            - "--workers"
+            - "4"
+            - "--epochs"
+            - "3"
+            - "--samples"
+            - "4096"
+            - "--shards"
+            - "16"
+            - "--batch-size"
+            - "32"
+            - "--shard-dir"
+            - "/mnt/shards"
+            - "--out-dir"
+            - "/tmp/dtruntime-worker-out"
+          env:
+            - name: PYTHONPATH
+              value: /app/python
+            # JOB_COMPLETION_INDEX is injected automatically by the Indexed Job
+            # controller — no need to set it here; listed for documentation.
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          volumeMounts:
+            - name: shard-storage
+              mountPath: /mnt/shards
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+      volumes:
+        - name: shard-storage
+          hostPath:
+            path: /tmp/dtruntime-shards
+            type: Directory
