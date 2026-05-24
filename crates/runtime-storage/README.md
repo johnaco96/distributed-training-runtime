@@ -2,5 +2,4 @@
 
 Storage abstractions and backend integrations.
 
-This crate is currently a Phase 3 skeleton. It intentionally does not include
-business logic yet.
+This crate provides the backend-neutral storage abstraction layer, including local filesystem and S3-compatible object store backends.

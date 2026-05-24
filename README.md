@@ -42,7 +42,7 @@ Run `python/examples/benchmark_pytorch_orchestration.py` in smoke mode, then ins
 - `benchmark-summary.json`
 - `benchmark-results.csv`
 
-This benchmark compares local standalone training vs local coordinator-driven training. Current timings include coordinator startup overhead unless/ until a warmed external-coordinator mode is used.
+This benchmark compares local standalone training vs local coordinator-driven training. Current timings include coordinator startup overhead unless/until a warmed external-coordinator mode is used.
 
 ## What is **not** claimed yet?
 
@@ -80,8 +80,6 @@ PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --ru
 - [Troubleshooting](docs/troubleshooting.md)
 - [Status and limitations](docs/status-and-limitations.md)
 - [Observability](docs/observability.md)
-- [Product direction](docs/product-direction.md)
-- [Demo checklist](docs/demo-checklist.md)
 - [Project packaging](docs/project-packaging.md)
 
 ## Validation notes
@@ -94,10 +92,9 @@ Environment dependencies can affect validation:
 
 When unavailable, those paths should fail clearly or skip; treat that as environment limitation rather than a product-claim change.
 
+## Kubernetes local demo
 
-## Kubernetes local demo (Phase 20E)
-
-A local/dev-first Kubernetes demo path is now available.
+A local/dev-first Kubernetes demo path is available.
 
 - Container image: `Dockerfile`
 - Manifests: `k8s/local/`
@@ -105,82 +102,56 @@ A local/dev-first Kubernetes demo path is now available.
 
 This path demonstrates packaging/deployment for local clusters (kind/minikube) only. It does not claim production Kubernetes readiness, HA, auth, dashboard, or `torch.distributed` execution.
 
-## Phase 20F-1 security foundation
+## Security
 
-Phase **20F-1** (security architecture/threat-model foundation) is now documented.
+Transport security and an authorization model are available for coordinator gRPC and the Python RuntimeClient. Plaintext remains the default local/dev behavior when TLS options are omitted.
 
-New security docs:
+**TLS/mTLS:** Coordinator accepts `--tls-cert`, `--tls-key`, and optional `--tls-client-ca` flags. The Python client supports `tls_ca_cert`, `tls_client_cert`, `tls_client_key` constructor args and corresponding `DTRUNTIME_TLS_*` env vars. No certificates or keys are committed in-repo; see `k8s/local/tls-secret.example.yaml` for placeholder examples.
+
+**Authorization:** An optional metadata-based caller identity model is available for local/dev testing. Enable with `--auth-mode metadata` or `DTRUNTIME_AUTH_MODE=metadata`. The Python client can attach `x-dtruntime-subject`, `x-dtruntime-role`, and `x-dtruntime-worker-id` via constructor args or `DTRUNTIME_AUTH_*` env vars. This is policy scaffolding — not full SPIFFE/SPIRE or production RBAC.
+
+**Audit logging:** Structured audit/security events are emitted for security-relevant coordinator operations. Audit logs may include logical identity and run/checkpoint identifiers.
+
+Security docs:
 - [Security architecture](docs/security-architecture.md)
 - [Threat model](docs/threat-model.md)
 - [Production readiness](docs/production-readiness.md)
 - [Security auth plan](docs/security-auth.md)
 - [High availability plan](docs/high-availability.md)
-- [Dashboard plan](docs/dashboard-plan.md)
 - [Production S3 plan](docs/production-s3.md)
 
-Important: auth/mTLS, dashboard, HA replication, and production S3 hardening are **not** fully implemented in 20F-1. The next implementation step is **20F-2** (optional TLS/mTLS foundation).
-\n\n## Phase 20F-2 TLS/mTLS foundation\nPhase 20F-2 adds optional transport security for coordinator gRPC and Python RuntimeClient. Plaintext remains the default local/dev behavior when TLS options are omitted.\n\nCoordinator TLS options:\n- --tls-cert /path/to/server.crt\n- --tls-key /path/to/server.key\n- --tls-client-ca /path/to/ca.crt (optional; enables client cert verification/mTLS)\n\nExample server commands:\n- runtime-coordinator --addr 0.0.0.0:50051 --tls-cert /path/to/server.crt --tls-key /path/to/server.key\n- runtime-coordinator --addr 0.0.0.0:50051 --tls-cert /path/to/server.crt --tls-key /path/to/server.key --tls-client-ca /path/to/ca.crt\n\nPython RuntimeClient supports TLS args and env vars: tls_ca_cert, tls_client_cert, tls_client_key and DTRUNTIME_TLS_CA_CERT, DTRUNTIME_TLS_CLIENT_CERT, DTRUNTIME_TLS_CLIENT_KEY.\n\nNo certificates/keys are committed in-repo; use placeholders such as k8s/local/tls-secret.example.yaml.\nNo workload authorization policy is implemented in 20F-2; that is planned for Phase 20F-3.\nNo production PKI issuance/rotation is implemented in 20F-2.\n
+## Observability
 
+Prometheus `/metrics` is available via `--metrics-addr`. Grafana dashboard assets are under `observability/`.
 
-## Phase 20F-3 authorization scaffolding
-Phase 20F-3 adds an internal authorization model with optional metadata-based caller identity for local/dev testing. Default mode remains disabled for compatibility. Enable with `runtime-coordinator --addr 0.0.0.0:50051 --auth-mode metadata` or `DTRUNTIME_AUTH_MODE=metadata`. Python client can attach `x-dtruntime-subject`, `x-dtruntime-role`, and optional `x-dtruntime-worker-id` via constructor args or env (`DTRUNTIME_AUTH_SUBJECT`, `DTRUNTIME_AUTH_ROLE`, `DTRUNTIME_AUTH_WORKER_ID`). This is policy scaffolding only (not full SPIFFE/SPIRE or production RBAC). Audit/security events remain planned for Phase 20F-4; dashboard/HA/production S3 hardening remain Phase 20F-5.
-
-
-Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
-
-## Phase 20F-5 completion status
-
-Phase **20F-5** is complete for **secure design tracks** (dashboard, HA, and production S3 planning), and Phase 20 is complete as a **product-direction/security-foundation milestone**.
-
-This is **not** a claim that dashboard implementation, coordinator HA replication, or production S3 hardening are implemented. Local Kubernetes remains local/dev only.
-
-See:
-- [Phase 20F summary](docs/phase-20f-summary.md)
-- [Production gates checklist](docs/production-gates.md)
-
-
-
-## Phase 20 hardening update (in progress)
-
-- Added stricter env-gated MinIO/S3 integration-test behavior with explicit skip messaging.
-- Expanded benchmark/runbook documentation labels and caveats for local/dev versus secure/minio optional surfaces.
-- Secure Kubernetes runbook depth expanded for local certificate/secret creation flow.
-- Production readiness is still not claimed; remaining gaps are tracked in status/production docs.
-\n- Phase 20 update: benchmark expansion and MinIO/S3 validation are environment-gated; no production-readiness claim.
-
-
-## Phase 20 benchmark surface expansion
-Added runtime-bench subcommands: `dataset-prefetch`, `cache-aware-placement`, `auth-audit-overhead`, and `status-snapshot`. Outputs now include `environment`, `surface`, `mode`, `caveats`, `timestamp_utc`, duration/latency fields, plus JSON/CSV outputs. MinIO-gated paths remain optional and must be enabled via `DTRUNTIME_RUN_MINIO_TESTS=1`; otherwise they should skip cleanly with caveats.
-
-
-## Step 1 production observability
-Prometheus /metrics is available via `--metrics-addr` and Grafana dashboard assets are under `observability/`.
-
-## Step 2 production probes
-
-Coordinator health endpoints are now available on the metrics HTTP listener (`--metrics-addr`):
+Coordinator health endpoints are available on the metrics HTTP listener (`--metrics-addr`):
 - `GET /healthz` for liveness
 - `GET /readyz` for readiness
 
 Local Kubernetes manifests wire startup/readiness/liveness probes to these endpoints to prevent early traffic routing and to restart unhealthy pods.
 
-## Step 3: Secure TLS/mTLS Kubernetes validation
-Use `k8s/local-secure/` as the runnable secure deployment path. Generate local/dev certs with `scripts/generate_dev_certs.ps1`, create `dtruntime-tls`, `dtruntime-client-ca`, and `dtruntime-client-tls` Secrets, then deploy coordinator + job in order as documented in `k8s/local-secure/README.md`. No certificate or key material is committed to git.
+Secure Kubernetes validation: use `k8s/local-secure/` as the runnable secure deployment path. Generate local/dev certs with `scripts/generate_dev_certs.ps1`, create `dtruntime-tls`, `dtruntime-client-ca`, and `dtruntime-client-tls` Secrets, then deploy coordinator + job in order as documented in `k8s/local-secure/README.md`. No certificate or key material is committed to git.
 
-### Step 4 production-style Kubernetes validation benchmark
+Use `scripts/run_k8s_secure_validation.ps1` to run secure coordinator rollout + secure PyTorch job + metrics artifact capture. This validates secure runtime correctness in Kubernetes and is not a production-scale throughput benchmark.
 
-Use `scripts/run_k8s_secure_validation.ps1` to run secure coordinator rollout + secure PyTorch job + metrics artifact capture. The benchmark is evidence of secure runtime correctness in Kubernetes, not a production-scale throughput benchmark.
+## Benchmarking
 
-## Linux scaling and checkpoint profiling suite
+### Standalone vs coordinator-driven comparison
 
-Use `scripts/run_linux_scaling_benchmark.sh` for Linux-only scaling plus checkpoint-stall summary artifacts under `.dtruntime-results/`.
-This benchmark is separate from secure Kubernetes validation and focuses on control-plane throughput, latency percentiles, and checkpoint stall percent.
+Run `python/examples/benchmark_pytorch_orchestration.py` to compare local standalone training against coordinator-driven training. Results include wall-clock timings, overhead, final loss/accuracy, checkpoint/resume status, and coordinator RPC summary.
 
+### Linux scaling and checkpoint profiling
+
+Use `scripts/run_linux_scaling_benchmark.sh` for Linux-only scaling plus checkpoint-stall summary artifacts under `.dtruntime-results/`. This focuses on control-plane throughput, latency percentiles, and checkpoint stall percent.
 
 ### High-scale logical-worker benchmarking
-The runtime now includes a `runtime-bench logical-workers` mode that emulates hundreds to thousands of logical workers from one or more benchmark processes while issuing real coordinator gRPC control-plane RPCs (register worker, shard assignment, heartbeat, checkpoint metadata lifecycle, and restore-latest checks). This is the recommended way to benchmark control-plane scalability to 100/250/500/1000/2000+ workers without requiring thousands of physical GPUs or pods.
 
-Use:
-`cargo run -p runtime-bench -- logical-workers --workers 1000 --duration-secs 60 --concurrency 128 --heartbeat-interval-ms 1000 --shards 10000 --checkpoint-every-secs 30 --checkpoint-artifacts-per-checkpoint 4 --checkpoint-bytes 67108864 --out-json logical-workers.json --out-csv logical-workers.csv`
+The `runtime-bench logical-workers` mode emulates hundreds to thousands of logical workers from one or more benchmark processes while issuing real coordinator gRPC control-plane RPCs (register worker, shard assignment, heartbeat, checkpoint metadata lifecycle, and restore-latest checks). This is the recommended way to benchmark control-plane scalability without requiring thousands of physical GPUs or pods.
+
+```
+cargo run -p runtime-bench -- logical-workers --workers 1000 --duration-secs 60 --concurrency 128 --heartbeat-interval-ms 1000 --shards 10000 --checkpoint-every-secs 30 --checkpoint-artifacts-per-checkpoint 4 --checkpoint-bytes 67108864 --out-json logical-workers.json --out-csv logical-workers.csv
+```
 
 Interpretation guidance: use p50/p95/p99 latencies together with coordinator CPU/RSS and disk/network metrics from Linux profiling outputs. Claims about cluster-scale behavior must be based on measured runs and reported caveats; unavailable metrics are recorded as unavailable/null rather than zero.
+
+The benchmark suite also includes `runtime-bench` subcommands: `dataset-prefetch`, `cache-aware-placement`, `auth-audit-overhead`, and `status-snapshot`. Outputs include `environment`, `surface`, `mode`, `caveats`, `timestamp_utc`, duration/latency fields, plus JSON/CSV outputs. MinIO-gated paths remain optional and must be enabled via `DTRUNTIME_RUN_MINIO_TESTS=1`; otherwise they skip cleanly with caveats.

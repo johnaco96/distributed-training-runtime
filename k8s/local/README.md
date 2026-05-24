@@ -1,4 +1,4 @@
-# Local Kubernetes Manifests (Phase 20E)
+# Local Kubernetes Manifests
 
 These manifests are intentionally local/dev focused.
 

@@ -151,7 +151,7 @@ Rule: latest lookup must prefer latest **committed** checkpoint, never newest di
   - return terminal failure if previously failed/aborted.
 - MVP provides at-least-once style retry safety, not exactly-once semantics.
 
-## 13. Checksum and size validation (Phase 12.5A foundation)
+## 13. Checksum and size validation
 
 - Each artifact report includes:
   - artifact logical name,
@@ -159,14 +159,14 @@ Rule: latest lookup must prefer latest **committed** checkpoint, never newest di
   - byte size,
   - checksum,
   - checksum algorithm.
-- Phase 12.5A adds reusable backend-neutral integrity helpers:
+- Backend-neutral integrity helpers provide:
   - `ChecksumAlgorithm` parsing/normalization (currently supports `sha256`),
   - canonical algorithm names (lowercase),
   - canonical lowercase hex digests,
   - digest compute/verify helpers,
   - artifact integrity validation (existence/read success, size match, supported algorithm, digest match).
 - Unsupported algorithms are rejected clearly.
-- Phase 12.5B enforces this validation in the commit path before writing committed checkpoint state.
+- Integrity validation is enforced in the commit path before writing committed checkpoint state.
 
 ## 14. Partial checkpoint cleanup policy
 
@@ -208,7 +208,7 @@ When adding S3-compatible backend:
 - Consider conditional writes (etag/version) for pointer races.
 - Validate checksum/size with object metadata where available.
 - Background garbage collection and lifecycle rules become more important.
-- Phase 12A adds only the S3-compatible storage foundation; Phase 12B wires S3-compatible storage into checkpoint storage tests with local MinIO validation gated by environment variables.
+- S3-compatible storage support is implemented and checkpoint storage tests with local MinIO validation are gated by environment variables.
 
 ## 18. Explicit MVP scope
 
@@ -241,15 +241,15 @@ Artifact metadata and artifact bytes are related but distinct:
 
 Current protocol behavior and roadmap alignment:
 
-- The current checkpoint protocol already carries artifact metadata and backend-neutral storage keys.
-- Phase 12 completed backend-neutral checkpoint storage and S3-compatible/MinIO-compatible checkpoint-layer support.
-- Phase 12.5 introduces the explicit worker artifact-byte data path and validates that metadata matches stored objects.
-- Commit semantics should require that expected artifacts both exist and match their reported metadata before checkpoint commit succeeds.
+- The current checkpoint protocol carries artifact metadata and backend-neutral storage keys.
+- Backend-neutral checkpoint storage with S3-compatible/MinIO-compatible support is implemented.
+- The worker artifact-byte data path validates that metadata matches stored objects.
+- Commit semantics require that expected artifacts both exist and match their reported metadata before checkpoint commit succeeds.
 
 
-## 21. Phase 13B concurrent artifact upload helper
+## 21. Concurrent artifact upload helper
 
-Phase 13B adds a backend-neutral helper in `runtime-checkpoint` for uploading multiple checkpoint artifacts with bounded concurrency. Worker/client code can upload artifact bytes first through `StorageBackend`, receive checksum/size metadata, and then report metadata for commit. Commit-time integrity checks from Phase 12.5B remain authoritative and still verify existence/size/checksum before commit finalization.
+A backend-neutral helper in `runtime-checkpoint` supports uploading multiple checkpoint artifacts with bounded concurrency. Worker/client code can upload artifact bytes first through `StorageBackend`, receive checksum/size metadata, and then report metadata for commit. Commit-time integrity checks remain authoritative and verify existence/size/checksum before commit finalization.
 
 ## 22. Risks and follow-ups
 

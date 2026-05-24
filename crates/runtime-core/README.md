@@ -2,5 +2,4 @@
 
 Shared domain types and common coordinator/runtime utilities.
 
-This crate is currently a Phase 3 skeleton. It intentionally does not include
-business logic yet.
+This crate provides shared domain types and common utilities used across coordinator and runtime crates.
