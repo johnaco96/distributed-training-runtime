@@ -285,8 +285,20 @@ def maybe_start_coordinator(
         return
     port = find_free_port()
     addr = f"127.0.0.1:{port}"
+    # Prefer the pre-built release binary so we never pay a cargo compilation
+    # round-trip (which can take 30+ s and blow the readiness timeout).
+    _project_root = Path(__file__).resolve().parent.parent.parent
+    _release_bin = _project_root / "target" / "release" / "runtime-coordinator"
+    if _release_bin.exists():
+        coordinator_cmd = [str(_release_bin), "--addr", addr]
+    else:
+        # Fall back to cargo run --release when no binary is present (CI/fresh clone).
+        coordinator_cmd = [
+            "cargo", "run", "--release", "-p", "runtime-coordinator",
+            "--", "--addr", addr,
+        ]
     proc = subprocess.Popen(
-        ["cargo", "run", "-p", "runtime-coordinator", "--", "--addr", addr],
+        coordinator_cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
