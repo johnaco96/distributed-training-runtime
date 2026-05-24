@@ -229,6 +229,52 @@ class RuntimeClient:
             metadata=self.rpc_metadata(worker_id=worker_id, extra=extra_metadata),
         )
 
+    def renew_shard_lease(
+        self,
+        run_id: str,
+        worker_id: str,
+        shard_id: str,
+        lease_epoch: int,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.RenewShardLeaseResponse":
+        """Renew the lease on a shard the worker currently holds."""
+        request = self._runtime_pb2.RenewShardLeaseRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            shard_id=self._runtime_pb2.ShardId(value=shard_id),
+            lease_epoch=lease_epoch,
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.RenewShardLease(
+            request, metadata=self.rpc_metadata(worker_id=worker_id)
+        )
+
+    def report_shard_progress(
+        self,
+        run_id: str,
+        worker_id: str,
+        dataset_id: str,
+        shard_id: str,
+        lease_epoch: int,
+        progress_offset: int,
+        is_complete: bool = False,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.ReportShardProgressResponse":
+        """Report how far this worker has read into its assigned shard."""
+        request = self._runtime_pb2.ReportShardProgressRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            dataset_id=self._runtime_pb2.DatasetId(value=dataset_id),
+            shard_id=self._runtime_pb2.ShardId(value=shard_id),
+            lease_epoch=lease_epoch,
+            progress_offset=progress_offset,
+            is_complete=is_complete,
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.ReportShardProgress(
+            request, metadata=self.rpc_metadata(worker_id=worker_id)
+        )
+
     def begin_checkpoint(
         self,
         run_id: str,
