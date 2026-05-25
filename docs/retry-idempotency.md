@@ -1,4 +1,4 @@
-# Retry and idempotency notes (Phase 17B)
+# Retry and Idempotency
 
 ## Scope
 
@@ -36,7 +36,7 @@ Mutating operations without idempotency keys should not be retried blindly becau
 
 ## Current retry implementation status
 
-- Storage retries: implemented in `runtime-storage` policy/retry helpers (Phase 13).
+- Storage retries: implemented in `runtime-storage` policy/retry helpers.
 - Coordinator RPC automatic client retries: not globally enabled by default.
 - Benchmarks: send deterministic idempotency keys per logical benchmark run to avoid accidental cross-run key collisions.
 

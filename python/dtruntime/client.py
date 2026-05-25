@@ -15,8 +15,7 @@ class RuntimeClient:
 
     The high-level SDK methods for worker registration and heartbeat call the
     generated coordinator gRPC stub directly. Additional high-level SDK methods
-    for datasets, shard leases, and checkpoints will be added in later Phase 4
-    work. This class owns the channel and keeps the generated coordinator stub
+    for datasets, shard leases, and checkpoints are implemented in shard_loader.py. This class owns the channel and keeps the generated coordinator stub
     available for low-level use.
     """
 

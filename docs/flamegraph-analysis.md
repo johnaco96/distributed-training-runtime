@@ -204,7 +204,7 @@ background, then only synchronise before the *next* checkpoint barrier.
 
 ---
 
-## Phase 12 — 500-Worker gRPC Scale Flamegraph (2026-05-24)
+## 500-Worker gRPC Scale Flamegraph (2026-05-24)
 
 **Binary**: `RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile perf`  
 **Profiler**: `perf record -g -F 997 --call-graph fp` (frame-pointer unwinding)  

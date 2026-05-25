@@ -1,4 +1,4 @@
-# Checkpoint cleanup (Phase 17D)
+# Checkpoint Cleanup
 
 Checkpoint cleanup is an explicit library helper in `runtime-checkpoint` for safely deleting old or partial checkpoint data.
 

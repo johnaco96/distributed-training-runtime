@@ -197,11 +197,11 @@ def run_demo(address: str) -> None:
         assert manifest.state == runtime_pb2.CHECKPOINT_STATE_COMMITTED
         assert len(manifest.artifacts) >= 2
         print(f"Restored latest checkpoint id: {manifest.checkpoint_id.value}")
-        print("Phase 10 local demo completed successfully")
+        print("Local demo completed successfully")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Phase 10 local end-to-end demo")
+    parser = argparse.ArgumentParser(description="Run local end-to-end demo")
     parser.add_argument("--addr", default="", help="Use an existing coordinator address instead of starting one")
     args = parser.parse_args()
 

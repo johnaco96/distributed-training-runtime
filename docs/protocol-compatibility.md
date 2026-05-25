@@ -1,4 +1,4 @@
-# Protocol compatibility notes (Phase 17E)
+# Protocol Compatibility Notes
 
 ## Current protocol status
 
@@ -52,7 +52,7 @@ Later hardening phases may add one or both of:
 - explicit protocol version fields in selected requests/responses, and/or
 - capability negotiation between client and coordinator.
 
-Those mechanisms are beyond the current Phase 17E informational metadata and are not yet enforced at runtime.
+Those mechanisms are beyond the current informational metadata and are not yet enforced at runtime.
 
 
 ## Related reliability notes
@@ -60,5 +60,3 @@ Those mechanisms are beyond the current Phase 17E informational metadata and are
 For retry safety and idempotent replay behavior at current protocol shape, see `docs/retry-idempotency.md`.
 For shard lease ownership/epoch semantics and stale-worker behavior, see `docs/leases.md`.
 
-
-- Checkpoint cleanup helpers in Phase 17D are library-level storage operations and do not change existing runtime.v1 RPC wire compatibility.

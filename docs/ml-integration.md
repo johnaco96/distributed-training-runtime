@@ -1,14 +1,14 @@
-# ML Integration (Phase 18)
+# ML Integration
 
 For end-to-end component and flow context, see [Architecture Overview](architecture.md).
 
 ## Goal
 
-Phase 18 introduces real ML-facing examples that can be connected to runtime checkpointing flows.
+This section describes the ML-facing examples that connect to runtime checkpointing and coordinator flows.
 
-## Phase 18A (complete)
+## Single-worker local PyTorch example
 
-Phase 18A added a minimal local PyTorch training example:
+A minimal local PyTorch training example is provided in `python/examples/pytorch_train.py`:
 
 - deterministic synthetic dataset (no downloads)
 - tiny CPU-friendly MLP model
@@ -16,11 +16,7 @@ Phase 18A added a minimal local PyTorch training example:
 - CLI tuning flags for local experimentation
 - `metrics.json` output for quick validation
 
-## Phase 18B (complete)
-
-Phase 18B extends the local PyTorch example with real local checkpoint state save/restore.
-
-### New CLI flags
+### CLI flags
 
 - `--checkpoint-every N` (default `1`): write a checkpoint every `N` epochs.
 - `--resume`: require a latest checkpoint and continue from `epoch + 1`.
@@ -96,10 +92,9 @@ Includes:
 - no cloud/object-storage requirement for this example
 - no GPU requirement
 
+## Simulated distributed-style training
 
-## Phase 18C (complete)
-
-Phase 18C adds `python/examples/pytorch_simulated_distributed.py`, a deterministic single-process simulation of distributed-style training concepts.
+`python/examples/pytorch_simulated_distributed.py` provides a deterministic single-process simulation of distributed-style training concepts.
 
 ### What it simulates
 
@@ -125,14 +120,6 @@ Under `--out-dir` (default `.dtruntime-pytorch-distributed`):
 - `metrics.json`
 - `shard_assignments.json`
 
-Checkpoint state includes:
-
-- global model state dict
-- epoch and global step
-- sanitized config snapshot
-- shard assignments and worker metrics
-- summary metric fields
-
 ### Resume behavior
 
 When `--resume` is set:
@@ -144,36 +131,11 @@ When `--resume` is set:
 
 If checkpoint metadata or referenced checkpoint file is missing, the script exits with a clear error.
 
+## Coordinator-driven PyTorch orchestration
 
-## Phase 18D (complete)
+`python/examples/pytorch_coordinator_train.py` is a local single-process PyTorch example that exercises coordinator control-plane calls during training: worker registration, heartbeat, dataset/shard registration, coordinator shard assignment requests, checkpoint artifact reporting/commit, and latest checkpoint lookup. This is intentionally not `torch.distributed` or multi-node training.
 
-Phase 18D finalizes documentation and validation workflow:
-
-- adds a dedicated runbook: `docs/ml-runbook.md`
-- consolidates smoke/resume/no-checkpoint commands for both examples
-- adds final validation checklist and cleanup guidance
-- clarifies explicit non-goals and current limitations
-
-## Phase 18 summary
-
-- **18A**: single-worker deterministic PyTorch training example with `metrics.json`.
-- **18B**: local checkpoint save/restore for model, optimizer, scheduler, plus `latest.json` pointer.
-- **18C**: single-process simulated distributed-style training with deterministic shard assignment and FedAvg-style parameter averaging.
-- **18D**: runbook + final validation cleanup/documentation pass.
-
-Single-worker and simulated-distributed examples are intentionally different: the former validates a local training/checkpoint loop, while the latter validates local simulation of worker/shard behavior and aggregation semantics in one process.
-
-Checkpoint state currently includes model state and progress/metrics metadata, and resume behavior starts from `restored_epoch + 1` using `checkpoints/latest.json` as the required pointer file.
-
-For command-level usage and cleanup steps, see `docs/ml-runbook.md`.
-
-
-## Phase 20B: Coordinator-driven PyTorch orchestration
-
-Added `python/examples/pytorch_coordinator_train.py`, a local single-process PyTorch example that exercises coordinator control-plane calls during training: worker registration, heartbeat, dataset/shard registration, coordinator shard assignment requests, checkpoint artifact reporting/commit, and latest checkpoint lookup. This is intentionally not `torch.distributed` or multi-node training.
-
-
-## Phase 20C: Local PyTorch orchestration benchmark
+## Local PyTorch orchestration benchmark
 
 Use `python/examples/benchmark_pytorch_orchestration.py` to compare local standalone training (`pytorch_train.py`) versus local coordinator-driven training (`pytorch_coordinator_train.py`). It records wall-clock timings, overhead (seconds and percent), final loss/accuracy, checkpoint/resume status, and coordinator RPC summary when available. Results are emitted as JSON and CSV for reproducibility and automation.
 
@@ -186,3 +148,5 @@ Smoke:
 `PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke`
 
 Caveats: this is local-only and environment-specific. Coordinator timings include coordinator startup in the current implementation (no warmed/external coordinator benchmark mode yet). These numbers do **not** prove distributed multi-node scaling, Kubernetes performance, or production throughput.
+
+For command-level usage and cleanup steps, see `docs/ml-runbook.md`.

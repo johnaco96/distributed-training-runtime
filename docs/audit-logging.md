@@ -1,6 +1,6 @@
-# Audit Logging (Phase 20F-4)
+# Audit Logging
 
-Phase 20F-4 adds structured coordinator audit/security events for startup, authn/authz decisions, and key state-changing RPCs.
+The coordinator emits structured audit events for startup, authn/authz decisions, and key state-changing RPCs.
 
 ## Implemented categories
 - Coordinator startup and security configuration mode events.
@@ -18,4 +18,4 @@ Audit fields may include logical identities (`subject`, `role`, `worker_id`) and
 
 This is application-level structured audit logging only, not full SIEM integration, durable retention, or dashboard analytics.
 
-Future work (20F-5+): durable export, security counters, dashboard views, SIEM pipelines, retention/compliance policy.
+Future work: durable export, security counters, dashboard views, SIEM pipelines, retention/compliance policy.

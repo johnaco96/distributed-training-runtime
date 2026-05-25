@@ -1,10 +1,8 @@
-# Architecture Overview (Phase 19B)
+# Architecture Overview
 
 This document describes how the Distributed Training Runtime is structured **today** and how the main components interact. It is intentionally honest about current MVP limits.
 
 For the current project boundary list and validation posture, see [Status and limitations](status-and-limitations.md).
-
-For planned sequencing and product evolution priorities, see [Product direction](product-direction.md).
 
 ## High-level system overview
 
@@ -13,12 +11,20 @@ Implemented today:
 - A Python SDK and examples call that control plane.
 - Storage backends persist checkpoint artifacts/metadata.
 - Dataset registration and shard assignment flows are available for local/runtime simulations.
+- Optional mTLS via coordinator TLS flags and cert-manager PKI in local-secure Kubernetes path.
+- Role-based authorization via metadata-based identity model.
+- Structured audit logging via `DbAuditSink`.
+- PostgreSQL HA via advisory lock for multi-replica coordinator deployments.
+- Local Kubernetes manifests in `k8s/local/` and secure manifests in `k8s/local-secure/`.
 
 Simulated today:
 - The PyTorch distributed-style flow is a **single-process simulation** with logical workers and FedAvg-style aggregation.
 
 Not implemented yet (future work):
-- Production scheduler integration, Kubernetes deployment/orchestration, Prometheus/Grafana exporter integration, and real `torch.distributed` execution.
+- Production scheduler integration.
+- Real `torch.distributed` execution.
+- Dashboard/admin UI.
+- Production HA with full failover test coverage.
 
 ## Main components
 
@@ -53,16 +59,23 @@ Local benchmark and scaling-smoke harness covering control-plane RPC patterns an
 ```mermaid
 flowchart LR
     subgraph PythonSide[Python Side]
-      SDK[Python SDK\n(dtruntime client)]
-      EX[Examples\nlocal_demo / pytorch_*]
+      SDK[Python SDK
+(dtruntime client)]
+      EX[Examples
+local_demo / pytorch_*]
     end
 
     subgraph RustSide[Rust Runtime]
-      COORD[Coordinator gRPC service\n(runtime-coordinator)]
-      DATASET[Dataset/Sharding\n(runtime-dataset)]
-      CKPT[Checkpoint runtime\n(runtime-checkpoint)]
-      META[Coordinator state + metadata\n(run/worker/checkpoint state)]
-      PROTO[Protocol contract\n(runtime-proto)]
+      COORD[Coordinator gRPC service
+(runtime-coordinator)]
+      DATASET[Dataset/Sharding
+(runtime-dataset)]
+      CKPT[Checkpoint runtime
+(runtime-checkpoint)]
+      META[Coordinator state + metadata
+(run/worker/checkpoint state)]
+      PROTO[Protocol contract
+(runtime-proto)]
     end
 
     subgraph Storage[Storage Backends]
@@ -70,7 +83,8 @@ flowchart LR
       S3[S3-compatible backend]
     end
 
-    BENCH[Benchmark harness\n(runtime-bench)]
+    BENCH[Benchmark harness
+(runtime-bench)]
 
     EX --> SDK
     SDK -->|gRPC (runtime.v1)| COORD
@@ -165,9 +179,12 @@ stateDiagram-v2
 flowchart TD
     SYN[Synthetic dataset generation]
     SH[Deterministic shard split]
-    W1[Logical worker 0\nlocal training step]
-    W2[Logical worker 1\nlocal training step]
-    AGG[FedAvg-style aggregation\n(single process)]
+    W1[Logical worker 0
+local training step]
+    W2[Logical worker 1
+local training step]
+    AGG[FedAvg-style aggregation
+(single process)]
     CK[Checkpoint save/restore]
 
     SYN --> SH
@@ -190,10 +207,10 @@ Implemented today:
 - In-process observability foundation: structured logs + runtime metrics counters/gauges.
 - `runtime-bench` benchmark harness for local control-plane and scaling smoke tests.
 - Worker RPC benchmark and scaling-workers benchmark variants (including simulated large logical worker counts).
+- Prometheus/Grafana stack in `observability/` directory.
 
 Not implemented yet:
-- Prometheus scrape/export endpoint.
-- Grafana dashboards/packaged observability stack.
+- Full distributed multi-node profiling.
 
 ## Current boundaries
 
@@ -201,20 +218,11 @@ This architecture currently targets local/MVP development workflows:
 - Local/MVP coordinator behavior is the primary scope.
 - PyTorch distributed-style example is simulated, not true distributed runtime execution.
 - No production scheduler integration.
-- No Kubernetes orchestration/deployment support.
-- No Prometheus/Grafana exporter yet.
 - No real `torch.distributed` integration yet.
 
-Use this document as the “today view” for Phase 19B; future phases should update it as real runtime capabilities expand.
-
-
-- Local Kubernetes manifests now exist for Phase 20E under `k8s/local/` (single coordinator Deployment + demo Job). This is packaging/orchestration scaffolding for local clusters, not production control-plane maturity.
-
-## Security architecture companion docs (Phase 20F-1)
+## Security architecture companion docs
 
 For the security target model and trust boundaries, see:
 - [Security architecture](security-architecture.md)
 - [Threat model](threat-model.md)
 - [Production readiness](production-readiness.md)
-
-Auth/dashboard/HA/production S3 hardening are intentionally tracked as future phases and are not complete in current runtime behavior.
