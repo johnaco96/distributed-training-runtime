@@ -148,6 +148,14 @@ def main() -> int:
     if _run_grpc_tools():
         _patch_grpc_import()
     else:
+        print(
+            "WARNING: grpcio-tools not installed — falling back to system protoc.\n"
+            "The system protoc may embed a NEWER gencode version than the protobuf\n"
+            "runtime pinned in pyproject.toml, which breaks import at runtime\n"
+            "(VersionError: runtime cannot be older than gencode).\n"
+            "Prefer: pip install -e .[dev]  (pins grpcio-tools) and re-run.",
+            file=sys.stderr,
+        )
         _run_system_protoc()
         _generate_minimal_grpc_client()
     return 0
