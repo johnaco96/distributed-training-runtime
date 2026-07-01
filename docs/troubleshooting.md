@@ -1,6 +1,6 @@
 # Troubleshooting Guide
 
-This guide captures the most common local-development issues seen during Phase 10–19 work.
+This guide captures the most common local-development issues encountered during development.
 
 ## A) Rust/build issues
 
@@ -161,17 +161,10 @@ Remove-Item -Recurse -Force .dtruntime-pytorch-dist-smoke -ErrorAction SilentlyC
 Remove-Item -Recurse -Force .dtruntime-pytorch-dist-no-checkpoint -ErrorAction SilentlyContinue
 ```
 
-## Security documentation boundary checks
+## I) Security configuration
 
-If reviewing Phase 20F-1 work, confirm that:
-- no real secrets/tokens were committed,
-- local placeholder values are clearly marked example-only,
-- docs do not claim production auth/dashboard/HA readiness.
-
-
-Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
-
-## Phase 20F-5 troubleshooting scope
-
-Troubleshooting guidance remains local/dev focused. Dashboard server issues, HA leader-election failover incidents, and production S3 IAM/lifecycle incidents are future operational tracks not yet implemented.
-
+When using optional TLS/mTLS or auth mode:
+- No real secrets/tokens should be committed.
+- Local placeholder values should be clearly marked example-only.
+- Use `--auth-mode metadata` only for local/dev testing; this is not production identity assurance.
+- Audit logs are implemented via `DbAuditSink` and include logical identity and run/checkpoint identifiers; protect logs accordingly.

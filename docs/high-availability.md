@@ -1,14 +1,12 @@
-# High Availability Plan (Phase 20F-5 Secure Design Track)
+# High Availability
 
 ## Current status
 
-- Coordinator deployment is currently single-replica.
-- Local Kubernetes Deployment uses `replicas: 1`.
-- No leader election is implemented.
-- No active/passive coordinator failover semantics are implemented.
-- No production HA claim is made.
+PostgreSQL-backed HA is implemented via advisory lock with support for 2-replica coordinator deployments. The coordinator uses a PostgreSQL advisory lock for leader election; replica coordinators wait for the lock before serving requests. This provides basic active/passive semantics with durable metadata.
 
-## Why replicas alone are unsafe
+For single-node and local/dev deployments, SQLite metadata persistence is also supported.
+
+## Why replicas alone are unsafe without semantic controls
 
 Running multiple coordinator replicas without semantic safety controls risks:
 
@@ -19,31 +17,26 @@ Running multiple coordinator replicas without semantic safety controls risks:
 - Latest-checkpoint pointer races.
 - Inconsistent metadata persistence and read/write ordering.
 
-## Required HA architecture
+The advisory lock approach avoids these risks by ensuring only one coordinator serves traffic at a time.
 
-Before HA replica count changes are allowed, the control plane needs:
+## Implemented HA controls
 
-- Durable external metadata store.
-- Leader election.
-- Fencing token / coordinator epoch.
-- Transactional checkpoint metadata updates.
-- Durable idempotency key store.
-- Safe lease/liveness reconciliation rules.
-- Safe recovery after leader restart.
-- Explicit failover test coverage.
+- PostgreSQL advisory lock for single-writer guarantee.
+- 2-replica coordinator support for failover.
+- Durable metadata in PostgreSQL for checkpoint and run state.
+- Two-phase commit (2PC) for checkpoint commits.
+- Shard progress persistence.
 
-## Proposed HA phases
+## Remaining work before production HA claims
 
-- **HA-1:** Durable metadata hardening and schema review.
-- **HA-2:** Leader election design.
-- **HA-3:** Active/passive coordinator with fencing.
-- **HA-4:** Failover simulation tests.
-- **HA-5:** Kubernetes HA manifests only after code semantics are safe.
-- **HA-6:** Operational runbook and rollback plan.
+- Full automated failover test coverage.
+- Kubernetes HA manifests with proper liveness/readiness probes for multi-replica.
+- Operational runbook and rollback plan.
+- Explicit fencing token / coordinator epoch (currently advisory lock provides this implicitly).
 
 ## Acceptance criteria
 
-HA is not considered ready until all are true:
+HA is not considered fully production-ready until all are true:
 
 - Checkpoint state cannot be double-committed during failover.
 - Worker lease state remains consistent during leader transitions.
@@ -63,8 +56,7 @@ HA is not considered ready until all are true:
 
 ## Explicit non-claims
 
-This phase does **not** implement:
-- Coordinator replication semantics.
-- Leader election runtime behavior.
-- Active/passive failover runtime behavior.
-- Production HA Kubernetes rollout.
+This does **not** yet implement:
+- Production HA Kubernetes rollout with full validation.
+- Full distributed failover test suite.
+- Automatic HA Kubernetes manifests.

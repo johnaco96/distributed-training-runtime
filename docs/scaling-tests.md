@@ -1,10 +1,10 @@
-# Scaling Tests Runbook (Phase 16C)
+# Scaling Tests Runbook
 
-This document is the Phase 16 runbook for `runtime-bench` scaling tests.
+This document is the runbook for `runtime-bench` scaling tests.
 
 ## Scope
 
-Phase 16 measures **local coordinator control-plane RPC behavior** as worker counts increase.
+These benchmarks measure **local coordinator control-plane RPC behavior** as worker counts increase.
 
 - Real local worker-count benchmarks: `1,2,4,8,16`
 - Simulated larger-count benchmarks: `32,64,128` (logical workers)
@@ -27,7 +27,7 @@ cargo run -p runtime-bench -- --help
 
 ## Local coordinator scaling benchmark (real local counts)
 
-Run the Phase 16 baseline worker counts:
+Run baseline worker counts:
 
 ```bash
 cargo run -p runtime-bench -- scaling-workers --workers-list 1,2,4,8,16 --heartbeats 2

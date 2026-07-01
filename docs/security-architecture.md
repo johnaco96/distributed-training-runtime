@@ -1,13 +1,14 @@
-# Security Architecture (Phase 20F-1)
+# Security Architecture
 
 ## 1) Current security status
 
-The project now has a local/dev Kubernetes deployment path (Phase 20E), but that path is intentionally non-production.
+The project provides a local/dev Kubernetes deployment path, but that path is intentionally non-production.
 
 Current state:
 - Local/dev Kubernetes manifests and runbook are available.
-- Coordinator RPC access does not yet enforce production authentication/authorization.
-- gRPC transport is plaintext in local/dev mode.
+- mTLS is implemented via optional `--tls-cert`/`--tls-key`/`--tls-client-ca` flags on the coordinator.
+- Role-based authorization is implemented via metadata-based identity (`--auth-mode metadata`).
+- Structured audit logging is implemented via the `DbAuditSink` and `audit_events` table.
 - Dashboard/admin UI is not implemented.
 - HA coordinator replication/failover is not implemented.
 - Production S3 hardening is not implemented.
@@ -52,32 +53,19 @@ Security posture principles for this repository:
 - Auditable decisions.
 - Reproducible deployment configuration.
 
-## 5) Phase breakdown (20F track)
+## 5) What is implemented
 
-- **20F-1:** Security architecture, threat model, and production-readiness documentation foundation (this phase).
-- **20F-2:** Optional TLS/mTLS foundation for coordinator gRPC and Python client.
-- **20F-3:** Workload identity and authorization model.
-- **20F-4:** Audit logging and security event model.
-- **20F-5:** Secure dashboard, HA, and production S3 hardening tracks.
+The following security controls are implemented:
 
-## 6) Non-claims for Phase 20F-1
+- **mTLS**: Optional transport security for coordinator gRPC and Python RuntimeClient via `--tls-cert`, `--tls-key`, and `--tls-client-ca` flags. Coordinator TLS is provisioned via cert-manager PKI in secure local Kubernetes paths. No certificates are committed to the repository.
+- **Role-based authorization**: Metadata-based caller identity for local/dev testing via `--auth-mode metadata`. Python client attaches `x-dtruntime-subject`, `x-dtruntime-role`, and `x-dtruntime-worker-id` headers. Coordinator enforces admin-only and worker-scoped endpoint policies.
+- **Structured audit logging**: The coordinator emits structured audit events via `DbAuditSink` to the `audit_events` table, covering startup, authn/authz decisions, and key state-changing RPCs.
 
-This phase does **not** claim:
-- mTLS already implemented.
-- OIDC already implemented.
+## 6) Non-claims
+
+This repository does **not** yet claim:
+- OIDC/SPIFFE/SPIRE identity integration.
 - Dashboard implementation.
 - HA replication/failover implementation.
 - Production S3 hardening complete.
-\n\n## Phase 20F-2 TLS/mTLS foundation\nPhase 20F-2 adds optional transport security for coordinator gRPC and Python RuntimeClient. Plaintext remains the default local/dev behavior when TLS options are omitted.\n\nCoordinator TLS options:\n- --tls-cert /path/to/server.crt\n- --tls-key /path/to/server.key\n- --tls-client-ca /path/to/ca.crt (optional; enables client cert verification/mTLS)\n\nExample server commands:\n- runtime-coordinator --addr 0.0.0.0:50051 --tls-cert /path/to/server.crt --tls-key /path/to/server.key\n- runtime-coordinator --addr 0.0.0.0:50051 --tls-cert /path/to/server.crt --tls-key /path/to/server.key --tls-client-ca /path/to/ca.crt\n\nPython RuntimeClient supports TLS args and env vars: tls_ca_cert, tls_client_cert, tls_client_key and DTRUNTIME_TLS_CA_CERT, DTRUNTIME_TLS_CLIENT_CERT, DTRUNTIME_TLS_CLIENT_KEY.\n\nNo certificates/keys are committed in-repo; use placeholders such as k8s/local/tls-secret.example.yaml.\nNo workload authorization policy is implemented in 20F-2; that is planned for Phase 20F-3.\nNo production PKI issuance/rotation is implemented in 20F-2.\n
-
-
-## Phase 20F-3 authorization scaffolding
-Phase 20F-3 adds an internal authorization model with optional metadata-based caller identity for local/dev testing. Default mode remains disabled for compatibility. Enable with `runtime-coordinator --addr 0.0.0.0:50051 --auth-mode metadata` or `DTRUNTIME_AUTH_MODE=metadata`. Python client can attach `x-dtruntime-subject`, `x-dtruntime-role`, and optional `x-dtruntime-worker-id` via constructor args or env (`DTRUNTIME_AUTH_SUBJECT`, `DTRUNTIME_AUTH_ROLE`, `DTRUNTIME_AUTH_WORKER_ID`). This is policy scaffolding only (not full SPIFFE/SPIRE or production RBAC). Audit/security events remain planned for Phase 20F-4; dashboard/HA/production S3 hardening remain Phase 20F-5.
-
-
-Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
-
-## Phase 20F-5 update
-
-Phase 20F-5 completes secure design tracks for dashboard, HA, and production S3. This advances readiness planning but does not implement those production systems yet. See [phase-20f-summary.md](phase-20f-summary.md) and [production-gates.md](production-gates.md).
-
+- Full SIEM/durable audit pipeline.

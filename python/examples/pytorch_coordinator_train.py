@@ -770,9 +770,8 @@ def run_single_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
         run_id = run_resp.run_id.value
         print(f"[rank {rank}] run_id={run_id}")
 
-        # Register this worker early — before waiting for the dataset — so that
-        # wait_for_dataset can probe with a real registered worker_id instead of
-        # a fake "probe" id that the coordinator would reject.
+        # Register this worker before dataset registration so shard assignment
+        # is available as soon as the dataset exists.
         registered = client.register_worker(
             run_id=run_id,
             worker_id=worker_id,
@@ -818,9 +817,22 @@ def run_single_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
             )
             print(f"[rank 0] dataset registered ({len(shard_metadata)} shards)")
         else:
-            print(f"[rank {rank}] waiting for dataset to be registered by rank 0 …")
-            wait_for_dataset(client, run_id, dataset_id, worker_id=actual_worker_id)
-            print(f"[rank {rank}] dataset is available")
+            # Shards are pre-created on the shared volume (by shard-prep-job or
+            # rank 0).  Re-registering with the same idempotency key is a
+            # coordinator no-op if rank 0 already registered the dataset — no
+            # polling probe needed (fixes the k8s worker-job dataset race).
+            shard_metadata = shard_metadata_from_existing(shard_dir)
+            client.register_dataset(
+                run_id=run_id,
+                name="training-shards",
+                uri=str(shard_dir.resolve()),
+                format="npz",
+                shards=shard_metadata,
+                dataset_id=dataset_id,
+                dataset_version="v1",
+                idempotency_key=f"pt-dataset-{idempotency_suffix}",
+            )
+            print(f"[rank {rank}] dataset available")
 
         # Resume from checkpoint if requested (rank 0 saves, all ranks load)
         if args.resume and latest_local.exists():

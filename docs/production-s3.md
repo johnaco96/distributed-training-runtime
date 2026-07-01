@@ -1,11 +1,12 @@
-# Production S3 Plan (Phase 20F-5 Secure Design Track)
+# Production S3
 
 ## Current status
 
 - Local filesystem and S3-compatible storage abstraction paths exist.
 - MinIO/S3-compatible flows exist for local/dev and test-oriented paths.
+- S3 write-through backend is implemented for checkpoint artifacts.
 - Checkpoint commit path includes checksum-oriented validation.
-- Production S3 hardening is not complete.
+- Full production S3 hardening is not complete.
 
 ## Target production S3 model
 
@@ -64,11 +65,10 @@ Production S3 path is not ready until:
 
 ## Explicit non-claims
 
-This phase does **not** implement:
+This does **not** implement:
 - Production cloud-provider S3 deployment.
 - Automatic IAM provisioning.
 - Full production S3 tuning in runtime code.
-
 
 ## Local/dev MinIO validation environment variables
 
@@ -82,4 +82,3 @@ This phase does **not** implement:
 - `DTRUNTIME_S3_KEY_PREFIX` optional test key prefix root.
 
 These are local/dev validation inputs only and must not be committed.
-\n- Phase 20 update: benchmark expansion and MinIO/S3 validation are environment-gated; no production-readiness claim.

@@ -1,9 +1,10 @@
-# Phase 11 Metadata Persistence (MVP)
+# Metadata Persistence
 
 The coordinator supports optional SQLite-backed metadata persistence via `--metadata-db <path>`.
 
 ## Selected backend
-- SQLite is the Phase 11 metadata backend.
+- SQLite is the default metadata backend for single-node persistence.
+- PostgreSQL is supported for multi-replica HA deployments via advisory lock leader election.
 
 ## Persisted metadata
 - runs
@@ -30,10 +31,6 @@ If `--metadata-db` is omitted, coordinator stays in-memory only.
 - Checkpoint artifact bytes are not stored in SQLite (metadata only).
 - SQLite stores coordinator metadata only.
 - Worker liveness remains runtime state and is recalculated/refreshed after restart.
-- This is not coordinator replication or HA.
-- This is not S3/MinIO object storage.
-- Phase 12 covers object storage and is out of scope for this task.
-
 
 ## Coordinator CLI help
 

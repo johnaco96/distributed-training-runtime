@@ -1,7 +1,6 @@
-# Phase 12 Object Storage (12A + 12B)
+# Object Storage
 
-Phase 12A added an **S3-compatible storage backend foundation** in `runtime-storage`.
-Phase 12B wires that backend into **checkpoint store write/restore tests** and adds an **env-gated MinIO validation path**.
+An **S3-compatible storage backend** is provided in `runtime-storage` and wired into **checkpoint store write/restore tests** with an **env-gated MinIO validation path**.
 
 ## Purpose
 
@@ -38,10 +37,7 @@ Environment variables (recommended):
 Bash:
 
 ```bash
-docker run -p 9000:9000 -p 9001:9001 \
-  -e MINIO_ROOT_USER=minioadmin \
-  -e MINIO_ROOT_PASSWORD=minioadmin \
-  quay.io/minio/minio server /data --console-address ":9001"
+docker run -p 9000:9000 -p 9001:9001   -e MINIO_ROOT_USER=minioadmin   -e MINIO_ROOT_PASSWORD=minioadmin   quay.io/minio/minio server /data --console-address ":9001"
 ```
 
 PowerShell:
@@ -55,7 +51,7 @@ docker run -p 9000:9000 -p 9001:9001 `
 
 Create bucket: `dtruntime-checkpoints`.
 
-## Running env-gated MinIO tests (Phase 12B)
+## Running env-gated MinIO tests
 
 MinIO tests are local integration tests and should run only when explicitly enabled, for example with:
 
@@ -83,11 +79,11 @@ Manual bucket creation flow (if bucket is not already present):
 - Log in with `minioadmin / minioadmin`
 - Create bucket `dtruntime-checkpoints`
 
-Real AWS S3 validation is **not required** for Phase 12B.
+Real AWS S3 validation is **not required** for local development.
 
-## Phase 13A reliability guardrails foundation
+## Reliability guardrails
 
-Phase 13A/13D provide a reusable `StorageOperationPolicy` in `runtime-storage` for async-capable storage operations. In `S3Storage`, timeout/retry/backpressure now cover `put`, `get`, `exists` (head), `delete`, and `list_prefix`.
+A reusable `StorageOperationPolicy` in `runtime-storage` provides async-capable storage operation safety for `S3Storage`. Timeout/retry/backpressure cover `put`, `get`, `exists` (head), `delete`, and `list_prefix`.
 
 Default policy values:
 
@@ -97,7 +93,7 @@ Default policy values:
 - `retry_max_backoff`: 2 seconds
 - `max_concurrent_operations`: 16
 
-This adds timeout/retry/backpressure primitives:
+Primitives provided:
 
 - timeout guardrail using `tokio::time::timeout` for async storage calls,
 - retry helper with capped exponential backoff for retryable storage failures,
@@ -105,32 +101,28 @@ This adds timeout/retry/backpressure primitives:
 
 Scope note:
 
-- This is a **foundation** for Phase 13. It does **not** claim full concurrent checkpoint upload completion, dataset prefetching completion, benchmark harness completion, or production S3 tuning completion.
-- MinIO/AWS paths can use these same policies in later Phase 13 work.
+- MinIO/AWS paths can use the same policies.
 - Normal unit/integration tests remain MinIO-optional and do not require AWS credentials.
 
+## Extended S3 operation coverage
 
+Policy coverage applies to additional S3 operations:
 
-## Phase 13D scope update
+- Timeout/retry/backpressure apply to `S3Storage::put`, `get`, `exists`, `delete`, and `list_prefix`.
+- `runtime-storage` includes small backend-neutral batch helpers: `put_many`, `get_many`, and `exists_many`, each with bounded concurrency via `StorageOperationPolicy.max_concurrent_operations` and per-item result reporting.
+- Multipart upload, coordinator gRPC artifact-byte streaming, and production S3 tuning remain future work.
 
-Phase 13D extends policy coverage to additional S3 operations without a full async rewrite:
+## Concurrent checkpoint artifact helper
 
-- Timeout/retry/backpressure currently apply to `S3Storage::put`, `get`, `exists`, `delete`, and `list_prefix`.
-- `runtime-storage` now includes small backend-neutral batch helpers: `put_many`, `get_many`, and `exists_many`, each with bounded concurrency via `StorageOperationPolicy.max_concurrent_operations` and per-item result reporting.
-- This remains foundation-level work: multipart upload, coordinator gRPC artifact-byte streaming, production S3 tuning, and benchmark harness work are still future phases.
-
-## Phase 13B concurrent checkpoint artifact helper
-
-`runtime-checkpoint` now provides a bounded concurrent upload helper that uses `StorageBackend`, so it works with both `LocalStorage` and `S3Storage`. Concurrency is bounded via `StorageOperationPolicy.max_concurrent_operations`. This helper uploads artifact bytes and returns artifact metadata including checksum/size, but it is not multipart upload and does not stream artifact bytes through coordinator gRPC.
+`runtime-checkpoint` provides a bounded concurrent upload helper that uses `StorageBackend`, so it works with both `LocalStorage` and `S3Storage`. Concurrency is bounded via `StorageOperationPolicy.max_concurrent_operations`. This helper uploads artifact bytes and returns artifact metadata including checksum/size, but it is not multipart upload and does not stream artifact bytes through coordinator gRPC.
 
 ## Limitations
 
-- Phase 12A provides storage backend primitives and key mapping.
-- Phase 12B wires S3-compatible storage into checkpoint storage tests and adds local env-gated MinIO validation.
+- Storage backend provides primitives and key mapping.
 - Coordinator checkpoint RPCs may still report artifact metadata rather than uploading artifact bytes through coordinator RPCs.
-- Real AWS cloud validation, production readiness, HA, and hardening are out of scope.
+- Real AWS cloud validation, production readiness, HA, and hardening are out of scope for local development.
 
-## Artifact integrity validation (Phase 12.5A)
+## Artifact integrity validation
 
 - Artifact integrity validation is backend-neutral and uses the shared `StorageBackend` interface.
 - `LocalStorage` and `S3Storage` both expose stored artifact bytes via `StorageBackend::get`.
@@ -139,14 +131,13 @@ Phase 13D extends policy coverage to additional S3 operations without a full asy
   - expected byte length,
   - supported checksum algorithm,
   - expected checksum digest.
-- Phase 12.5A adds reusable helpers for this validation layer.
-- Phase 12.5B now enforces commit-time integrity validation before manifest/marker/latest writes.
+- Commit-time integrity validation is enforced before manifest/marker/latest writes.
 
-## How Phase 12.5 uses object storage
+## How the backends are used
 
 - `S3Storage` and `LocalStorage` are backend implementations of the same storage abstraction.
-- Phase 12.5 will use these backends for **real worker artifact-byte uploads**, not only metadata reporting.
-- The object key layout remains:
+- Real worker artifact-byte uploads go through these backends, not only metadata reporting.
+- The object key layout is:
 
 ```text
 runs/{run_id}/checkpoints/{checkpoint_id}/manifest.pending.json
@@ -156,9 +147,9 @@ runs/{run_id}/checkpoints/{checkpoint_id}/COMMITTED
 runs/{run_id}/LATEST
 ```
 
-## Phase 13C: Dataset prefetching prototype
+## Dataset prefetching
 
-`runtime-dataset` now includes a bounded prefetch helper for dataset shard objects that reads through the existing `StorageBackend` abstraction. It is intentionally small and backend-neutral, so it works with local storage, memory-backed test storage, and S3-backed storage implementations without introducing a separate cache layer.
+`runtime-dataset` includes a bounded prefetch helper for dataset shard objects that reads through the existing `StorageBackend` abstraction. It is backend-neutral, so it works with local storage, memory-backed test storage, and S3-backed storage implementations.
 
 Highlights:
 - Accepts `DatasetPrefetchItem` inputs containing shard id, storage key, and optional expected size and checksum metadata.
@@ -167,4 +158,3 @@ Highlights:
 - Validates expected size and checksum when provided.
 
 Scope note: this is a prototype for worker-side loading workflows. It is **not** a production dataset cache, does **not** implement cache-aware placement, and does **not** include distributed prefetch scheduling.
-

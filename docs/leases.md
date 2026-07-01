@@ -1,4 +1,4 @@
-# Lease Semantics (Phase 17C)
+# Lease Semantics
 
 ## Ownership model
 

@@ -1,8 +1,8 @@
-# Phase 10 Local End-to-End Demo
+# Local End-to-End Demo
 
 ## Purpose
 
-This demo exercises Phase 10 end-to-end behavior with the **real Rust coordinator** and the **Python SDK/gRPC client path** in one local run.
+This demo exercises end-to-end behavior with the **real Rust coordinator** and the **Python SDK/gRPC client path** in one local run.
 
 It demonstrates:
 
@@ -64,7 +64,7 @@ $env:PYTHONPATH="python"
 python -m pytest python/tests/test_local_integration.py -v
 ```
 
-## Run the Phase 10 demo
+## Run the demo
 
 ```powershell
 $env:PYTHONPATH="python"
@@ -105,7 +105,7 @@ Simulating worker-1 stop (heartbeats paused briefly).
 Not waiting for production stale/failure timeout windows in this demo.
 worker-1 has rejoined/reactivated.
 Restored latest checkpoint id: checkpoint-demo-1
-Phase 10 local demo completed successfully
+Local demo completed successfully
 ```
 
 IDs and ports vary by run.
@@ -127,15 +127,12 @@ IDs and ports vary by run.
 - checkpoint artifact bytes are written locally by the demo script to `.dtruntime-demo/checkpoints/...` and reported by URI.
 - worker death/restart is simulated by pausing and then re-registering/heartbeating `worker-1`.
 
-## Current MVP limitations
+## Current limitations
 
-
-> Note: this Phase 10 local demo uses the normal in-memory coordinator path unless you explicitly run coordinator with `--metadata-db <path>`. The Phase 11 metadata DB mode is primarily for restart/recovery validation.
+> Note: this local demo uses the normal in-memory coordinator path unless you explicitly run coordinator with `--metadata-db <path>`. The metadata DB mode is primarily for restart/recovery validation.
 
 - checkpoint artifact bytes are written locally by the Python demo, not uploaded through a coordinator data plane.
 - coordinator can persist metadata when started with `--metadata-db <path>`; without it, metadata is in-memory only.
-- S3-compatible object storage backend foundation is added in Phase 12, and
-  Phase 12.5 is the next roadmap milestone to wire real artifact-byte uploads/validation across LocalStorage and S3/MinIO backends before Phase 13 performance work.
+- An S3-compatible object storage backend is also available via the `--features s3` build flag.
 - worker death is simulated at demo level.
 - deterministic stale/failed transitions are covered by Rust tests.
-- coordinator process restart recovery belongs to Phase 11, not Phase 10.

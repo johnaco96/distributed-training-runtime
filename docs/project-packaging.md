@@ -1,4 +1,4 @@
-# Project Packaging Guide (Phase 20D)
+# Project Packaging Guide
 
 ## Project identity / positioning
 
@@ -19,6 +19,9 @@ Distributed Training Runtime is packaged as a **local-first ML runtime control-p
 - Checkpoint metadata + artifact lifecycle experiments
 - Local recovery/resume-oriented ML example paths
 - Local benchmark comparison of standalone vs coordinator-driven training
+- Optional mTLS and role-based authorization
+- Structured audit logging
+- PostgreSQL HA via advisory lock
 
 ## Claims to avoid
 
@@ -36,7 +39,7 @@ Do **not** claim:
 2. Show coordinator-driven PyTorch training flow.
 3. Show checkpoint/resume artifacts and metrics.
 4. Show benchmark overhead summary report (JSON/CSV).
-5. Explain future Phase 20E/20F path (Kubernetes/auth/HA) without claiming delivery now.
+5. Show optional TLS/mTLS and auth mode with local-secure Kubernetes path.
 
 ## Suggested repository tour
 
@@ -61,26 +64,22 @@ Only include badges/placeholders that are already backed by real automation/stat
 - benchmark results labeled local/environment-specific
 - limitations prominently visible and conservative
 
+## Local Kubernetes packaging
 
-## Phase 20E extension: local Kubernetes packaging
-
-Phase 20E adds a local/dev-first deployment path:
+A local/dev-first deployment path is available:
 - Build image from `Dockerfile`.
 - Apply manifests from `k8s/local/`.
 - Run the `pytorch-coordinator-demo` Job against the in-cluster coordinator Service.
 
+For secure local Kubernetes with TLS/mTLS, use `k8s/local-secure/`.
+
 This extends packaging demonstration coverage without claiming production orchestration maturity.
 
-## Phase 20F-1 packaging/security posture notes
+## Security/readiness packaging note
 
 For reviewer-facing clarity, include links to the security foundation docs and avoid production-security claims:
 - [Security architecture](security-architecture.md)
 - [Threat model](threat-model.md)
 - [Production readiness](production-readiness.md)
 
-Do not claim full auth/dashboard/HA/production S3 readiness. 20F-2 is the next implementation step for TLS/mTLS.
-
-## Security/readiness packaging note
-
-Packaging outputs remain local/dev oriented. Phase 20F-5 adds secure design tracks and production gates documentation; it does not add production dashboard, HA replicas, or production S3 rollout manifests.
-
+Do not claim full auth/dashboard/HA/production S3 readiness. Packaging outputs remain local/dev oriented.

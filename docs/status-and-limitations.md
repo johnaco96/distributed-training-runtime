@@ -1,29 +1,29 @@
-# Status and Limitations (Phase 20E)
+# Status and Limitations
 
 ## Completion status
 
-- Phase **20D** (project packaging/documentation polish) is complete.
-- Phase **20E** (local/dev Kubernetes deployment path) is complete.
-- Demo/release checklist: [`docs/demo-checklist.md`](demo-checklist.md).
-- Packaging/positioning guide: [`docs/project-packaging.md`](project-packaging.md).
-
-- Phases **10 through 18** are complete and locally validated.
-- Phase **19A** (README + quickstart), **19B** (architecture diagrams/overview), and **19C** (runbooks/examples indexing) are complete.
-- Phase **19D** completes documentation polish by adding troubleshooting guidance plus this final status/limitations pass.
-
-## Current capabilities
-
-Implemented capabilities today include:
+The following capabilities are implemented and locally validated:
 
 - Rust coordinator gRPC control plane.
 - Python SDK for coordinator interactions.
 - Dataset registration and deterministic shard assignment flows.
 - Checkpoint lifecycle support including integrity-oriented commit validation and cleanup helper paths.
+- Two-phase commit (2PC) for checkpoint commits.
 - Storage abstraction with local filesystem support and optional S3/MinIO-compatible backend paths.
+- S3 write-through backend for checkpoint artifacts.
+- Shard progress persistence.
 - Benchmark harness for local RPC and scaling-style smoke runs.
-- Observability foundation (structured logs + in-process metrics).
+- Observability foundation (structured logs + in-process metrics + Prometheus/Grafana).
 - PyTorch single-worker example.
 - PyTorch simulated distributed-style example.
+- Coordinator-driven PyTorch orchestration example.
+- Optional mTLS via `--tls-cert`/`--tls-key`/`--tls-client-ca` with cert-manager PKI.
+- Role-based authorization via `--auth-mode metadata`.
+- Structured audit logging via `DbAuditSink` and `audit_events` table.
+- PostgreSQL HA via advisory lock (2-replica coordinator support).
+- SQLite and PostgreSQL metadata persistence backends.
+- Local Kubernetes manifests (`k8s/local/`) and secure local Kubernetes path (`k8s/local-secure/`).
+- Health endpoints: `/healthz` (liveness) and `/readyz` (readiness).
 
 ## Current limitations and non-goals
 
@@ -31,18 +31,17 @@ This project currently does **not** claim:
 
 - Production scheduler integration.
 - Production Kubernetes deployment/orchestration support (beyond local/dev manifests).
-- Prometheus/Grafana exporter integration.
 - Real `torch.distributed` execution.
 - Real multi-node ML orchestration.
 - Production-ready cloud deployment posture.
-- Proven production fault tolerance.
+- Proven production fault tolerance at scale.
 - Large-scale benchmark claims without measured evidence.
+- Dashboard/admin UI.
+- Full SIEM/durable audit pipeline.
+- Complete production S3 hardening.
+- OIDC/SPIFFE/SPIRE identity integration.
 
 Important boundary: local simulated worker scaling is useful for smoke/perf exploration, but it is **not** proof of real cluster scale.
-
-## Phase 20+ direction
-
-Phase 20 roadmap and sequencing are documented in [Product direction](product-direction.md). This document remains the conservative source for current capabilities and limitations until those future phases are implemented and validated.
 
 ## Validation status
 
@@ -63,85 +62,11 @@ Optional or environment-gated validation surfaces:
 
 Before external demo/release checkpoints, re-run the full local validation set in a clean environment and include any optional paths relevant to your deployment goals.
 
-## Suggested next phase boundary
+## Security references
 
-Phase 19 ends with docs polish and conservative status framing.
-
-**Phase 20 should be selected explicitly after this point.** It is intentionally not started in Phase 19D.
-
-
-Local Kubernetes deployment manifests exist in `k8s/local/` and are documented in `docs/kubernetes-local.md`. This is intentionally not a production Kubernetes platform.
-
-## Phase 20F-1 status update
-
-- Phase **20F-1** documentation foundation is complete.
-- Phase **20F-2** through **20F-5** remain pending.
-
-Security-related references:
 - [Security architecture](security-architecture.md)
 - [Threat model](threat-model.md)
 - [Production readiness](production-readiness.md)
 - [Security auth plan](security-auth.md)
-- [High availability plan](high-availability.md)
-- [Dashboard plan](dashboard-plan.md)
-- [Production S3 plan](production-s3.md)
-
-Local Kubernetes remains local/dev only and is not a production security posture.
-\n\n## Phase 20F-2 TLS/mTLS foundation\nPhase 20F-2 adds optional transport security for coordinator gRPC and Python RuntimeClient. Plaintext remains the default local/dev behavior when TLS options are omitted.\n\nCoordinator TLS options:\n- --tls-cert /path/to/server.crt\n- --tls-key /path/to/server.key\n- --tls-client-ca /path/to/ca.crt (optional; enables client cert verification/mTLS)\n\nExample server commands:\n- runtime-coordinator --addr 0.0.0.0:50051 --tls-cert /path/to/server.crt --tls-key /path/to/server.key\n- runtime-coordinator --addr 0.0.0.0:50051 --tls-cert /path/to/server.crt --tls-key /path/to/server.key --tls-client-ca /path/to/ca.crt\n\nPython RuntimeClient supports TLS args and env vars: tls_ca_cert, tls_client_cert, tls_client_key and DTRUNTIME_TLS_CA_CERT, DTRUNTIME_TLS_CLIENT_CERT, DTRUNTIME_TLS_CLIENT_KEY.\n\nNo certificates/keys are committed in-repo; use placeholders such as k8s/local/tls-secret.example.yaml.\nNo workload authorization policy is implemented in 20F-2; that is planned for Phase 20F-3.\nNo production PKI issuance/rotation is implemented in 20F-2.\n
-
-
-## Phase 20F-3 authorization scaffolding
-Phase 20F-3 adds an internal authorization model with optional metadata-based caller identity for local/dev testing. Default mode remains disabled for compatibility. Enable with `runtime-coordinator --addr 0.0.0.0:50051 --auth-mode metadata` or `DTRUNTIME_AUTH_MODE=metadata`. Python client can attach `x-dtruntime-subject`, `x-dtruntime-role`, and optional `x-dtruntime-worker-id` via constructor args or env (`DTRUNTIME_AUTH_SUBJECT`, `DTRUNTIME_AUTH_ROLE`, `DTRUNTIME_AUTH_WORKER_ID`). This is policy scaffolding only (not full SPIFFE/SPIRE or production RBAC). Audit/security events remain planned for Phase 20F-4; dashboard/HA/production S3 hardening remain Phase 20F-5.
-
-
-Phase 20F-4 adds structured audit/security events; dashboard/SIEM/durable audit storage remain future work (20F-5+). Audit logs may include logical identity and run/checkpoint identifiers and should be protected.
-
-## Phase 20F-5 status
-
-- Secure foundation exists (TLS/authz scaffolding + audit foundation + design tracks).
-- Dashboard is planned, not implemented.
-- HA coordinator replication is planned, not implemented.
-- Production S3 hardening is planned, not implemented.
-- Local Kubernetes remains local/dev only.
-
-References: [Phase 20F summary](phase-20f-summary.md), [production gates](production-gates.md).
-
-
-
-## Phase 20F-3 authorization matrix coverage update
-Service-level metadata authorization tests now cover coordinator RPC groups across admin-only and worker-scoped endpoints (including worker self-mismatch denial and missing/invalid identity rejection). This remains local/dev metadata identity scaffolding and is not production identity assurance. Production mTLS/SPIFFE identity extraction and policy integration remain future work.
-
-
-## Phase 20 hardening update (in progress)
-
-- Added stricter env-gated MinIO/S3 integration-test behavior with explicit skip messaging.
-- Expanded benchmark/runbook documentation labels and caveats for local/dev versus secure/minio optional surfaces.
-- Secure Kubernetes runbook depth expanded for local certificate/secret creation flow.
-- Production readiness is still not claimed; remaining gaps are tracked in status/production docs.
-\n- Phase 20 update: benchmark expansion and MinIO/S3 validation are environment-gated; no production-readiness claim.
-
-
-## Phase 20 benchmark surface expansion
-Added runtime-bench subcommands: `dataset-prefetch`, `cache-aware-placement`, `auth-audit-overhead`, and `status-snapshot`. Outputs now include `environment`, `surface`, `mode`, `caveats`, `timestamp_utc`, duration/latency fields, plus JSON/CSV outputs. MinIO-gated paths remain optional and must be enabled via `DTRUNTIME_RUN_MINIO_TESTS=1`; otherwise they should skip cleanly with caveats.
-
-
-Observability update: Step 1 Prometheus/Grafana is implemented. See `docs/observability.md`, `observability/prometheus/prometheus.yml`, and `observability/grafana/dtruntime-dashboard.json`.
-
-## Step 2 update (health probes)
-
-Coordinator health endpoints and Kubernetes startup/readiness/liveness probes are now implemented for local manifests. This improves pod lifecycle safety, but does not by itself claim full production readiness.
-
-
-### Benchmark claim boundaries
-
-Linux scaling/checkpoint outputs support host-scoped evidence for coordinator latency/throughput and checkpoint stall behavior.
-They do not imply hyperscale or vendor-infrastructure superiority claims.
-
-
-### High-scale logical-worker benchmarking
-The runtime now includes a `runtime-bench logical-workers` mode that emulates hundreds to thousands of logical workers from one or more benchmark processes while issuing real coordinator gRPC control-plane RPCs (register worker, shard assignment, heartbeat, checkpoint metadata lifecycle, and restore-latest checks). This is the recommended way to benchmark control-plane scalability to 100/250/500/1000/2000+ workers without requiring thousands of physical GPUs or pods.
-
-Use:
-`cargo run -p runtime-bench -- logical-workers --workers 1000 --duration-secs 60 --concurrency 128 --heartbeat-interval-ms 1000 --shards 10000 --checkpoint-every-secs 30 --checkpoint-artifacts-per-checkpoint 4 --checkpoint-bytes 67108864 --out-json logical-workers.json --out-csv logical-workers.csv`
-
-Interpretation guidance: use p50/p95/p99 latencies together with coordinator CPU/RSS and disk/network metrics from Linux profiling outputs. Claims about cluster-scale behavior must be based on measured runs and reported caveats; unavailable metrics are recorded as unavailable/null rather than zero.
+- [High availability](high-availability.md)
+- [Production S3](production-s3.md)
