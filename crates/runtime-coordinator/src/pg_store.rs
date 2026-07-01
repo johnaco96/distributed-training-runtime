@@ -266,10 +266,7 @@ ON CONFLICT (run_id, worker_id) DO UPDATE SET
         })
     }
 
-    fn load_workers_for_run(
-        &self,
-        run_id: &str,
-    ) -> PersistResult<Vec<(String, u32, u32, i32)>> {
+    fn load_workers_for_run(&self, run_id: &str) -> PersistResult<Vec<(String, u32, u32, i32)>> {
         self.block(async {
             let rows: Vec<(String, i32, i32, i32)> = sqlx::query_as(
                 "SELECT worker_id, rank, world_size, status FROM workers WHERE run_id = $1 ORDER BY worker_id",
@@ -546,14 +543,13 @@ ON CONFLICT (run_id) DO UPDATE SET
         dataset_id: &str,
     ) -> PersistResult<Option<(String, Vec<ShardRecord>)>> {
         self.block(async {
-            let name: Option<(String,)> = sqlx::query_as(
-                "SELECT name FROM datasets WHERE run_id = $1 AND dataset_id = $2",
-            )
-            .bind(run_id)
-            .bind(dataset_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let name: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM datasets WHERE run_id = $1 AND dataset_id = $2")
+                    .bind(run_id)
+                    .bind(dataset_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
             let Some((name,)) = name else {
                 return Ok(None);
@@ -620,30 +616,34 @@ ON CONFLICT (run_id, dataset_id, shard_id) DO UPDATE SET
     }
 
     fn load_all_shard_progress(&self) -> PersistResult<Vec<ShardProgressEntry>> {
+        // (run_id, dataset_id, shard_id, worker_id, lease_epoch,
+        //  progress_offset, is_complete, updated_at_millis)
+        type ShardProgressRow = (String, String, String, String, i64, i64, bool, i64);
         self.block(async {
-            let rows: Vec<(String, String, String, String, i64, i64, bool, i64)> =
-                sqlx::query_as(
-                    "SELECT run_id, dataset_id, shard_id, worker_id, lease_epoch, \
+            let rows: Vec<ShardProgressRow> = sqlx::query_as(
+                "SELECT run_id, dataset_id, shard_id, worker_id, lease_epoch, \
                      progress_offset, is_complete, updated_at_millis FROM shard_progress",
-                )
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
             Ok(rows
                 .into_iter()
-                .map(|(run_id, dataset_id, shard_id, worker_id, le, po, ic, ua)| {
-                    ShardProgressEntry {
-                        run_id,
-                        dataset_id,
-                        shard_id,
-                        worker_id,
-                        lease_epoch: le as u64,
-                        progress_offset: po,
-                        is_complete: ic,
-                        updated_at_millis: ua as u64,
-                    }
-                })
+                .map(
+                    |(run_id, dataset_id, shard_id, worker_id, le, po, ic, ua)| {
+                        ShardProgressEntry {
+                            run_id,
+                            dataset_id,
+                            shard_id,
+                            worker_id,
+                            lease_epoch: le as u64,
+                            progress_offset: po,
+                            is_complete: ic,
+                            updated_at_millis: ua as u64,
+                        }
+                    },
+                )
                 .collect())
         })
     }

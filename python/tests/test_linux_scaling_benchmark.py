@@ -45,9 +45,14 @@ def test_report_has_required_sections(tmp_path: Path) -> None:
         assert section in report
 
 
-def test_coordinator_mode_fails_cleanly(tmp_path: Path) -> None:
+def test_coordinator_mode_runs_end_to_end(tmp_path: Path) -> None:
+    # coordinator-grpc mode is implemented: it must run real RPCs against a
+    # live coordinator and record that in the summary.
     out_dir = tmp_path / "out3"
     cmd = [sys.executable, str(MODULE), "--mode", "coordinator-grpc", "--workers", "1", "--samples", "2", "--output-dir", str(out_dir)]
     r = subprocess.run(cmd, env={**os.environ, "PYTHONPATH": "python"}, capture_output=True, text=True, check=False)
-    assert r.returncode != 0
-    assert "real coordinator mode not implemented" in (r.stderr + r.stdout)
+    assert r.returncode == 0, r.stderr
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    interop = summary["interop_overhead_results"]
+    assert interop["mode"] == "coordinator-grpc"
+    assert interop["coordinator_rpc_measured"] is True

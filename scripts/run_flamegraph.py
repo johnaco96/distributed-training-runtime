@@ -12,7 +12,8 @@ import sys
 import pathlib
 
 HOME = pathlib.Path.home()
-DTR  = HOME / "dtr"
+# Repo root: this script lives in <repo>/scripts/.
+DTR = pathlib.Path(__file__).resolve().parent.parent
 OUTDIR  = DTR / ".flamegraph-tmp"
 COORD   = DTR / "target" / "perf" / "runtime-coordinator"
 BENCH   = DTR / "target" / "perf" / "runtime-bench"

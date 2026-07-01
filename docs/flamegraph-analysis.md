@@ -1,5 +1,7 @@
 # Coordinator Flamegraph Analysis
 
+Flamegraph SVG (current): [docs/perf/coordinator-flamegraph.svg](perf/coordinator-flamegraph.svg)
+
 ## Setup
 
 **Binary**: `runtime-coordinator` compiled with `cargo build --profile perf`  
@@ -204,12 +206,13 @@ background, then only synchronise before the *next* checkpoint barrier.
 
 ---
 
-## 500-Worker gRPC Scale Flamegraph (2026-05-24)
+## 500-Worker gRPC Scale Flamegraph (post-hardening, 2026-05-25)
 
 **Binary**: `RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile perf`  
 **Profiler**: `perf record -g -F 997 --call-graph fp` (frame-pointer unwinding)  
-**Load**: 500 logical workers, 30 s duration, 64 concurrent gRPC calls, 1000 shards, 2 s heartbeat interval  
-**Samples**: 4,202 samples, 1.4 MB perf.data → 1.4 MB SVG with full Rust async stacks  
+**Load**: 500 logical workers, 60 s duration, 64 concurrent gRPC calls, 1000 shards, checkpoint-every-secs 30  
+**Build includes**: audit logging (DbAuditSink), distributed 2PC checkpoint commit, PostgreSQL HA leader election, TLS/mTLS support  
+**Result**: 42,514 ops, p50=0.43 ms, p99=0.60 ms, 0.02% failure rate  
 **Flamegraph**: [docs/perf/coordinator-flamegraph.svg](perf/coordinator-flamegraph.svg)
 
 Frame-pointer unwinding produces complete Rust async call stacks on WSL2/Hyper-V.
@@ -247,7 +250,7 @@ begins contending.
 **Coordinator is I/O-bound, not CPU-bound.**
 24.5% of samples are idle thread parks vs. 6.7% allocator time. This is
 healthy — it means the coordinator scales further before hitting a CPU wall.
-Scale-test result confirms: 0% failure rate, p99 = 3.3 ms at 500 workers.
+Scale-test result confirms: 0.02% failure rate, p99 = 0.60 ms at 500 workers.
 
 **Mutex is not yet hot (0.4%).**
 `lock` appears in `RegisterWorker`, `GetShardAssignment`, and `Heartbeat`

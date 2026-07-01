@@ -287,8 +287,13 @@ def maybe_start_coordinator(
     addr = f"127.0.0.1:{port}"
     # Prefer the pre-built release binary so we never pay a cargo compilation
     # round-trip (which can take 30+ s and blow the readiness timeout).
+    # Use the platform-specific executable suffix: on Windows the extension-
+    # less file (if present) is a WSL/Linux build and is not runnable here.
+    _exe_suffix = ".exe" if os.name == "nt" else ""
     _project_root = Path(__file__).resolve().parent.parent.parent
-    _release_bin = _project_root / "target" / "release" / "runtime-coordinator"
+    _release_bin = (
+        _project_root / "target" / "release" / f"runtime-coordinator{_exe_suffix}"
+    )
     if _release_bin.exists():
         coordinator_cmd = [str(_release_bin), "--addr", addr]
     else:
@@ -303,12 +308,26 @@ def maybe_start_coordinator(
         stderr=subprocess.DEVNULL,
     )
     try:
+        import grpc
+
         deadline = time.time() + 30
         while time.time() < deadline:
             try:
                 with connect(addr) as client:
                     client.restore_latest("warmup")
                 break
+            except grpc.RpcError as exc:
+                # Any structured gRPC status other than UNAVAILABLE (e.g.
+                # NOT_FOUND for the "warmup" run) proves the server is up
+                # and answering RPCs — that's all this probe needs.
+                if exc.code() is not grpc.StatusCode.UNAVAILABLE:
+                    break
+                if proc.poll() is not None:
+                    raise RuntimeError(
+                        f"Coordinator subprocess exited before becoming ready "
+                        f"(returncode={proc.returncode})"
+                    )
+                time.sleep(0.2)
             except Exception:
                 if proc.poll() is not None:
                     raise RuntimeError(
@@ -337,18 +356,23 @@ def wait_for_dataset(
 
     Used by ranks > 0 in single-worker mode: rank 0 writes and registers
     the dataset; other ranks poll until it appears.
+
+    ``worker_id`` must be a worker that is already registered with the run
+    so the coordinator accepts the shard-assignment probe call.  Pass the
+    caller's own worker_id rather than the default ``"probe"`` placeholder.
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         try:
             # A successful shard assignment proves the dataset exists.
-            resp = client.request_shard(
+            # Empty assignments (pool exhausted) still count — any non-error
+            # response means the coordinator knows about this dataset.
+            client.request_shard(
                 run_id=run_id,
                 worker_id=worker_id,
                 dataset_id=dataset_id,
                 idempotency_key="",
             )
-            # Any response (even empty assignments) means the dataset is registered.
             return
         except Exception:
             time.sleep(1.0)
@@ -493,9 +517,27 @@ def run_multi_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
         restored_checkpoint_id = latest.get("checkpoint_id")
         print(f"[train] resumed from checkpoint at epoch {start_epoch - 1}")
 
-    with connect(coordinator_addr) as client:
+    with connect(coordinator_addr) as admin_client:
+        # Security: control-plane calls (register_run/register_dataset/commit)
+        # use the admin identity; data-plane calls (register_worker/shards/
+        # heartbeats) use per-worker scoped identities.  When auth metadata is
+        # configured, each simulated worker gets its own worker-scoped client;
+        # otherwise all workers share the admin channel (local dev).
+        auth_active = bool(
+            os.getenv("DTRUNTIME_AUTH_SUBJECT") and os.getenv("DTRUNTIME_AUTH_ROLE")
+        )
+        worker_role = os.getenv("DTRUNTIME_WORKER_AUTH_ROLE", "worker")
+        worker_clients = {
+            worker_id: (
+                admin_client.for_worker(worker_id=worker_id, worker_role=worker_role)
+                if auth_active
+                else admin_client
+            )
+            for worker_id in logical_worker_ids
+        }
+
         # Register run
-        run_resp = client.register_run(
+        run_resp = admin_client.register_run(
             idempotency_key=f"pt-register-run-{idempotency_suffix}",
             run_name=run_name,
             assignment_policy=runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
@@ -507,7 +549,7 @@ def run_multi_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
         print(f"[train] run_id={run_id}")
 
         # Register dataset with real file:// URIs
-        client.register_dataset(
+        admin_client.register_dataset(
             run_id=run_id,
             name="training-shards",
             uri=str(shard_dir.resolve()),
@@ -519,26 +561,29 @@ def run_multi_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
         )
         print(f"[train] dataset registered: {len(shard_metadata)} shards")
 
-        # Register all workers
-        worker_clients = {}
+        # Register all workers under their own identities
         worker_ids: list[str] = []
         for rank, worker_id in enumerate(logical_worker_ids):
-            registered = client.register_worker(
+            registered = worker_clients[worker_id].register_worker(
                 run_id=run_id,
                 worker_id=worker_id,
                 rank=rank,
                 host="localhost",
                 idempotency_key=f"pt-register-worker-{rank}-{idempotency_suffix}",
             )
-            worker_ids.append(registered.worker_id.value or worker_id)
-            worker_clients[worker_id] = client
+            actual_id = registered.worker_id.value or worker_id
+            worker_ids.append(actual_id)
+            if actual_id != worker_id:
+                worker_clients[actual_id] = worker_clients[worker_id]
             rpc_summary["registered_workers"] += 1
 
         # Training loop
         for epoch in range(start_epoch, args.epochs + 1):
             print(f"[train] epoch {epoch}/{args.epochs}")
             for worker_id in worker_ids:
-                loader = ShardLoader(client, run_id, worker_id, dataset_id)
+                loader = ShardLoader(
+                    worker_clients[worker_id], run_id, worker_id, dataset_id
+                )
                 idem = f"pt-shard-{worker_id}-{epoch}-{idempotency_suffix}"
                 shard_ids, feat, lab = loader.load_next_shard_as_tensors(
                     idempotency_key=idem
@@ -561,7 +606,7 @@ def run_multi_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
                     f"[train]   {worker_id}: shards={shard_ids} "
                     f"loss={loss:.4f} acc={acc:.4f} steps={steps}"
                 )
-                client.heartbeat(
+                worker_clients[worker_id].heartbeat(
                     run_id=run_id,
                     worker_id=worker_id,
                     active_shard_ids=shard_ids,
@@ -590,9 +635,11 @@ def run_multi_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
                     "final_accuracy": final_accuracy,
                     "worker_metrics": worker_metrics,
                     "assignment_map": assignment_map,
-                    "config": vars(args),
+                    # Stringify config values (argparse holds Path objects,
+                    # which torch.load(weights_only=True) refuses to unpickle).
+                    "config": {k: str(v) for k, v in vars(args).items()},
                 }
-                begin = client.begin_checkpoint(
+                begin = worker_clients[worker_ids[0]].begin_checkpoint(
                     run_id=run_id,
                     worker_id=worker_ids[0],
                     step=global_step,
@@ -603,7 +650,7 @@ def run_multi_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
                 for wid in worker_ids:
                     wf = checkpoints_dir / f"epoch-{epoch:04d}-{wid}.pt"
                     torch.save({**state, "worker_id": wid}, wf)
-                    client.report_checkpoint_artifact(
+                    worker_clients[wid].report_checkpoint_artifact(
                         run_id=run_id,
                         worker_id=wid,
                         checkpoint_id=checkpoint_id,
@@ -615,13 +662,13 @@ def run_multi_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
                         idempotency_key=f"pt-report-ckpt-{epoch}-{wid}-{idempotency_suffix}",
                     )
                     worker_ckpt_files.append(wf.name)
-                client.commit_checkpoint(
+                admin_client.commit_checkpoint(
                     run_id=run_id,
                     checkpoint_id=checkpoint_id,
                     idempotency_key=f"pt-commit-ckpt-{epoch}-{idempotency_suffix}",
                 )
                 rpc_summary["checkpoints_committed"] += 1
-                latest_resp = client.restore_latest(run_id=run_id)
+                latest_resp = admin_client.restore_latest(run_id=run_id)
                 latest_checkpoint_metadata = {
                     "checkpoint_id": latest_resp.manifest.checkpoint_id.value,
                     "step": latest_resp.manifest.step,
@@ -644,6 +691,8 @@ def run_multi_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
         "mode": "multi-worker",
         "run_id": run_id,
         "epochs_completed": args.epochs,
+        "final_epoch": args.epochs,
+        "resumed_from_checkpoint": start_epoch > 1,
         "workers": args.workers,
         "shards": shard_count,
         "samples": args.samples,
@@ -721,8 +770,8 @@ def run_single_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
         run_id = run_resp.run_id.value
         print(f"[rank {rank}] run_id={run_id}")
 
-        # Register this worker early so wait_for_dataset can probe with a real
-        # registered worker_id instead of the "probe" placeholder the coordinator rejects.
+        # Register this worker before dataset registration so shard assignment
+        # is available as soon as the dataset exists.
         registered = client.register_worker(
             run_id=run_id,
             worker_id=worker_id,
@@ -768,9 +817,10 @@ def run_single_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
             )
             print(f"[rank 0] dataset registered ({len(shard_metadata)} shards)")
         else:
-            # Shards are pre-created on the shared volume (by shard-prep-job or rank 0).
-            # Re-registering with the same idempotency key is a coordinator no-op if
-            # rank 0 already registered the dataset — no polling probe needed.
+            # Shards are pre-created on the shared volume (by shard-prep-job or
+            # rank 0).  Re-registering with the same idempotency key is a
+            # coordinator no-op if rank 0 already registered the dataset — no
+            # polling probe needed (fixes the k8s worker-job dataset race).
             shard_metadata = shard_metadata_from_existing(shard_dir)
             client.register_dataset(
                 run_id=run_id,
@@ -901,6 +951,8 @@ def run_single_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
         "run_id": run_id,
         "worker_id": actual_worker_id,
         "epochs_completed": args.epochs,
+        "final_epoch": args.epochs,
+        "resumed_from_checkpoint": start_epoch > 1,
         "shards_assigned": shard_ids,
         "final_loss": final_loss,
         "final_accuracy": final_accuracy,

@@ -81,21 +81,11 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 3
-          livenessProbe:
-            tcpSocket:
-              port: grpc
-            initialDelaySeconds: 30
-            periodSeconds: 20
-            timeoutSeconds: 2
-            failureThreshold: 3
-          startupProbe:
-            tcpSocket:
-              port: grpc
-            # Give the standby up to 60 s to acquire the advisory lock after
-            # the leader dies (12 * 5 s = 60 s).
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 12
+          # NOTE: intentionally no livenessProbe/startupProbe.  The standby
+          # never binds the gRPC port while waiting for the advisory lock, so
+          # a TCP liveness/startup probe would kill the hot standby in a
+          # permanent restart loop.  The kubelet already restarts the container
+          # if the process exits; readiness alone gates traffic to the leader.
           resources:
             requests:
               cpu: "100m"

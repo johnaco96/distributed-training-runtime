@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use runtime_coordinator::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome, DbAuditSink};
+use runtime_coordinator::audit::{
+    AuditEvent, AuditEventKind, AuditLogger, AuditOutcome, DbAuditSink,
+};
 use runtime_coordinator::auth::{AuthMode, Authorizer};
-use runtime_storage::S3StorageConfig;
 use runtime_coordinator::ha_lock::CoordinatorLockGuard;
 use runtime_coordinator::init_tracing_from_env;
 use runtime_coordinator::persistence::{MetadataStore, SqliteMetadataStore};
@@ -20,6 +21,7 @@ use runtime_coordinator::service::CoordinatorServiceImpl;
 use runtime_coordinator::state::CoordinatorState;
 use runtime_coordinator::telemetry::render_prometheus_metrics;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorServiceServer;
+use runtime_storage::S3StorageConfig;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::info;
 
@@ -294,10 +296,14 @@ fn print_usage() {
     println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--metadata-db-url <URL>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--max-s3-concurrent-ops <N>] [--help|-h]");
     println!("\nOptions:");
     println!("  --addr <ADDR>              Coordinator listen address (default: {DEFAULT_ADDR})");
-    println!("  --metadata-db <PATH>       Enable SQLite metadata persistence at PATH (single-node)");
+    println!(
+        "  --metadata-db <PATH>       Enable SQLite metadata persistence at PATH (single-node)"
+    );
     println!("  --metadata-db-url <URL>    PostgreSQL DSN for HA metadata (env: DTRUNTIME_METADATA_DB_URL)");
     println!("                             Example: postgres://user:pass@host:5432/dtruntime");
-    println!("  --storage-root <PATH>      Local staging area for StreamCheckpointArtifact (required)");
+    println!(
+        "  --storage-root <PATH>      Local staging area for StreamCheckpointArtifact (required)"
+    );
     println!("  --auth-mode <MODE>         Authorization mode: disabled|metadata (env: DTRUNTIME_AUTH_MODE)");
     println!("  --tls-cert <PATH>          Enable TLS with certificate chain PEM at PATH (requires --tls-key)");
     println!(
@@ -309,7 +315,9 @@ fn print_usage() {
     println!("  --s3-bucket <NAME>         S3 bucket for checkpoint artifact upload (env: DTRUNTIME_S3_BUCKET)");
     println!("  --s3-access-key <KEY>      S3 access key ID (env: DTRUNTIME_S3_ACCESS_KEY)");
     println!("  --s3-secret-key <SECRET>   S3 secret access key (env: DTRUNTIME_S3_SECRET_KEY)");
-    println!("  --s3-region <REGION>       S3 region (default: us-east-1, env: DTRUNTIME_S3_REGION)");
+    println!(
+        "  --s3-region <REGION>       S3 region (default: us-east-1, env: DTRUNTIME_S3_REGION)"
+    );
     println!("  --max-s3-concurrent-ops N  Max concurrent S3 operations (default: 64).");
     println!("                             Set >= world_size to avoid semaphore stalls at scale.");
     println!("  --no-verify-checkpoint-artifacts");
@@ -342,8 +350,7 @@ fn coordinator_args(
         s3_bucket: std::env::var("DTRUNTIME_S3_BUCKET").ok(),
         s3_access_key: std::env::var("DTRUNTIME_S3_ACCESS_KEY").ok(),
         s3_secret_key: std::env::var("DTRUNTIME_S3_SECRET_KEY").ok(),
-        s3_region: std::env::var("DTRUNTIME_S3_REGION")
-            .unwrap_or_else(|_| "us-east-1".to_string()),
+        s3_region: std::env::var("DTRUNTIME_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
         max_s3_concurrent_ops: None,
         verify_checkpoint_artifacts: true,
         show_help: false,
@@ -402,8 +409,7 @@ fn coordinator_args(
             }
             parsed.max_s3_concurrent_ops = Some(n);
         } else if arg == "--metadata-db-url" {
-            parsed.metadata_db_url =
-                Some(args.next().ok_or("--metadata-db-url requires a URL")?);
+            parsed.metadata_db_url = Some(args.next().ok_or("--metadata-db-url requires a URL")?);
         } else if arg == "--no-verify-checkpoint-artifacts" {
             parsed.verify_checkpoint_artifacts = false;
         } else if arg == "--help" || arg == "-h" {

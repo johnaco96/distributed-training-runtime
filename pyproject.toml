@@ -5,12 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dtruntime"
 version = "0.1.0"
-description = "Python SDK skeleton for the Distributed Training Runtime control plane."
+description = "Python SDK for the Distributed Training Runtime: dataset/checkpoint registration, shard loading, and coordinator RPCs."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "grpcio",
     "protobuf",
+    # dtruntime.shard_loader reads/writes .npz shards with numpy.
+    "numpy",
 ]
 
 [project.optional-dependencies]

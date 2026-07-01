@@ -60,10 +60,7 @@ pub trait MetadataStore: Send + Sync {
     // ── original methods ──────────────────────────────────────────────────────
     fn save_run(&self, run: &RunRecord) -> PersistResult<()>;
     fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> PersistResult<()>;
-    fn load_workers_for_run(
-        &self,
-        run_id: &str,
-    ) -> PersistResult<Vec<(String, u32, u32, i32)>>;
+    fn load_workers_for_run(&self, run_id: &str) -> PersistResult<Vec<(String, u32, u32, i32)>>;
     fn save_dataset(&self, d: &DatasetRecord) -> PersistResult<()>;
     fn save_checkpoint(
         &self,
@@ -464,7 +461,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
         Ok(())
     }
 
-    pub fn load_all_checkpoint_commits_inner(&self) -> rusqlite::Result<Vec<(String, String, String)>> {
+    pub fn load_all_checkpoint_commits_inner(
+        &self,
+    ) -> rusqlite::Result<Vec<(String, String, String)>> {
         let conn = self.conn.lock().expect("sqlite");
         let mut stmt = conn.prepare(
             "SELECT run_id,checkpoint_id,worker_id FROM checkpoint_commits ORDER BY run_id,checkpoint_id",
@@ -502,13 +501,12 @@ impl MetadataStore for SqliteMetadataStore {
         self.save_run(run).map_err(|e| Box::new(e) as _)
     }
     fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> PersistResult<()> {
-        self.save_worker(w, world_size).map_err(|e| Box::new(e) as _)
+        self.save_worker(w, world_size)
+            .map_err(|e| Box::new(e) as _)
     }
-    fn load_workers_for_run(
-        &self,
-        run_id: &str,
-    ) -> PersistResult<Vec<(String, u32, u32, i32)>> {
-        self.load_workers_for_run(run_id).map_err(|e| Box::new(e) as _)
+    fn load_workers_for_run(&self, run_id: &str) -> PersistResult<Vec<(String, u32, u32, i32)>> {
+        self.load_workers_for_run(run_id)
+            .map_err(|e| Box::new(e) as _)
     }
     fn save_dataset(&self, d: &DatasetRecord) -> PersistResult<()> {
         self.save_dataset(d).map_err(|e| Box::new(e) as _)
@@ -544,20 +542,24 @@ impl MetadataStore for SqliteMetadataStore {
         &self,
         run_id: &str,
     ) -> PersistResult<Option<CoordinatorCheckpointRecord>> {
-        self.load_latest_checkpoint(run_id).map_err(|e| Box::new(e) as _)
+        self.load_latest_checkpoint(run_id)
+            .map_err(|e| Box::new(e) as _)
     }
     fn load_dataset(
         &self,
         run_id: &str,
         dataset_id: &str,
     ) -> PersistResult<Option<(String, Vec<ShardRecord>)>> {
-        self.load_dataset(run_id, dataset_id).map_err(|e| Box::new(e) as _)
+        self.load_dataset(run_id, dataset_id)
+            .map_err(|e| Box::new(e) as _)
     }
     fn save_shard_progress(&self, p: &ShardProgressEntry) -> PersistResult<()> {
-        self.save_shard_progress_inner(p).map_err(|e| Box::new(e) as _)
+        self.save_shard_progress_inner(p)
+            .map_err(|e| Box::new(e) as _)
     }
     fn load_all_shard_progress(&self) -> PersistResult<Vec<ShardProgressEntry>> {
-        self.load_all_shard_progress_inner().map_err(|e| Box::new(e) as _)
+        self.load_all_shard_progress_inner()
+            .map_err(|e| Box::new(e) as _)
     }
     fn record_checkpoint_commit(
         &self,
@@ -570,10 +572,12 @@ impl MetadataStore for SqliteMetadataStore {
             .map_err(|e| Box::new(e) as _)
     }
     fn load_all_checkpoint_commits(&self) -> PersistResult<Vec<(String, String, String)>> {
-        self.load_all_checkpoint_commits_inner().map_err(|e| Box::new(e) as _)
+        self.load_all_checkpoint_commits_inner()
+            .map_err(|e| Box::new(e) as _)
     }
     fn insert_audit_event(&self, event: &AuditEventEntry) -> PersistResult<()> {
-        self.insert_audit_event_inner(event).map_err(|e| Box::new(e) as _)
+        self.insert_audit_event_inner(event)
+            .map_err(|e| Box::new(e) as _)
     }
 }
 

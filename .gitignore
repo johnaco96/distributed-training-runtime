@@ -70,3 +70,11 @@ aws_credentials
 .dtruntime-certs/
 
 .dtruntime-results/
+.dtruntime-pytorch-coordinator/
+
+# Profiling / benchmark artifacts
+perf.data
+perf.data.*
+.flamegraph-tmp/
+*.svg.tmp
+tmp/

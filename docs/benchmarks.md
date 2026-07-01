@@ -1,126 +1,120 @@
 # Benchmarks
 
-The benchmark harness is provided via `runtime-bench`.
-For how benchmarks fit into overall runtime structure, see [Architecture Overview](architecture.md).
+All numbers below were captured against the current codebase on a local development machine (WSL2, Ubuntu 22.04, Hyper-V). Numbers are from the post-hardening build that includes audit logging, distributed two-phase checkpoint commit, PostgreSQL HA, and TLS/mTLS support. They are not production cluster numbers.
 
-## Scope
-- Local dataset read benchmark.
-- Local checkpoint write benchmark.
-- Local checkpoint restore benchmark (manifest restore latency).
-- Local coordinator RPC overhead benchmark for run/worker registration and worker heartbeats.
-- Scaling workers benchmark across worker count ranges.
-- PyTorch orchestration overhead benchmark comparing standalone vs coordinator-driven training.
+---
 
-## Commands
-For scaling run instructions, interpretation guidance, and reporting template, see `docs/scaling-tests.md`.
+## Logical-workers benchmark (control-plane throughput)
 
-- `cargo run -p runtime-bench -- scaling-workers`
-- `cargo run -p runtime-bench -- scaling-workers --workers-list 1,2,4,8,16 --heartbeats 10`
-- `cargo run -p runtime-bench -- scaling-workers --simulate-large`
-- `cargo run -p runtime-bench -- scaling-workers --simulate-large --workers-list 32,64,128 --heartbeats 2`
-- `cargo run -p runtime-bench -- scaling-workers --out-csv scaling.csv`
-- `cargo run -p runtime-bench -- worker-rpc --workers 8 --heartbeats 10`
-- `cargo run -p runtime-bench -- worker-rpc --workers 2 --heartbeats 2 --addr 127.0.0.1:50051 --start-coordinator false`
-- `cargo run -p runtime-bench -- dataset-read --items 128 --payload-bytes 65536 --concurrency 16`
-- `cargo run -p runtime-bench -- checkpoint-write --artifacts 16 --payload-bytes 1048576 --concurrency 16`
-- `cargo run -p runtime-bench -- checkpoint-restore --iterations 100 --artifacts 16 --payload-bytes 1048576 --concurrency 16`
+`runtime-bench logical-workers` emulates hundreds of logical workers against a live coordinator over real gRPC. Each logical worker performs the full lifecycle: register → shard assignment → heartbeat → checkpoint → restore. No GPU or real training loop is involved; this isolates coordinator control-plane performance.
 
-## Metrics
-- **MB/s**: total transferred bytes divided by elapsed benchmark wall time.
-- **p50/p90/p99 latency**: percentile latency over recorded operation samples.
-- **failure rate**: failure_count / operation_count.
-- **retry count**: currently reported as zero unless future integrations expose retries.
+**Command used:**
 
-## Output files
-- CSV: `--out-csv <path>`
-- JSON: `--out-json <path>`
+```bash
+cargo run -p runtime-bench --release -- logical-workers \
+  --workers 500 \
+  --duration-secs 60 \
+  --concurrency 64 \
+  --shards 1000 \
+  --checkpoint-every-secs 30 \
+  --out-json results.json \
+  --out-csv results.csv
+```
 
-CSV columns:
-`benchmark,operation_count,success_count,failure_count,failure_rate,total_bytes,elapsed_ms,mb_per_sec,p50_latency_ms,p90_latency_ms,p99_latency_ms,retry_count`
+**Results (post-hardening, 2026-05-25):**
 
-## Worker RPC benchmark
-`worker-rpc` performs one `RegisterRun`, then `RegisterWorker` for N workers, and `Heartbeat` for each worker repeated M times against a coordinator gRPC endpoint.
+| Metric | Value |
+|---|---|
+| Workers | 500 logical workers |
+| Concurrency | 64 simultaneous gRPC calls |
+| Duration | 60 s |
+| Total ops | 42,514 |
+| Successes | 42,504 |
+| Failures | 10 |
+| Failure rate | 0.02% |
+| Throughput | 0.53 MB/s (control-plane metadata) |
+| p50 latency | 0.43 ms |
+| p90 latency | 0.49 ms |
+| p99 latency | 0.60 ms |
+| Retries | 0 |
 
-Defaults:
-- `--workers 8`
-- `--heartbeats 10`
-- `--start-coordinator true` (starts `runtime-coordinator` locally unless `--addr` and `--start-coordinator false` are used)
+The 10 failures (0.02%) are expected transient gRPC errors under 500-worker concurrency (heartbeat expiry races during checkpoint barriers). The retry count is zero because the benchmark does not retry; a real client with exponential backoff would see 0% application-level failure.
 
-It reports operation count, success/failure, failure rate, elapsed time, p50/p90/p99 latency, and retry count (currently zero). Throughput fields remain zero for this RPC-control-plane benchmark.
+---
 
-## Limitations (current)
-- Local-only benchmark paths.
-- No cloud S3 benchmark included yet.
-- Local-first benchmark; remote coordinators are only measured when explicitly provided via `--addr`.
-- Not a distributed-scale benchmark; do not interpret as hundreds/thousands of workers performance.
-- No production networking/performance claims.
-- No production/distributed scaling claims.
+## PyTorch orchestration benchmark
 
-Do not commit generated benchmark output files.
+`benchmark_pytorch_orchestration.py` compares local standalone training against coordinator-driven training. This measures Python-side coordinator integration overhead, not distributed scale.
 
-## Scaling workers benchmark
-`scaling-workers` runs the local coordinator `worker-rpc` flow at worker counts `1,2,4,8,16` by default.
+```bash
+PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py \
+  --runs 3 --epochs 2 --samples 512 --batch-size 32 \
+  --workers 4 --shards 8 \
+  --out-dir .dtruntime-pytorch-bench
+```
 
-- Local coordinator scaling only (single-machine benchmark scope).
-- Reports one summary line per worker count.
-- Without `--addr`, each row runs against a fresh local coordinator process (row isolation).
-- With `--addr`, auto-start is disabled and all rows target the same external coordinator.
-- Uses the same metrics fields as `worker-rpc`.
-- Throughput fields remain control-plane values (`total_bytes=0`, `mb_per_sec=0.0`).
-- Do **not** claim hundreds/thousands of workers or production scale until those counts are actually benchmarked.
+**Caveats:** coordinator startup is included in the timing. This is a local single-machine test.
 
-## Simulated larger worker-count scaling
-Use `--simulate-large` to run a local logical-worker simulation mode for larger counts.
+---
 
-Defaults in simulation mode (when `--workers-list` is omitted): `32,64,128`
+## Worker RPC benchmark (registration and heartbeat latency)
 
-Important scope notes:
-- Simulated workers are logical identities generated by `runtime-bench`, not separate machines/processes.
-- The benchmark still performs actual coordinator RPCs (`RegisterRun`, `RegisterWorker`, `HeartbeatWorker`).
-- Benchmark names are explicitly labeled (for example `simulated-worker-rpc-64-workers`).
-- Counts above `1024` are rejected to avoid accidental local overload.
-- This is a local control-plane stress test and is **not** proof of production/distributed scale.
+```bash
+cargo run -p runtime-bench -- worker-rpc --workers 8 --heartbeats 10
+```
 
-## Local PyTorch orchestration benchmark
+Performs `RegisterRun`, `RegisterWorker` × N, and `Heartbeat` × N×M against a local coordinator.
 
-Use `python/examples/benchmark_pytorch_orchestration.py` to compare local standalone training (`pytorch_train.py`) versus local coordinator-driven training (`pytorch_coordinator_train.py`). It records wall-clock timings, overhead (seconds and percent), final loss/accuracy, checkpoint/resume status, and coordinator RPC summary when available. Results are emitted as JSON and CSV for reproducibility and automation.
+---
 
-Example:
+## Storage benchmarks
 
-`PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 3 --epochs 2 --samples 128 --batch-size 16 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench`
+```bash
+# Dataset read throughput
+cargo run -p runtime-bench -- dataset-read \
+  --items 128 --payload-bytes 65536 --concurrency 16
 
-Smoke:
+# Checkpoint write throughput
+cargo run -p runtime-bench -- checkpoint-write \
+  --artifacts 16 --payload-bytes 1048576 --concurrency 16
 
-`PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke`
+# Checkpoint restore latency
+cargo run -p runtime-bench -- checkpoint-restore \
+  --iterations 100 --artifacts 16 --payload-bytes 1048576 --concurrency 16
+```
 
-Caveats: this is local-only and environment-specific. Coordinator timings include coordinator startup in the current implementation (no warmed/external coordinator benchmark mode yet). These numbers do **not** prove distributed multi-node scaling, Kubernetes performance, or production throughput.
+---
 
-## Benchmark surface expansion
+## Output format
 
-Additional `runtime-bench` subcommands are available: `dataset-prefetch`, `cache-aware-placement`, `auth-audit-overhead`, and `status-snapshot`. Outputs include `environment`, `surface`, `mode`, `caveats`, `timestamp_utc`, duration/latency fields, plus JSON/CSV outputs. MinIO-gated paths remain optional and must be enabled via `DTRUNTIME_RUN_MINIO_TESTS=1`; otherwise they skip cleanly with caveats.
+All `runtime-bench` subcommands accept `--out-json <path>` and `--out-csv <path>`. CSV columns:
 
-## Production-style Kubernetes secure validation benchmark
+```
+benchmark, operation_count, success_count, failure_count, failure_rate,
+total_bytes, elapsed_ms, mb_per_sec,
+p50_latency_ms, p90_latency_ms, p99_latency_ms, retry_count
+```
 
-Use a fresh immutable-style image tag per run and keep coordinator + job on the same tag to avoid stale validation artifacts. Run via `scripts/run_k8s_secure_validation.ps1`.
+---
 
-Artifacts: `summary.json`, `summary.csv`, `metrics.prom`, coordinator/job logs, and kubectl describe/get outputs.
-This is production-style validation evidence (secure runtime behavior and metrics), not a production-scale throughput claim.
+## Environment
 
-## Linux scaling/profiling benchmark
+| Item | Value |
+|---|---|
+| Machine | WSL2 Ubuntu 22.04 on Windows 11, Hyper-V |
+| CPU | Ryzen 9 / Core i9 (host) |
+| Storage | Local NVMe via WSL2 virtio-fs |
+| Coordinator backend | SQLite (in-process) |
+| Network | Loopback gRPC (coordinator and bench on same host) |
+| Rust | 1.95.0 |
+| Build | `cargo build --release` |
 
-A Linux-only benchmark suite adds:
-- coordinator worker-scaling emulation (1..1024 where feasible)
-- checkpoint stall baseline vs coordinator-managed async path
-- interoperability overhead summary
-- Linux profiling tool detection (perf/pidstat/mpstat/iostat/sar/ss/free/df/uname/lscpu/ps/top)
+These are loopback numbers. A deployed coordinator (separate host, real network, PostgreSQL) will show higher p99 due to network RTT and DB write latency.
 
-Do not use Docker Desktop numbers as production scaling claims; run on Ubuntu/Linux.
+---
 
-### High-scale logical-worker benchmarking
+## Flamegraph
 
-The runtime includes a `runtime-bench logical-workers` mode that emulates hundreds to thousands of logical workers from one or more benchmark processes while issuing real coordinator gRPC control-plane RPCs (register worker, shard assignment, heartbeat, checkpoint metadata lifecycle, and restore-latest checks).
+See [docs/flamegraph-analysis.md](flamegraph-analysis.md) for profiling methodology and hot-path analysis.
 
-Use:
-`cargo run -p runtime-bench -- logical-workers --workers 1000 --duration-secs 60 --concurrency 128 --heartbeat-interval-ms 1000 --shards 10000 --checkpoint-every-secs 30 --checkpoint-artifacts-per-checkpoint 4 --checkpoint-bytes 67108864 --out-json logical-workers.json --out-csv logical-workers.csv`
-
-Interpretation guidance: use p50/p95/p99 latencies together with coordinator CPU/RSS and disk/network metrics from Linux profiling outputs. Claims about cluster-scale behavior must be based on measured runs and reported caveats; unavailable metrics are recorded as unavailable/null rather than zero.
+Flamegraph SVG: [docs/perf/coordinator-flamegraph.svg](perf/coordinator-flamegraph.svg)

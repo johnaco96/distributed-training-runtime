@@ -25,24 +25,43 @@ cargo build --release -p runtime-coordinator
 ```
 
 ```python
-from dtruntime.client import RuntimeClient
-from dtruntime.shard_loader import build_and_write_shards, ShardLoader
+from pathlib import Path
+
 import numpy as np
 
-client = RuntimeClient("localhost:50051")
+from dtruntime.client import connect
+from dtruntime.generated import runtime_pb2
+from dtruntime.shard_loader import ShardLoader, build_and_write_shards
 
-# Register a run and dataset
-run    = client.register_run(run_id="run-001", world_size=4)
-worker = client.register_worker(run_id=run.run_id, idempotency_key="worker-0")
+client = connect("localhost:50051")
 
+# Register a run and this worker
+run = client.register_run(
+    run_name="quickstart",
+    world_size=1,
+    assignment_policy=runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
+    storage_backend_kind=runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
+    idempotency_key="quickstart-run",
+)
+run_id = run.run_id.value
+worker = client.register_worker(run_id=run_id, worker_id="worker-0", rank=0)
+worker_id = worker.worker_id.value
+
+# Write shard files and register the dataset
 features = np.random.rand(10000, 128).astype(np.float32)
-labels   = np.random.randint(0, 10, 10000).astype(np.int64)
-shards   = build_and_write_shards(Path("/data/shards"), features, labels, shard_count=16)
-dataset  = client.register_dataset(run_id=run.run_id, shards=shards)
+labels = np.random.randint(0, 10, 10000).astype(np.int64)
+shards = build_and_write_shards(Path("/data/shards"), features, labels, shard_count=16)
+client.register_dataset(
+    run_id=run_id,
+    name="quickstart-data",
+    uri="file:///data/shards",
+    format="npz",
+    shards=shards,
+    dataset_id="dataset",
+)
 
 # Load shards in the training loop
-loader = ShardLoader(client, run_id=run.run_id,
-                     worker_id=worker.worker_id, dataset_id=dataset.dataset_id)
+loader = ShardLoader(client, run_id, worker_id, "dataset")
 
 while True:
     shard_ids, features, labels = loader.load_next_shard_as_tensors()

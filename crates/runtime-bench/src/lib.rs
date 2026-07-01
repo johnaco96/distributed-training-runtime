@@ -831,9 +831,18 @@ fn start_local_coordinator(addr: &str) -> Result<Child, String> {
     // Prefer a pre-built release (or debug) binary sitting next to this
     // executable so we never pay a `cargo run` compilation round-trip.
     // Fall back to `cargo run` only when neither binary is found.
+    // Use the platform executable suffix: on Windows an extension-less
+    // "runtime-coordinator" next to us is a WSL/Linux build, not runnable.
     let coordinator_bin = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("runtime-coordinator")))
+        .and_then(|p| {
+            p.parent().map(|d| {
+                d.join(format!(
+                    "runtime-coordinator{}",
+                    std::env::consts::EXE_SUFFIX
+                ))
+            })
+        })
         .filter(|p| p.exists());
 
     let mut cmd = if let Some(bin) = coordinator_bin {
@@ -842,7 +851,15 @@ fn start_local_coordinator(addr: &str) -> Result<Child, String> {
         c
     } else {
         let mut c = Command::new("cargo");
-        c.args(["run", "--release", "-p", "runtime-coordinator", "--", "--addr", addr]);
+        c.args([
+            "run",
+            "--release",
+            "-p",
+            "runtime-coordinator",
+            "--",
+            "--addr",
+            addr,
+        ]);
         c
     };
 
@@ -1101,7 +1118,12 @@ async fn run_logical_workers_async(
                 retry_count: 0,
             });
         }
-        if checkpoint_every_secs > 0 && start.elapsed().as_secs().is_multiple_of(checkpoint_every_secs) {
+        if checkpoint_every_secs > 0
+            && start
+                .elapsed()
+                .as_secs()
+                .is_multiple_of(checkpoint_every_secs)
+        {
             checkpoint_seq += 1;
             let ckid = runtime_proto::runtime::v1::CheckpointId {
                 value: format!("ckpt-{checkpoint_seq}"),
@@ -1167,6 +1189,7 @@ async fn run_logical_workers_async(
                         run_id: Some(run_id.clone()),
                         checkpoint_id: Some(ckid.clone()),
                         idempotency_key: format!("{bench_id}-ccommit-{checkpoint_seq}"),
+                        worker_id: None,
                     },
                 ))
                 .await
@@ -1391,9 +1414,7 @@ async fn run_sharded_data_load_async(
 
     let bench_id = format!(
         "sdl-{}",
-        chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or_default()
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
 
     // ── 3. Register run ────────────────────────────────────────────────────
@@ -1437,18 +1458,20 @@ async fn run_sharded_data_load_async(
     };
     let shard_metas: Vec<runtime_proto::runtime::v1::ShardMetadata> = shard_uris
         .iter()
-        .map(|(shard_id, uri)| runtime_proto::runtime::v1::ShardMetadata {
-            shard_id: Some(runtime_proto::runtime::v1::ShardId {
-                value: shard_id.clone(),
-            }),
-            dataset_id: Some(dataset_id.clone()),
-            shard_uri: uri.clone(),
-            byte_range_start: 0,
-            byte_range_end: shard_size_bytes as i64,
-            size_bytes: shard_size_bytes as i64,
-            checksum: String::new(),
-            checksum_algorithm: String::new(),
-        })
+        .map(
+            |(shard_id, uri)| runtime_proto::runtime::v1::ShardMetadata {
+                shard_id: Some(runtime_proto::runtime::v1::ShardId {
+                    value: shard_id.clone(),
+                }),
+                dataset_id: Some(dataset_id.clone()),
+                shard_uri: uri.clone(),
+                byte_range_start: 0,
+                byte_range_end: shard_size_bytes as i64,
+                size_bytes: shard_size_bytes as i64,
+                checksum: String::new(),
+                checksum_algorithm: String::new(),
+            },
+        )
         .collect();
     client
         .register_dataset(Request::new(
