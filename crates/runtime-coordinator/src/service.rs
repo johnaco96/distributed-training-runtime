@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use runtime_storage::{S3Storage, S3StorageConfig};
 use runtime_proto::protocol_version;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorService;
 use runtime_proto::runtime::v1::*;
+use runtime_storage::{S3Storage, S3StorageConfig};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tonic::{Request, Response, Status, Streaming};
@@ -810,7 +810,11 @@ impl CoordinatorService for CoordinatorServiceImpl {
                     ))
                 }
             },
-            None => return Err(Status::invalid_argument("stream closed before meta message")),
+            None => {
+                return Err(Status::invalid_argument(
+                    "stream closed before meta message",
+                ))
+            }
         };
 
         let run_id = meta
@@ -855,9 +859,9 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
         // Open file for writing. Streaming chunks arrive from the network and
         // are written immediately — tokio::fs keeps the async executor unblocked.
-        let mut file = tokio::fs::File::create(&artifact_path).await.map_err(|e| {
-            Status::internal(format!("failed to create artifact file: {e}"))
-        })?;
+        let mut file = tokio::fs::File::create(&artifact_path)
+            .await
+            .map_err(|e| Status::internal(format!("failed to create artifact file: {e}")))?;
 
         let mut hasher = Sha256::new();
         let mut bytes_received: i64 = 0;
@@ -896,14 +900,16 @@ impl CoordinatorService for CoordinatorServiceImpl {
                     ));
                 }
                 None => {
-                    return Err(Status::invalid_argument("received message with empty payload"));
+                    return Err(Status::invalid_argument(
+                        "received message with empty payload",
+                    ));
                 }
             }
         }
 
-        file.flush().await.map_err(|e| {
-            Status::internal(format!("failed to flush artifact file: {e}"))
-        })?;
+        file.flush()
+            .await
+            .map_err(|e| Status::internal(format!("failed to flush artifact file: {e}")))?;
         drop(file);
 
         let checksum = hex::encode(hasher.finalize());
@@ -975,9 +981,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 ReportCheckpointArtifactError::CheckpointNotFound => {
                     not_found(format!("checkpoint {checkpoint_id} was not found"))
                 }
-                ReportCheckpointArtifactError::InvalidInput(message) => {
-                    invalid_argument(message)
-                }
+                ReportCheckpointArtifactError::InvalidInput(message) => invalid_argument(message),
                 ReportCheckpointArtifactError::InvalidState => failed_precondition(
                     "checkpoint is in terminal state or cannot accept artifacts",
                 ),
@@ -1077,12 +1081,16 @@ impl CoordinatorService for CoordinatorServiceImpl {
         let checkpoint_id = request
             .checkpoint_id
             .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?;
+        // Gap 2: extract caller's worker_id for 2PC vote tracking.
+        // Empty string triggers the legacy single-caller path (artifact-count only).
+        let worker_id = request.worker_id.map(|w| w.value).unwrap_or_default();
 
         let checkpoint = self
             .state
             .commit_checkpoint(
                 run_id.value.clone(),
                 checkpoint_id.value.clone(),
+                worker_id.clone(),
                 request.idempotency_key,
             )
             .map_err(|error| {
@@ -1099,13 +1107,31 @@ impl CoordinatorService for CoordinatorServiceImpl {
                     CommitCheckpointError::InvalidState => Status::failed_precondition(
                         "checkpoint is in terminal state, missing artifacts, or cannot be committed",
                     ),
+                    CommitCheckpointError::PersistenceUnavailable => Status::unavailable(
+                        "commit vote could not be durably recorded; retry the commit",
+                    ),
                 }
             })?;
-        self.metrics.inc_checkpoint_writes();
-        info!(run_id = %run_id.value, checkpoint_id = %checkpoint_id.value, "checkpoint commit succeeded");
+        if checkpoint.globally_committed {
+            self.metrics.inc_checkpoint_writes();
+            info!(
+                run_id = %run_id.value,
+                checkpoint_id = %checkpoint_id.value,
+                worker_id = %worker_id,
+                "checkpoint globally committed"
+            );
+        } else {
+            info!(
+                run_id = %run_id.value,
+                checkpoint_id = %checkpoint_id.value,
+                worker_id = %worker_id,
+                "checkpoint commit vote recorded — waiting for remaining workers"
+            );
+        }
         Ok(Response::new(CommitCheckpointResponse {
             state: checkpoint_state_to_proto(checkpoint.record.checkpoint.state),
             committed_at: Some(millis_to_timestamp(checkpoint.committed_at_millis)),
+            globally_committed: checkpoint.globally_committed,
         }))
     }
 
@@ -1747,6 +1773,7 @@ mod tests {
                 run_id: Some(run_id.clone()),
                 checkpoint_id: Some(ckpt.clone()),
                 idempotency_key: "commit-m".into(),
+                worker_id: None,
             }))
             .await
             .unwrap();
@@ -1758,6 +1785,7 @@ mod tests {
                         run_id: Some(run_id.clone()),
                         checkpoint_id: Some(ckpt.clone()),
                         idempotency_key: "commit-deny".into(),
+                        worker_id: None,
                     },
                 ))
                 .await
@@ -2819,6 +2847,7 @@ mod tests {
                     value: "ckpt-commit".to_string(),
                 }),
                 idempotency_key: "commit-1".to_string(),
+                worker_id: None,
             }))
             .await
             .unwrap()
@@ -2832,6 +2861,7 @@ mod tests {
                     value: "ckpt-commit".to_string(),
                 }),
                 idempotency_key: "commit-2".to_string(),
+                worker_id: None,
             }))
             .await
             .unwrap()
@@ -2870,6 +2900,7 @@ mod tests {
                     value: "ckpt-1".to_string(),
                 }),
                 idempotency_key: String::new(),
+                worker_id: None,
             }))
             .await
             .unwrap_err();
@@ -2884,6 +2915,7 @@ mod tests {
                     value: "missing".to_string(),
                 }),
                 idempotency_key: String::new(),
+                worker_id: None,
             }))
             .await
             .unwrap_err();
@@ -2916,6 +2948,7 @@ mod tests {
                     value: "ckpt-empty".to_string(),
                 }),
                 idempotency_key: String::new(),
+                worker_id: None,
             }))
             .await
             .unwrap_err();
@@ -3019,6 +3052,7 @@ mod tests {
                         value: ckpt.to_string(),
                     }),
                     idempotency_key: format!("commit-{ckpt}"),
+                    worker_id: None,
                 }))
                 .await
                 .unwrap();
@@ -3523,10 +3557,7 @@ mod tests {
         let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()))
             .with_storage_root(tmp.path().to_path_buf());
         assert!(service.storage_root.is_some());
-        assert_eq!(
-            service.storage_root.as_ref().unwrap().as_ref(),
-            tmp.path()
-        );
+        assert_eq!(service.storage_root.as_ref().unwrap().as_ref(), tmp.path());
     }
 
     #[test]
@@ -3535,10 +3566,7 @@ mod tests {
         let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()))
             .with_storage_root(tmp.path().to_path_buf());
         let cloned = service.clone();
-        assert_eq!(
-            cloned.storage_root.as_ref().unwrap().as_ref(),
-            tmp.path()
-        );
+        assert_eq!(cloned.storage_root.as_ref().unwrap().as_ref(), tmp.path());
     }
 
     #[test]

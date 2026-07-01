@@ -2,5 +2,4 @@
 
 Benchmark harness support.
 
-This crate is currently a Phase 3 skeleton. It intentionally does not include
-business logic yet.
+This crate provides the benchmark harness for coordinator control-plane load testing, including logical-worker emulation and latency/throughput measurement.

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use dashmap::DashMap;
@@ -21,9 +21,9 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const WORKER_FAILURE_INTERVAL: Duration = Duration::from_secs(90);
 const SHARD_LEASE_DURATION: Duration = Duration::from_secs(30);
 
-use crate::persistence::MetadataStore;
 #[cfg(test)]
 use crate::persistence::SqliteMetadataStore;
+use crate::persistence::{MetadataStore, ShardProgressEntry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatasetPlacementPolicy {
@@ -67,10 +67,16 @@ pub struct CoordinatorState {
     checkpoint_idempotency_keys: DashMap<String, String>,
     checkpoint_artifact_idempotency_keys: DashMap<String, String>,
 
+    // Gap 2: per-checkpoint commit votes for distributed 2PC.
+    // Key: (run_id, checkpoint_id) → set of worker_ids that called CommitCheckpoint.
+    // The global commit fires when commit_set.len() == expected_artifact_count.
+    checkpoint_commits: DashMap<(String, String), Arc<Mutex<HashSet<String>>>>,
+
     placement_policy: DatasetPlacementPolicy,
     /// Optional persistence back-end.  Either [`SqliteMetadataStore`] (single-
     /// node) or [`crate::pg_store::PostgresMetadataStore`] (distributed HA).
-    metadata_store: Option<Box<dyn MetadataStore>>,
+    /// Wrapped in Arc so it can be shared with the audit sink.
+    metadata_store: Option<Arc<dyn MetadataStore>>,
     next_run_id: AtomicU64,
     next_worker_id: AtomicU64,
     next_dataset_id: AtomicU64,
@@ -250,6 +256,9 @@ pub enum CommitCheckpointError {
     CheckpointNotFound,
     InvalidInput(&'static str),
     InvalidState,
+    /// The metadata store rejected the commit-vote write.  The vote was not
+    /// recorded; the caller should retry the commit.
+    PersistenceUnavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,6 +274,10 @@ pub enum GetLatestCheckpointError {
 pub struct CommitCheckpointResult {
     pub record: CoordinatorCheckpointRecord,
     pub committed_at_millis: u64,
+    /// `true` when all workers have voted and the checkpoint is durably committed;
+    /// `false` when this worker's vote was recorded but other workers have not
+    /// yet called CommitCheckpoint.
+    pub globally_committed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -320,6 +333,7 @@ impl Default for CoordinatorState {
             checkpoints_by_run: DashMap::new(),
             checkpoint_idempotency_keys: DashMap::new(),
             checkpoint_artifact_idempotency_keys: DashMap::new(),
+            checkpoint_commits: DashMap::new(),
             metadata_store: None,
             next_run_id: AtomicU64::new(0),
             next_worker_id: AtomicU64::new(0),
@@ -339,10 +353,56 @@ impl CoordinatorState {
         }
     }
 
-    pub fn with_metadata_store(metadata_store: impl MetadataStore + 'static) -> Self {
-        Self {
-            metadata_store: Some(Box::new(metadata_store)),
+    pub fn with_metadata_store(metadata_store: Arc<dyn MetadataStore>) -> Self {
+        let mut state = Self {
+            metadata_store: Some(Arc::clone(&metadata_store)),
             ..Self::default()
+        };
+        state.hydrate_from_store(metadata_store.as_ref());
+        state
+    }
+
+    /// Re-hydrate in-memory caches from the durable store after a coordinator restart.
+    ///
+    /// Called once inside [`with_metadata_store`] before the gRPC server starts
+    /// so the coordinator can resume mid-shard reads and in-flight 2PC commits
+    /// without requiring workers to re-send progress reports.
+    fn hydrate_from_store(&mut self, store: &dyn MetadataStore) {
+        // Gap 1: restore shard-progress offsets so workers get the correct
+        // resume position on GetShardAssignment after a coordinator restart.
+        if let Ok(entries) = store.load_all_shard_progress() {
+            for entry in entries {
+                let key = ShardProgressKey {
+                    run_id: entry.run_id.clone(),
+                    dataset_id: entry.dataset_id.clone(),
+                    shard_id: entry.shard_id.clone(),
+                };
+                let record = ShardProgressRecord {
+                    run_id: entry.run_id,
+                    dataset_id: entry.dataset_id,
+                    shard_id: entry.shard_id,
+                    worker_id: entry.worker_id,
+                    lease_epoch: entry.lease_epoch,
+                    progress_offset: entry.progress_offset,
+                    is_complete: entry.is_complete,
+                    updated_at: std::time::UNIX_EPOCH
+                        + Duration::from_millis(entry.updated_at_millis),
+                };
+                self.shard_progress.insert(key, record);
+            }
+        }
+        // Gap 2: restore per-worker commit votes so in-flight 2PC commits that
+        // arrived before the restart are not lost and the vote count is correct.
+        if let Ok(commits) = store.load_all_checkpoint_commits() {
+            for (run_id, checkpoint_id, worker_id) in commits {
+                let key = (run_id, checkpoint_id);
+                let set_arc = self
+                    .checkpoint_commits
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(Mutex::new(HashSet::new())))
+                    .clone();
+                set_arc.lock().unwrap().insert(worker_id);
+            }
         }
     }
 
@@ -384,6 +444,38 @@ impl CoordinatorState {
             store
                 .save_checkpoint_artifact(run_id, checkpoint_id, artifact)
                 .expect("persist artifact");
+        }
+    }
+
+    fn persist_shard_progress(&self, progress: &ShardProgressRecord) {
+        if let Some(store) = &self.metadata_store {
+            let millis = progress
+                .updated_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let entry = ShardProgressEntry {
+                run_id: progress.run_id.clone(),
+                dataset_id: progress.dataset_id.clone(),
+                shard_id: progress.shard_id.clone(),
+                worker_id: progress.worker_id.clone(),
+                lease_epoch: progress.lease_epoch,
+                progress_offset: progress.progress_offset,
+                is_complete: progress.is_complete,
+                updated_at_millis: millis,
+            };
+            // Shard progress is an at-least-once resume hint: if this write is
+            // lost the worker simply re-processes a few records after a
+            // coordinator restart.  Log and continue rather than crashing the
+            // coordinator over a transient DB error in the hot path.
+            if let Err(e) = store.save_shard_progress(&entry) {
+                tracing::error!(
+                    error = %e,
+                    run_id = %entry.run_id,
+                    shard_id = %entry.shard_id,
+                    "failed to persist shard progress (resume offset may be stale)"
+                );
+            }
         }
     }
 
@@ -622,6 +714,7 @@ impl CoordinatorState {
         &self,
         run_id: String,
         checkpoint_id: String,
+        worker_id: String, // Gap 2: per-worker 2PC commit vote
         _idempotency_key: String,
     ) -> Result<CommitCheckpointResult, CommitCheckpointError> {
         if run_id.trim().is_empty() {
@@ -644,11 +737,101 @@ impl CoordinatorState {
             .ok_or(CommitCheckpointError::CheckpointNotFound)?
             .value()
             .clone();
+
+        // Fast path: already globally committed (idempotent re-commit).
+        {
+            let checkpoints = checkpoints_arc.read().unwrap();
+            if let Some(record) = checkpoints.get(&checkpoint_id) {
+                if record.checkpoint.state == DomainCheckpointState::Committed {
+                    return Ok(CommitCheckpointResult {
+                        record: record.clone(),
+                        committed_at_millis: record
+                            .committed_at_millis
+                            .unwrap_or(record.checkpoint.updated_at_millis),
+                        globally_committed: true,
+                    });
+                }
+            }
+        }
+
+        // Gap 2: record this worker's commit vote (idempotent via HashSet insert).
+        let all_voted = if !worker_id.is_empty() {
+            let commit_key = (run_id.clone(), checkpoint_id.clone());
+            let set_arc = self
+                .checkpoint_commits
+                .entry(commit_key)
+                .or_insert_with(|| Arc::new(Mutex::new(HashSet::new())))
+                .clone();
+            let mut set = set_arc.lock().unwrap();
+            // Persist the vote *before* recording it in memory: if the DB
+            // write fails we return Unavailable and the worker retries, at
+            // which point persistence is re-attempted.  Inserting into the
+            // in-memory set first would make the retry a no-op and the vote
+            // would never become durable.
+            if !set.contains(&worker_id) {
+                if let Some(store) = &self.metadata_store {
+                    store
+                        .record_checkpoint_commit(&run_id, &checkpoint_id, &worker_id, now_millis())
+                        .map_err(|e| {
+                            tracing::error!(
+                                error = %e,
+                                run_id = %run_id,
+                                checkpoint_id = %checkpoint_id,
+                                worker_id = %worker_id,
+                                "failed to persist checkpoint commit vote"
+                            );
+                            CommitCheckpointError::PersistenceUnavailable
+                        })?;
+                }
+                set.insert(worker_id.clone());
+            }
+            let commit_count = set.len();
+            drop(set);
+
+            // Check whether all workers have voted by comparing against the
+            // expected artifact count (which equals world_size at begin_checkpoint).
+            let checkpoints = checkpoints_arc.read().unwrap();
+            let record = checkpoints
+                .get(&checkpoint_id)
+                .ok_or(CommitCheckpointError::CheckpointNotFound)?;
+            commit_count >= record.expected_artifact_count as usize
+        } else {
+            // Legacy path: no worker_id supplied → skip vote-count gate and
+            // rely solely on artifact completeness (backward compatible).
+            true
+        };
+
+        if !all_voted {
+            // Some workers haven't committed yet — return a pending result.
+            let checkpoints = checkpoints_arc.read().unwrap();
+            let record = checkpoints
+                .get(&checkpoint_id)
+                .ok_or(CommitCheckpointError::CheckpointNotFound)?;
+            return Ok(CommitCheckpointResult {
+                record: record.clone(),
+                committed_at_millis: record.checkpoint.updated_at_millis,
+                globally_committed: false,
+            });
+        }
+
+        // All votes in — acquire the write lock and perform the global commit.
         let mut checkpoints = checkpoints_arc.write().unwrap();
 
         let record = checkpoints
             .get_mut(&checkpoint_id)
             .ok_or(CommitCheckpointError::CheckpointNotFound)?;
+
+        // Double-check under write lock (another worker may have beaten us).
+        if record.checkpoint.state == DomainCheckpointState::Committed {
+            let committed_at = record
+                .committed_at_millis
+                .unwrap_or(record.checkpoint.updated_at_millis);
+            return Ok(CommitCheckpointResult {
+                record: record.clone(),
+                committed_at_millis: committed_at,
+                globally_committed: true,
+            });
+        }
 
         if record.checkpoint.artifacts.is_empty() {
             return Err(CommitCheckpointError::InvalidState);
@@ -678,30 +861,24 @@ impl CoordinatorState {
             return Err(CommitCheckpointError::InvalidState);
         }
 
-        let committed_at_millis = if record.checkpoint.state == DomainCheckpointState::Committed {
+        let now_millis_val = now_millis();
+        if record.checkpoint.state == DomainCheckpointState::UploadInProgress {
             record
-                .committed_at_millis
-                .unwrap_or(record.checkpoint.updated_at_millis)
-        } else {
-            let now_millis = now_millis();
-            if record.checkpoint.state == DomainCheckpointState::UploadInProgress {
-                record
-                    .checkpoint
-                    .transition_to(DomainCheckpointState::Validating, now_millis)
-                    .map_err(map_commit_checkpoint_error)?;
-            }
-            if record.checkpoint.state == DomainCheckpointState::Validating {
-                record
-                    .checkpoint
-                    .transition_to(DomainCheckpointState::Committed, now_millis)
-                    .map_err(map_commit_checkpoint_error)?;
-            }
-            if record.checkpoint.state != DomainCheckpointState::Committed {
-                return Err(CommitCheckpointError::InvalidState);
-            }
-            record.committed_at_millis = Some(now_millis);
-            now_millis
-        };
+                .checkpoint
+                .transition_to(DomainCheckpointState::Validating, now_millis_val)
+                .map_err(map_commit_checkpoint_error)?;
+        }
+        if record.checkpoint.state == DomainCheckpointState::Validating {
+            record
+                .checkpoint
+                .transition_to(DomainCheckpointState::Committed, now_millis_val)
+                .map_err(map_commit_checkpoint_error)?;
+        }
+        if record.checkpoint.state != DomainCheckpointState::Committed {
+            return Err(CommitCheckpointError::InvalidState);
+        }
+        record.committed_at_millis = Some(now_millis_val);
+        let committed_at_millis = now_millis_val;
 
         let response = record.clone();
         drop(checkpoints);
@@ -726,6 +903,7 @@ impl CoordinatorState {
         Ok(CommitCheckpointResult {
             record: response,
             committed_at_millis,
+            globally_committed: true,
         })
     }
 
@@ -1184,6 +1362,9 @@ impl CoordinatorState {
             is_complete,
             updated_at: SystemTime::now(),
         };
+        // Gap 1: persist shard progress to the durable store so we can
+        // hydrate it on coordinator restart (resume-from-mid-shard).
+        self.persist_shard_progress(&record);
         self.shard_progress.insert(key, record);
 
         Ok(ReportedShardProgress {
@@ -1223,9 +1404,7 @@ impl CoordinatorState {
 
         let idempotency_key = worker_idempotency_key(&run_id, &request.idempotency_key);
         if !idempotency_key.is_empty() {
-            if let Some(existing_worker_id) =
-                self.worker_idempotency_keys.get(&idempotency_key)
-            {
+            if let Some(existing_worker_id) = self.worker_idempotency_keys.get(&idempotency_key) {
                 let existing_worker_id = existing_worker_id.clone();
                 let record = self
                     .workers_by_run
@@ -1349,10 +1528,9 @@ impl CoordinatorState {
         self.workers_by_run
             .get(&run_id.value)
             .and_then(|arc| {
-                arc.write()
-                    .unwrap()
-                    .get_mut(&worker_id.value)
-                    .map(|w| { w.next_heartbeat_deadline = deadline; })
+                arc.write().unwrap().get_mut(&worker_id.value).map(|w| {
+                    w.next_heartbeat_deadline = deadline;
+                })
             })
             .is_some()
     }
@@ -1367,10 +1545,9 @@ impl CoordinatorState {
         self.workers_by_run
             .get(&run_id.value)
             .and_then(|arc| {
-                arc.write()
-                    .unwrap()
-                    .get_mut(&worker_id.value)
-                    .map(|w| { w.failure_deadline = deadline; })
+                arc.write().unwrap().get_mut(&worker_id.value).map(|w| {
+                    w.failure_deadline = deadline;
+                })
             })
             .is_some()
     }
@@ -1470,8 +1647,7 @@ fn reconcile_worker_liveness(
                         worker.state = WorkerState::Stale as i32;
                         changed = true;
                     }
-                } else if worker.state == WorkerState::Stale as i32
-                    && worker.failure_deadline < now
+                } else if worker.state == WorkerState::Stale as i32 && worker.failure_deadline < now
                 {
                     worker.state = WorkerState::Failed as i32;
                     changed = true;
@@ -2074,7 +2250,7 @@ mod tests {
         let path = dir.path().join("coordinator.db");
         let store = SqliteMetadataStore::open(&path).unwrap();
         store.init_schema().unwrap();
-        let state = CoordinatorState::with_metadata_store(store);
+        let state = CoordinatorState::with_metadata_store(Arc::new(store));
 
         let run_id = state.register_run(register_request("run-key")).run_id;
         let worker_0 = state
@@ -2164,6 +2340,7 @@ mod tests {
             .commit_checkpoint(
                 run_id.value.clone(),
                 "checkpoint-1".to_string(),
+                String::new(), // legacy: no worker_id → skip vote gate
                 "commit".to_string(),
             )
             .unwrap();
@@ -2172,7 +2349,7 @@ mod tests {
 
         let reopened_store = SqliteMetadataStore::open(&path).unwrap();
         reopened_store.init_schema().unwrap();
-        let recreated = CoordinatorState::with_metadata_store(reopened_store);
+        let recreated = CoordinatorState::with_metadata_store(Arc::new(reopened_store));
 
         let latest = recreated
             .get_latest_checkpoint(run_id.value.clone())
@@ -2246,6 +2423,7 @@ mod tests {
             .commit_checkpoint(
                 run_id.value.clone(),
                 "ckpt-committed".to_string(),
+                String::new(),
                 "commit-1".to_string(),
             )
             .unwrap();
@@ -2283,6 +2461,7 @@ mod tests {
             .commit_checkpoint(
                 run_id.value.clone(),
                 "ckpt-committed-2".to_string(),
+                String::new(),
                 "commit-2".to_string(),
             )
             .unwrap();
@@ -2375,13 +2554,23 @@ mod tests {
     fn commit_checkpoint_requires_existing_run_and_checkpoint() {
         let state = CoordinatorState::default();
         let err = state
-            .commit_checkpoint("missing".to_string(), "ckpt-1".to_string(), String::new())
+            .commit_checkpoint(
+                "missing".to_string(),
+                "ckpt-1".to_string(),
+                String::new(),
+                String::new(),
+            )
             .expect_err("missing run should fail");
         assert_eq!(err, CommitCheckpointError::RunNotFound);
 
         let run_id = state.register_run(register_request("run-key")).run_id;
         let err = state
-            .commit_checkpoint(run_id.value, "missing-ckpt".to_string(), String::new())
+            .commit_checkpoint(
+                run_id.value,
+                "missing-ckpt".to_string(),
+                String::new(),
+                String::new(),
+            )
             .expect_err("missing checkpoint should fail");
         assert_eq!(err, CommitCheckpointError::CheckpointNotFound);
     }
@@ -2405,7 +2594,12 @@ mod tests {
             .unwrap();
 
         let err = state
-            .commit_checkpoint(run_id.value, "ckpt-1".to_string(), String::new())
+            .commit_checkpoint(
+                run_id.value,
+                "ckpt-1".to_string(),
+                String::new(),
+                String::new(),
+            )
             .expect_err("checkpoint without artifacts should fail");
         assert_eq!(err, CommitCheckpointError::InvalidState);
     }
@@ -2445,6 +2639,7 @@ mod tests {
             .commit_checkpoint(
                 run_id.value.clone(),
                 "ckpt-1".to_string(),
+                String::new(),
                 "commit-1".to_string(),
             )
             .expect("commit should succeed");
@@ -2471,11 +2666,207 @@ mod tests {
         );
 
         let repeated = state
-            .commit_checkpoint(run_id.value, "ckpt-1".to_string(), "commit-2".to_string())
+            .commit_checkpoint(
+                run_id.value,
+                "ckpt-1".to_string(),
+                String::new(),
+                "commit-2".to_string(),
+            )
             .expect("repeated commit should be harmless");
         assert_eq!(
             repeated.record.checkpoint.state,
             DomainCheckpointState::Committed
         );
+    }
+
+    /// Register a run with two workers, begin a checkpoint, and report one
+    /// artifact per worker.  Returns (run_id, worker_a, worker_b).
+    fn setup_two_worker_checkpoint(
+        state: &CoordinatorState,
+        checkpoint_id: &str,
+    ) -> (RunId, WorkerId, WorkerId) {
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_a = state
+            .register_worker(worker_request(run_id.clone(), "worker-a"))
+            .expect("worker a should register")
+            .worker_id;
+        let mut request_b = worker_request(run_id.clone(), "worker-b");
+        request_b.rank = 1;
+        let worker_b = state
+            .register_worker(request_b)
+            .expect("worker b should register")
+            .worker_id;
+
+        state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker_a.value.clone(),
+                checkpoint_id.to_string(),
+                1,
+                format!("begin-{checkpoint_id}"),
+            )
+            .expect("begin checkpoint should succeed");
+        for (index, worker) in [&worker_a, &worker_b].iter().enumerate() {
+            state
+                .report_checkpoint_artifact(
+                    run_id.value.clone(),
+                    worker.value.clone(),
+                    checkpoint_id.to_string(),
+                    format!("model-{index}.bin"),
+                    format!("s3://bucket/model-{index}.bin"),
+                    10,
+                    "sum".to_string(),
+                    "sha256".to_string(),
+                    format!("artifact-{checkpoint_id}-{index}"),
+                )
+                .expect("artifact report should succeed");
+        }
+        (run_id, worker_a, worker_b)
+    }
+
+    #[test]
+    fn commit_checkpoint_with_worker_votes_waits_for_all_workers() {
+        let state = CoordinatorState::default();
+        let (run_id, worker_a, worker_b) = setup_two_worker_checkpoint(&state, "ckpt-2pc");
+
+        // First vote: recorded but the global commit must wait.
+        let first = state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "ckpt-2pc".to_string(),
+                worker_a.value.clone(),
+                "c1".to_string(),
+            )
+            .expect("first vote should be accepted");
+        assert!(!first.globally_committed);
+        assert_ne!(
+            first.record.checkpoint.state,
+            DomainCheckpointState::Committed
+        );
+
+        // Duplicate vote from the same worker is idempotent — still pending.
+        let duplicate = state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "ckpt-2pc".to_string(),
+                worker_a.value.clone(),
+                "c1-dup".to_string(),
+            )
+            .expect("duplicate vote should be accepted");
+        assert!(!duplicate.globally_committed);
+
+        // Second worker's vote completes the global commit.
+        let second = state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "ckpt-2pc".to_string(),
+                worker_b.value.clone(),
+                "c2".to_string(),
+            )
+            .expect("final vote should commit");
+        assert!(second.globally_committed);
+        assert_eq!(
+            second.record.checkpoint.state,
+            DomainCheckpointState::Committed
+        );
+
+        // Any further commit is an idempotent no-op reporting global commit.
+        let repeat = state
+            .commit_checkpoint(
+                run_id.value,
+                "ckpt-2pc".to_string(),
+                worker_a.value,
+                "c3".to_string(),
+            )
+            .expect("post-commit vote should be harmless");
+        assert!(repeat.globally_committed);
+    }
+
+    #[test]
+    fn checkpoint_commit_votes_survive_coordinator_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("coordinator.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+        let state = CoordinatorState::with_metadata_store(Arc::new(store));
+
+        let (run_id, worker_a, worker_b) = setup_two_worker_checkpoint(&state, "ckpt-2pc");
+        let first = state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "ckpt-2pc".to_string(),
+                worker_a.value.clone(),
+                "c1".to_string(),
+            )
+            .expect("first vote should be accepted");
+        assert!(!first.globally_committed);
+        drop(state);
+
+        // Simulate a coordinator restart: reopen the store and rebuild state.
+        let reopened = SqliteMetadataStore::open(&path).unwrap();
+        reopened.init_schema().unwrap();
+        let recreated = CoordinatorState::with_metadata_store(Arc::new(reopened));
+
+        // Clients rebuild run/checkpoint state via idempotent re-registration.
+        let (run_id, _, worker_b_again) = setup_two_worker_checkpoint(&recreated, "ckpt-2pc");
+        assert_eq!(worker_b_again.value, worker_b.value);
+
+        // Worker A's pre-restart vote was hydrated from the store, so
+        // worker B's single vote must complete the global commit.
+        let second = recreated
+            .commit_checkpoint(
+                run_id.value,
+                "ckpt-2pc".to_string(),
+                worker_b.value,
+                "c2".to_string(),
+            )
+            .expect("post-restart vote should commit");
+        assert!(second.globally_committed);
+        assert_eq!(
+            second.record.checkpoint.state,
+            DomainCheckpointState::Committed
+        );
+    }
+
+    #[test]
+    fn shard_progress_survives_coordinator_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("coordinator.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+        let state = CoordinatorState::with_metadata_store(Arc::new(store));
+
+        let run_id = state.register_run(register_request("run-key")).run_id;
+        let worker_id = state
+            .register_worker(worker_request(run_id.clone(), "worker-key"))
+            .expect("worker should register")
+            .worker_id;
+        let dataset = state
+            .register_dataset(dataset_request(run_id.clone(), "dataset-key"))
+            .expect("dataset should register");
+        let dataset_id = dataset.dataset_id;
+        let shard_id = ShardId {
+            value: "shard-test-0".to_string(),
+        };
+
+        let reported = state
+            .report_shard_progress(&run_id, &worker_id, &dataset_id, &shard_id, 1, 42, false)
+            .expect("progress report should be accepted");
+        assert_eq!(reported.stored_progress_offset, 42);
+        drop(state);
+
+        // Simulate a coordinator restart.
+        let reopened = SqliteMetadataStore::open(&path).unwrap();
+        reopened.init_schema().unwrap();
+        let recreated = CoordinatorState::with_metadata_store(Arc::new(reopened));
+
+        // The offset must be visible immediately after hydration, without the
+        // worker having to re-send a progress report.
+        let progress = recreated
+            .get_shard_progress(&run_id, &dataset_id, &shard_id)
+            .expect("shard progress should be hydrated after restart");
+        assert_eq!(progress.progress_offset, 42);
+        assert_eq!(progress.worker_id, worker_id.value);
+        assert!(!progress.is_complete);
     }
 }

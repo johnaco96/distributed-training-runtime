@@ -31,7 +31,7 @@
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::persistence::{MetadataStore, PersistResult};
+use crate::persistence::{AuditEventEntry, MetadataStore, PersistResult, ShardProgressEntry};
 use crate::state::{
     CoordinatorCheckpointRecord, DatasetRecord, RunRecord, ShardRecord, WorkerRecord,
 };
@@ -142,12 +142,66 @@ CREATE TABLE IF NOT EXISTS latest_checkpoints (
   checkpoint_id        TEXT NOT NULL,
   committed_at_millis  BIGINT NOT NULL
 );
+
+-- Gap 1: shard progress — enables resume-from-mid-shard across coordinator restarts
+CREATE TABLE IF NOT EXISTS shard_progress (
+  run_id             TEXT NOT NULL,
+  dataset_id         TEXT NOT NULL,
+  shard_id           TEXT NOT NULL,
+  worker_id          TEXT NOT NULL,
+  lease_epoch        BIGINT NOT NULL,
+  progress_offset    BIGINT NOT NULL,
+  is_complete        BOOLEAN NOT NULL,
+  updated_at_millis  BIGINT NOT NULL,
+  PRIMARY KEY (run_id, dataset_id, shard_id)
+);
+
+-- Gap 2: per-worker checkpoint commit votes (distributed 2PC)
+CREATE TABLE IF NOT EXISTS checkpoint_commits (
+  run_id              TEXT NOT NULL,
+  checkpoint_id       TEXT NOT NULL,
+  worker_id           TEXT NOT NULL,
+  committed_at_millis BIGINT NOT NULL,
+  PRIMARY KEY (run_id, checkpoint_id, worker_id)
+);
+
+-- Gap 5: durable audit log
+CREATE TABLE IF NOT EXISTS audit_events (
+  id                 BIGSERIAL PRIMARY KEY,
+  occurred_at_millis BIGINT NOT NULL,
+  kind               TEXT,
+  outcome            TEXT,
+  subject            TEXT,
+  role               TEXT,
+  worker_id          TEXT,
+  run_id             TEXT,
+  dataset_id         TEXT,
+  checkpoint_id      TEXT,
+  reason             TEXT,
+  request_name       TEXT
+);
 "#,
         )
         .execute(&self.pool)
         .await?;
         info!("postgres metadata store: schema initialised");
         Ok(())
+    }
+
+    /// Attempt to acquire a PostgreSQL session-level advisory lock.
+    ///
+    /// Returns `true` if the lock was acquired (this replica is now the
+    /// leader), `false` if another replica already holds it (standby).
+    ///
+    /// The lock is automatically released when the database connection pool
+    /// is dropped (i.e. when the coordinator process exits), so the standby
+    /// takes over within one retry interval.
+    pub async fn try_acquire_advisory_lock(&self, key: i64) -> Result<bool, sqlx::Error> {
+        let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
     }
 
     /// Helper: run an async closure synchronously inside a Tokio worker thread.
@@ -212,10 +266,7 @@ ON CONFLICT (run_id, worker_id) DO UPDATE SET
         })
     }
 
-    fn load_workers_for_run(
-        &self,
-        run_id: &str,
-    ) -> PersistResult<Vec<(String, u32, u32, i32)>> {
+    fn load_workers_for_run(&self, run_id: &str) -> PersistResult<Vec<(String, u32, u32, i32)>> {
         self.block(async {
             let rows: Vec<(String, i32, i32, i32)> = sqlx::query_as(
                 "SELECT worker_id, rank, world_size, status FROM workers WHERE run_id = $1 ORDER BY worker_id",
@@ -492,14 +543,13 @@ ON CONFLICT (run_id) DO UPDATE SET
         dataset_id: &str,
     ) -> PersistResult<Option<(String, Vec<ShardRecord>)>> {
         self.block(async {
-            let name: Option<(String,)> = sqlx::query_as(
-                "SELECT name FROM datasets WHERE run_id = $1 AND dataset_id = $2",
-            )
-            .bind(run_id)
-            .bind(dataset_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let name: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM datasets WHERE run_id = $1 AND dataset_id = $2")
+                    .bind(run_id)
+                    .bind(dataset_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
             let Some((name,)) = name else {
                 return Ok(None);
@@ -530,6 +580,142 @@ ON CONFLICT (run_id) DO UPDATE SET
                 .collect();
 
             Ok(Some((name, shards)))
+        })
+    }
+
+    // ── Gap 1: shard progress ────────────────────────────────────────────────
+
+    fn save_shard_progress(&self, p: &ShardProgressEntry) -> PersistResult<()> {
+        self.block(async {
+            sqlx::query(
+                r#"
+INSERT INTO shard_progress
+  (run_id, dataset_id, shard_id, worker_id, lease_epoch, progress_offset, is_complete, updated_at_millis)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (run_id, dataset_id, shard_id) DO UPDATE SET
+  worker_id         = EXCLUDED.worker_id,
+  lease_epoch       = EXCLUDED.lease_epoch,
+  progress_offset   = EXCLUDED.progress_offset,
+  is_complete       = EXCLUDED.is_complete,
+  updated_at_millis = EXCLUDED.updated_at_millis
+"#,
+            )
+            .bind(&p.run_id)
+            .bind(&p.dataset_id)
+            .bind(&p.shard_id)
+            .bind(&p.worker_id)
+            .bind(p.lease_epoch as i64)
+            .bind(p.progress_offset)
+            .bind(p.is_complete)
+            .bind(p.updated_at_millis as i64)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+
+    fn load_all_shard_progress(&self) -> PersistResult<Vec<ShardProgressEntry>> {
+        // (run_id, dataset_id, shard_id, worker_id, lease_epoch,
+        //  progress_offset, is_complete, updated_at_millis)
+        type ShardProgressRow = (String, String, String, String, i64, i64, bool, i64);
+        self.block(async {
+            let rows: Vec<ShardProgressRow> = sqlx::query_as(
+                "SELECT run_id, dataset_id, shard_id, worker_id, lease_epoch, \
+                     progress_offset, is_complete, updated_at_millis FROM shard_progress",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(run_id, dataset_id, shard_id, worker_id, le, po, ic, ua)| {
+                        ShardProgressEntry {
+                            run_id,
+                            dataset_id,
+                            shard_id,
+                            worker_id,
+                            lease_epoch: le as u64,
+                            progress_offset: po,
+                            is_complete: ic,
+                            updated_at_millis: ua as u64,
+                        }
+                    },
+                )
+                .collect())
+        })
+    }
+
+    // ── Gap 2: checkpoint commit votes ───────────────────────────────────────
+
+    fn record_checkpoint_commit(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+        worker_id: &str,
+        committed_at_millis: u64,
+    ) -> PersistResult<()> {
+        self.block(async {
+            sqlx::query(
+                r#"
+INSERT INTO checkpoint_commits (run_id, checkpoint_id, worker_id, committed_at_millis)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (run_id, checkpoint_id, worker_id) DO NOTHING
+"#,
+            )
+            .bind(run_id)
+            .bind(checkpoint_id)
+            .bind(worker_id)
+            .bind(committed_at_millis as i64)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+
+    fn load_all_checkpoint_commits(&self) -> PersistResult<Vec<(String, String, String)>> {
+        self.block(async {
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT run_id, checkpoint_id, worker_id FROM checkpoint_commits \
+                 ORDER BY run_id, checkpoint_id",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            Ok(rows)
+        })
+    }
+
+    // ── Gap 5: durable audit log ─────────────────────────────────────────────
+
+    fn insert_audit_event(&self, event: &AuditEventEntry) -> PersistResult<()> {
+        self.block(async {
+            sqlx::query(
+                r#"
+INSERT INTO audit_events
+  (occurred_at_millis, kind, outcome, subject, role, worker_id,
+   run_id, dataset_id, checkpoint_id, reason, request_name)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+"#,
+            )
+            .bind(event.occurred_at_millis as i64)
+            .bind(&event.kind)
+            .bind(&event.outcome)
+            .bind(&event.subject)
+            .bind(&event.role)
+            .bind(&event.worker_id)
+            .bind(&event.run_id)
+            .bind(&event.dataset_id)
+            .bind(&event.checkpoint_id)
+            .bind(&event.reason)
+            .bind(&event.request_name)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         })
     }
 }

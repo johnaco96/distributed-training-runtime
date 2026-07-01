@@ -9,17 +9,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use runtime_coordinator::audit::{AuditEvent, AuditEventKind, AuditLogger, AuditOutcome};
+use runtime_coordinator::audit::{
+    AuditEvent, AuditEventKind, AuditLogger, AuditOutcome, DbAuditSink,
+};
 use runtime_coordinator::auth::{AuthMode, Authorizer};
-use runtime_storage::S3StorageConfig;
 use runtime_coordinator::ha_lock::CoordinatorLockGuard;
 use runtime_coordinator::init_tracing_from_env;
-use runtime_coordinator::persistence::SqliteMetadataStore;
+use runtime_coordinator::persistence::{MetadataStore, SqliteMetadataStore};
 use runtime_coordinator::pg_store::PostgresMetadataStore;
 use runtime_coordinator::service::CoordinatorServiceImpl;
 use runtime_coordinator::state::CoordinatorState;
 use runtime_coordinator::telemetry::render_prometheus_metrics;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorServiceServer;
+use runtime_storage::S3StorageConfig;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tracing::info;
 
@@ -61,7 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let audit = AuditLogger::tracing();
+    // Gap 5: build the audit logger; upgraded to DbAuditSink once the metadata
+    // store is initialised below.  Start with tracing-only so startup events
+    // are always captured even if the DB initialisation fails.
+    let mut audit = AuditLogger::tracing();
+
     let addr: SocketAddr = args.addr.parse()?;
     info!(%addr, "runtime-coordinator configured listen address");
 
@@ -70,6 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // Coordinator HA advisory-lock key: "DTRNCOOR" in ASCII (fits i64).
+    const PG_HA_LOCK_KEY: i64 = 0x4452_544e_434f_4f52;
 
     let state = if let Some(ref url) = args.metadata_db_url {
         // PostgreSQL: distributed, HA-capable, allows multiple coordinator replicas.
@@ -84,12 +93,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init_schema()
             .await
             .map_err(|e| format!("failed to init postgres schema: {e}"))?;
+
+        // Gap 3: PostgreSQL advisory lock for coordinator HA.
+        // Only one replica holds the lock at a time.  The standby polls until
+        // the leader releases it (process exit / connection drop), then takes over.
+        // While in standby the gRPC port is not bound so the k8s readiness probe
+        // (tcpSocket:50051) fails → k8s routes no traffic to the standby.
+        loop {
+            match store.try_acquire_advisory_lock(PG_HA_LOCK_KEY).await {
+                Ok(true) => {
+                    info!("coordinator HA: acquired PostgreSQL advisory lock — this replica is the leader");
+                    break;
+                }
+                Ok(false) => {
+                    info!("coordinator HA: advisory lock held by another replica — standing by (retry in 5s)");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                Err(e) => {
+                    return Err(format!("failed to check PostgreSQL advisory lock: {e}").into());
+                }
+            }
+        }
+
+        let store: Arc<dyn MetadataStore> = Arc::new(store);
+        // Gap 5: wire the durable DB audit sink now that the store is ready.
+        audit = AuditLogger::new(Arc::new(DbAuditSink::new(Arc::clone(&store))));
         Arc::new(CoordinatorState::with_metadata_store(store))
     } else if let Some(ref path) = args.metadata_db {
         // SQLite: single-node, local dev / small deployments.
         info!(metadata_db_path = %path, "runtime-coordinator using sqlite metadata store");
         let store = SqliteMetadataStore::open(path)?;
         store.init_schema()?;
+        let store: Arc<dyn MetadataStore> = Arc::new(store);
+        // Gap 5: wire the durable DB audit sink.
+        audit = AuditLogger::new(Arc::new(DbAuditSink::new(Arc::clone(&store))));
         Arc::new(CoordinatorState::with_metadata_store(store))
     } else {
         Arc::new(CoordinatorState::default())
@@ -259,10 +296,14 @@ fn print_usage() {
     println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--metadata-db-url <URL>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--max-s3-concurrent-ops <N>] [--help|-h]");
     println!("\nOptions:");
     println!("  --addr <ADDR>              Coordinator listen address (default: {DEFAULT_ADDR})");
-    println!("  --metadata-db <PATH>       Enable SQLite metadata persistence at PATH (single-node)");
+    println!(
+        "  --metadata-db <PATH>       Enable SQLite metadata persistence at PATH (single-node)"
+    );
     println!("  --metadata-db-url <URL>    PostgreSQL DSN for HA metadata (env: DTRUNTIME_METADATA_DB_URL)");
     println!("                             Example: postgres://user:pass@host:5432/dtruntime");
-    println!("  --storage-root <PATH>      Local staging area for StreamCheckpointArtifact (required)");
+    println!(
+        "  --storage-root <PATH>      Local staging area for StreamCheckpointArtifact (required)"
+    );
     println!("  --auth-mode <MODE>         Authorization mode: disabled|metadata (env: DTRUNTIME_AUTH_MODE)");
     println!("  --tls-cert <PATH>          Enable TLS with certificate chain PEM at PATH (requires --tls-key)");
     println!(
@@ -274,7 +315,9 @@ fn print_usage() {
     println!("  --s3-bucket <NAME>         S3 bucket for checkpoint artifact upload (env: DTRUNTIME_S3_BUCKET)");
     println!("  --s3-access-key <KEY>      S3 access key ID (env: DTRUNTIME_S3_ACCESS_KEY)");
     println!("  --s3-secret-key <SECRET>   S3 secret access key (env: DTRUNTIME_S3_SECRET_KEY)");
-    println!("  --s3-region <REGION>       S3 region (default: us-east-1, env: DTRUNTIME_S3_REGION)");
+    println!(
+        "  --s3-region <REGION>       S3 region (default: us-east-1, env: DTRUNTIME_S3_REGION)"
+    );
     println!("  --max-s3-concurrent-ops N  Max concurrent S3 operations (default: 64).");
     println!("                             Set >= world_size to avoid semaphore stalls at scale.");
     println!("  --no-verify-checkpoint-artifacts");
@@ -307,8 +350,7 @@ fn coordinator_args(
         s3_bucket: std::env::var("DTRUNTIME_S3_BUCKET").ok(),
         s3_access_key: std::env::var("DTRUNTIME_S3_ACCESS_KEY").ok(),
         s3_secret_key: std::env::var("DTRUNTIME_S3_SECRET_KEY").ok(),
-        s3_region: std::env::var("DTRUNTIME_S3_REGION")
-            .unwrap_or_else(|_| "us-east-1".to_string()),
+        s3_region: std::env::var("DTRUNTIME_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
         max_s3_concurrent_ops: None,
         verify_checkpoint_artifacts: true,
         show_help: false,
@@ -367,8 +409,7 @@ fn coordinator_args(
             }
             parsed.max_s3_concurrent_ops = Some(n);
         } else if arg == "--metadata-db-url" {
-            parsed.metadata_db_url =
-                Some(args.next().ok_or("--metadata-db-url requires a URL")?);
+            parsed.metadata_db_url = Some(args.next().ok_or("--metadata-db-url requires a URL")?);
         } else if arg == "--no-verify-checkpoint-artifacts" {
             parsed.verify_checkpoint_artifacts = false;
         } else if arg == "--help" || arg == "-h" {

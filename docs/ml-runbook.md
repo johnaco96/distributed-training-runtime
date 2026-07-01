@@ -1,8 +1,8 @@
-# ML Integration Runbook (Phase 18D)
+# ML Integration Runbook
 
 ## Purpose
 
-Phase 18 provides local, CPU-friendly ML integration examples that exercise deterministic training loops plus local checkpoint save/restore behavior:
+This runbook covers local, CPU-friendly ML integration examples that exercise deterministic training loops plus local checkpoint save/restore behavior:
 
 - single-worker training (`python/examples/pytorch_train.py`)
 - simulated distributed-style training (`python/examples/pytorch_simulated_distributed.py`)
@@ -98,7 +98,7 @@ rm -rf .dtruntime-pytorch-dist-smoke .dtruntime-pytorch-dist-no-checkpoint
 
 ## Validation checklist
 
-Run the following as a final pass for Phase 18 work:
+Run the following as a final local validation pass:
 
 ```bash
 cargo fmt
@@ -130,7 +130,7 @@ Simulated distributed output also includes:
 
 ## Honest scope boundaries
 
-Phase 18 does **not** prove:
+These examples do **not** prove:
 
 - real `torch.distributed` training
 - real multi-machine training
@@ -140,7 +140,7 @@ Phase 18 does **not** prove:
 - cloud/S3 checkpoint restore flows for ML examples (future work)
 
 
-## Coordinator-driven PyTorch example (Phase 20B)
+## Coordinator-driven PyTorch example
 
 Fresh run:
 
@@ -161,7 +161,7 @@ PYTHONPATH=python python python/examples/pytorch_coordinator_train.py --workers 
 ```
 
 
-## Phase 20C: Local PyTorch orchestration benchmark
+## Local PyTorch orchestration benchmark
 
 Use `python/examples/benchmark_pytorch_orchestration.py` to compare local standalone training (`pytorch_train.py`) versus local coordinator-driven training (`pytorch_coordinator_train.py`). It records wall-clock timings, overhead (seconds and percent), final loss/accuracy, checkpoint/resume status, and coordinator RPC summary when available. Results are emitted as JSON and CSV for reproducibility and automation.
 

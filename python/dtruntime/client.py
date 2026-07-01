@@ -371,14 +371,26 @@ class RuntimeClient:
         run_id: str,
         checkpoint_id: str,
         idempotency_key: str = "",
+        worker_id: str = "",
     ) -> "runtime_pb2.CommitCheckpointResponse":
-        """Commit a checkpoint with the coordinator and return its response."""
+        """Commit a checkpoint with the coordinator and return its response.
+
+        When ``worker_id`` is provided the coordinator records it as a 2PC
+        commit vote and only performs the global commit once every expected
+        worker has voted; the response's ``globally_committed`` flag reports
+        whether the global commit has happened.  An empty ``worker_id`` keeps
+        the legacy single-caller behaviour (rank 0 commits on behalf of all).
+        """
         request = self._runtime_pb2.CommitCheckpointRequest(
             run_id=self._runtime_pb2.RunId(value=run_id),
             checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
             idempotency_key=idempotency_key,
         )
-        return self._stub.CommitCheckpoint(request, metadata=self.rpc_metadata())
+        if worker_id:
+            request.worker_id.value = worker_id
+        return self._stub.CommitCheckpoint(
+            request, metadata=self.rpc_metadata(worker_id=worker_id or None)
+        )
 
     def restore_latest(
         self,

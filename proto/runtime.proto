@@ -312,11 +312,20 @@ message CommitCheckpointRequest {
   RunId run_id = 1;
   CheckpointId checkpoint_id = 2;
   string idempotency_key = 3;
+  // worker_id identifies the calling worker for distributed 2PC tracking.
+  // Each worker must call CommitCheckpoint with their own worker_id; the
+  // coordinator only performs the global commit once all expected workers
+  // have voted.  Leave empty for legacy single-caller behaviour.
+  WorkerId worker_id = 4;
 }
 
 message CommitCheckpointResponse {
   CheckpointState state = 1;
   google.protobuf.Timestamp committed_at = 2;
+  // globally_committed is true when all expected workers have committed and
+  // the checkpoint has been durably recorded.  When false the caller's vote
+  // was recorded but the global commit is still pending other workers.
+  bool globally_committed = 3;
 }
 
 message CheckpointManifest {

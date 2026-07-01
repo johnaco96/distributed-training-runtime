@@ -2,5 +2,4 @@
 
 Dataset metadata and sharding support.
 
-This crate is currently a Phase 3 skeleton. It intentionally does not include
-business logic yet.
+This crate provides dataset registration, shard assignment, and dataset metadata management for the coordinator.

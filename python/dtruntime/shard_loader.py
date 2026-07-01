@@ -282,13 +282,32 @@ class ShardLoader:
             shard_id = shard.shard_id.value
             shard_uri = shard.shard_uri
 
+            # Gap 1: resume-from-mid-shard.
+            # The coordinator returns the last persisted progress_offset, which
+            # we use as a record-count to skip on restart.  The offset is stored
+            # as number-of-records already processed (reported below as
+            # len(features) once the shard is fully consumed).
+            resume_offset = int(getattr(shard, "progress_offset", 0))
+
             features, labels = read_shard_uri(shard_uri)
+
+            # Skip records already processed in a prior (crashed) run.
+            if resume_offset > 0:
+                if resume_offset >= len(features):
+                    # Entire shard was consumed before the crash — skip it.
+                    continue
+                features = features[resume_offset:]
+                labels = labels[resume_offset:]
+
             shard_ids.append(shard_id)
             shard_data.append((features, labels))
 
-            # Report full consumption back to the coordinator so it can
-            # track data-plane progress and re-assign on worker failure.
-            bytes_read = features.nbytes + labels.nbytes
+            # Report progress back to the coordinator as a record count
+            # (total records in the shard, not bytes).  This lets the
+            # coordinator correctly skip the shard on the next restart even if
+            # individual record sizes vary between shards.
+            lease_epoch = int(getattr(shard, "lease_epoch", 0))
+            total_records_in_shard = resume_offset + len(features)
             prog_key = (
                 f"{idempotency_key}-prog-{shard_id}" if idempotency_key else ""
             )
@@ -297,8 +316,8 @@ class ShardLoader:
                 worker_id=self.worker_id,
                 dataset_id=self.dataset_id,
                 shard_id=shard_id,
-                lease_epoch=0,
-                progress_offset=bytes_read,
+                lease_epoch=lease_epoch,
+                progress_offset=total_records_in_shard,
                 is_complete=True,
                 idempotency_key=prog_key,
             )

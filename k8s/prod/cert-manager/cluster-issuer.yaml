@@ -1,0 +1,45 @@
+# Gap 4: Production PKI — self-signed CA via cert-manager
+#
+# This ClusterIssuer creates a self-signed CA certificate that is stored in
+# the Secret referenced below.  The CA is then used by the Certificate resource
+# (coordinator-certificate.yaml) to sign the coordinator's TLS leaf certificate.
+#
+# Installation:
+#   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.14.5/cert-manager.yaml
+#   kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=120s
+#   kubectl apply -f k8s/prod/cert-manager/cluster-issuer.yaml
+---
+# Step 1: a self-signed issuer for bootstrapping
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: dtruntime-selfsigned-issuer
+spec:
+  selfSigned: {}
+---
+# Step 2: generate the root CA certificate using the self-signed issuer
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dtruntime-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: dtruntime-ca
+  secretName: dtruntime-ca-secret
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: dtruntime-selfsigned-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+# Step 3: an issuer backed by the root CA — used to sign leaf certificates
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: dtruntime-ca-issuer
+spec:
+  ca:
+    secretName: dtruntime-ca-secret

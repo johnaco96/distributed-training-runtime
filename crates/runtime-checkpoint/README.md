@@ -2,5 +2,4 @@
 
 Checkpoint state machine, manifests, and commit protocol.
 
-This crate is currently a Phase 3 skeleton. It intentionally does not include
-business logic yet.
+This crate implements the checkpoint state machine, artifact integrity validation, concurrent artifact upload helpers, and commit protocol used by the coordinator.

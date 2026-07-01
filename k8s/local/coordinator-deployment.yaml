@@ -15,13 +15,11 @@ spec:
     spec:
       containers:
         - name: coordinator
-          image: distributed-training-runtime:local
+          image: distributed-training-runtime:dev
           imagePullPolicy: IfNotPresent
           args:
             - "--addr"
             - "0.0.0.0:50051"
-            - "--metrics-addr"
-            - "0.0.0.0:9090"
             - "--storage-root"
             - "/tmp/dtr-artifacts"
             # --metadata-db-url wires the coordinator to PostgreSQL.
@@ -49,28 +47,23 @@ spec:
           ports:
             - containerPort: 50051
               name: grpc
-            - containerPort: 9090
-              name: metrics
           readinessProbe:
-            httpGet:
-              path: /readyz
-              port: metrics
+            tcpSocket:
+              port: grpc
             initialDelaySeconds: 3
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
           livenessProbe:
-            httpGet:
-              path: /healthz
-              port: metrics
+            tcpSocket:
+              port: grpc
             initialDelaySeconds: 10
             periodSeconds: 20
             timeoutSeconds: 2
             failureThreshold: 3
           startupProbe:
-            httpGet:
-              path: /healthz
-              port: metrics
+            tcpSocket:
+              port: grpc
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 12

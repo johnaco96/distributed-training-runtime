@@ -113,7 +113,9 @@ def test_example_uses_separate_admin_and_worker_identity_paths() -> None:
     source = Path(MODULE).read_text(encoding="utf-8")
     assert "admin_client.register_run(" in source
     assert "worker_clients[worker_id].register_worker(" in source
-    assert "worker_clients[worker_id].request_shard(" in source
+    # Shard requests moved into ShardLoader; it must be constructed with the
+    # worker-scoped client so GetShardAssignment carries the worker identity.
+    assert "worker_clients[worker_id], run_id, worker_id, dataset_id" in source
     assert "worker_clients[worker_id].heartbeat(" in source
     assert "admin_client.commit_checkpoint(" in source
 

@@ -1,0 +1,99 @@
+# Production coordinator deployment — 2 replicas with HA advisory lock
+#
+# Gaps covered:
+#   3 — Coordinator HA via PostgreSQL advisory lock (replicas: 2, only
+#         leader binds gRPC port; standby readiness probe fails until takeover)
+#   4 — Production PKI: TLS cert from cert-manager mounted at /tls/
+#
+# Prerequisites:
+#   - PostgreSQL Secret "postgres-credentials" with DATABASE_URL key
+#   - cert-manager ClusterIssuer + Certificate applied from k8s/prod/cert-manager/
+#   - Namespace dtruntime exists with label app.kubernetes.io/part-of: dtruntime
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runtime-coordinator
+  namespace: dtruntime
+  labels:
+    app: runtime-coordinator
+    version: production-hardening
+spec:
+  # Two replicas: one leader (holds PG advisory lock, serves gRPC) and one
+  # hot standby (blocked in the advisory-lock loop, gRPC port not bound).
+  # If the leader pod dies the standby acquires the lock within ~5 s and
+  # starts serving — k8s re-routes traffic once its readiness probe passes.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: runtime-coordinator
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: runtime-coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: distributed-training-runtime:prod
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--addr"
+            - "0.0.0.0:50051"
+            - "--storage-root"
+            - "/tmp/dtr-artifacts"
+            # PostgreSQL DSN — enables HA advisory lock + durable metadata
+            - "--metadata-db-url"
+            - "$(DTRUNTIME_METADATA_DB_URL)"
+            # Gap 4: TLS certificate provisioned by cert-manager
+            - "--tls-cert"
+            - "/tls/tls.crt"
+            - "--tls-key"
+            - "/tls/tls.key"
+            # Raise S3 semaphore (see flamegraph P0 optimisation)
+            - "--max-s3-concurrent-ops"
+            - "128"
+          env:
+            - name: DTRUNTIME_METADATA_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+          ports:
+            - containerPort: 50051
+              name: grpc
+          volumeMounts:
+            # Gap 4: TLS certificate secret mounted from cert-manager
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          readinessProbe:
+            # TCP probe: only the leader binds port 50051 (standby is blocked
+            # in the advisory-lock retry loop).  Failing probe keeps the standby
+            # out of the Service endpoints until it becomes leader.
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # NOTE: intentionally no livenessProbe/startupProbe.  The standby
+          # never binds the gRPC port while waiting for the advisory lock, so
+          # a TCP liveness/startup probe would kill the hot standby in a
+          # permanent restart loop.  The kubelet already restarts the container
+          # if the process exits; readiness alone gates traffic to the leader.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: tls
+          secret:
+            secretName: dtruntime-coordinator-tls

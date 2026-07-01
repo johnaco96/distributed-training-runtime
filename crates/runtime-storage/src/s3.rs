@@ -171,12 +171,12 @@ impl S3Storage {
     }
 
     fn sync_rt(&self) -> Result<&tokio::runtime::Runtime, StorageError> {
-        self.rt
-            .as_deref()
-            .ok_or_else(|| StorageError::Io(std::io::Error::other(
+        self.rt.as_deref().ok_or_else(|| {
+            StorageError::Io(std::io::Error::other(
                 "S3Storage was created with new_async(); use put_async() instead of the \
                  synchronous StorageBackend methods",
-            )))
+            ))
+        })
     }
 }
 
