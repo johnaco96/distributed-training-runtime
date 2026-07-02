@@ -32,16 +32,26 @@ The following capabilities are implemented and locally validated:
 - Rank replacement after worker failure and elastic world-size changes
   (min/max worker bounds with a settle window).
 - DDP, FSDP, and DeepSpeed strategy wrappers (`dtruntime.strategies`).
+- Kubernetes operator (`runtime-operator`, kube-rs): TrainingRun CRD,
+  managed-coordinator rendering, Indexed worker Jobs, status projection
+  (see `docs/kubernetes-operator.md`).
+- Scheduler backends: plain Kubernetes Jobs, Volcano gang scheduling, Kueue
+  queue admission; documented submitter contract for Slurm/Ray/SageMaker/AWS
+  Batch (see `docs/schedulers.md`).
+- GPU/accelerator requests, node selectors, tolerations, affinity, topology
+  spread constraints, and priority classes on TrainingRun specs.
 
 ## Current limitations and non-goals
 
 This project currently does **not** claim:
 
-- Production scheduler integration.
-- Production Kubernetes deployment/orchestration support (beyond local/dev manifests).
 - Multi-node training validated on a real GPU cluster (the torch.distributed
-  path is validated with multi-process gloo on a single machine; NCCL
-  multi-node uses the same rendezvous protocol but is not yet cluster-proven).
+  path is validated with multi-process gloo on a single machine and in kind;
+  NCCL multi-node uses the same rendezvous protocol but is not yet
+  cluster-proven).
+- Volcano/Kueue backends exercised against real Volcano/Kueue installations
+  (adaptation logic is unit-tested; the rendered objects follow those
+  projects' documented contracts).
 - Production-ready cloud deployment posture.
 - Proven production fault tolerance at scale.
 - Large-scale benchmark claims without measured evidence.

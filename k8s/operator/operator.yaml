@@ -1,0 +1,91 @@
+# runtime-operator deployment: RBAC + Deployment.
+#
+# Apply after the CRD:
+#   kubectl apply -f k8s/operator/crd-trainingrun.yaml
+#   kubectl apply -f k8s/operator/operator.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dtruntime-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: runtime-operator
+  namespace: dtruntime-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: runtime-operator
+rules:
+  # The operator's own resources.
+  - apiGroups: ["dtruntime.io"]
+    resources: ["trainingruns", "trainingruns/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Rendered workload objects.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  # Scheduler integrations (only exercised when a TrainingRun selects them).
+  - apiGroups: ["scheduling.volcano.sh"]
+    resources: ["podgroups"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: runtime-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: runtime-operator
+subjects:
+  - kind: ServiceAccount
+    name: runtime-operator
+    namespace: dtruntime-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: runtime-operator
+  namespace: dtruntime-system
+  labels:
+    app.kubernetes.io/name: runtime-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: runtime-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: runtime-operator
+    spec:
+      serviceAccountName: runtime-operator
+      containers:
+        - name: operator
+          # Build with: docker build -f Dockerfile.operator -t <registry>/runtime-operator:<tag> .
+          image: ghcr.io/example/runtime-operator:latest
+          command: ["runtime-operator"]
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
