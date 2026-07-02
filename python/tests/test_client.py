@@ -237,6 +237,15 @@ def install_fake_generated_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, "dtruntime.generated.runtime_pb2", runtime_pb2)
     monkeypatch.setitem(sys.modules, "dtruntime.generated.runtime_pb2_grpc", runtime_pb2_grpc)
 
+    # `from dtruntime.generated import runtime_pb2` resolves through the
+    # package attribute when the real submodule was already imported by an
+    # earlier test, bypassing the sys.modules fakes above — patch the package
+    # attributes too so these tests stay hermetic regardless of ordering.
+    generated_pkg = sys.modules.get("dtruntime.generated")
+    if generated_pkg is not None:
+        monkeypatch.setattr(generated_pkg, "runtime_pb2", runtime_pb2, raising=False)
+        monkeypatch.setattr(generated_pkg, "runtime_pb2_grpc", runtime_pb2_grpc, raising=False)
+
     return grpc_module, runtime_pb2_grpc, stub, channel, creds
 
 

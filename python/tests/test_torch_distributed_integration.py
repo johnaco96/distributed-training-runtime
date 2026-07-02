@@ -41,17 +41,29 @@ def _free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _start_coordinator(log_dir: Path) -> tuple[subprocess.Popen, str]:
-    port = _free_tcp_port()
-    address = f"127.0.0.1:{port}"
+def _start_coordinator(
+    log_dir: Path, extra_args: list[str] | None = None
+) -> tuple[subprocess.Popen, str]:
+    address = f"127.0.0.1:{_free_tcp_port()}"
+    process = _restart_coordinator(log_dir, address, extra_args)
+    return process, address
+
+
+def _restart_coordinator(
+    log_dir: Path, address: str, extra_args: list[str] | None = None
+) -> subprocess.Popen:
     # Coordinator output goes to files, never PIPE: these tests keep the
     # coordinator running for minutes under polling load, and an undrained
     # 64 KB pipe buffer would eventually block its logging (and with it every
     # RPC handler).
-    stdout = (log_dir / "coordinator.stdout.log").open("w", encoding="utf-8")
-    stderr = (log_dir / "coordinator.stderr.log").open("w", encoding="utf-8")
+    stdout = (log_dir / "coordinator.stdout.log").open("a", encoding="utf-8")
+    stderr = (log_dir / "coordinator.stderr.log").open("a", encoding="utf-8")
     process = subprocess.Popen(
-        ["cargo", "run", "-p", "runtime-coordinator", "--", "--addr", address],
+        [
+            "cargo", "run", "-p", "runtime-coordinator", "--",
+            "--addr", address,
+            *(extra_args or []),
+        ],
         cwd=REPO_ROOT,
         stdout=stdout,
         stderr=stderr,
@@ -68,7 +80,7 @@ def _start_coordinator(log_dir: Path) -> tuple[subprocess.Popen, str]:
         channel = grpc.insecure_channel(address)
         try:
             grpc.channel_ready_future(channel).result(timeout=1)
-            return process, address
+            return process
         except Exception:
             pass
         finally:
@@ -157,6 +169,167 @@ def test_ddp_training_via_launcher_completes(tmp_path: Path) -> None:
         # Both workers observed the same rendezvous round.
         assert len({r["round"] for r in reports}) == 1
     finally:
+        _stop(coordinator)
+
+
+def test_cancel_run_stops_training_without_restart(tmp_path: Path) -> None:
+    """Admin cancellation: workers observe RUN_STATE_CANCELLED via heartbeat,
+    exit, and the launcher stops without burning its restart budget."""
+    _gate()
+    import grpc  # noqa: F401 - gated above
+
+    from dtruntime import RuntimeClient
+    from dtruntime.generated import runtime_pb2
+
+    coordinator, address = _start_coordinator(tmp_path)
+    try:
+        run_name = f"ddp-cancel-{uuid.uuid4().hex[:8]}"
+        admin = RuntimeClient(address)
+        run_id = admin.register_run(
+            run_name=run_name,
+            world_size=2,
+            assignment_policy=runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
+            storage_backend_kind=runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
+            idempotency_key=f"launch-{run_name}",
+        ).run_id.value
+
+        env = dict(os.environ)
+        env.update(
+            {
+                "PYTHONPATH": str(REPO_ROOT / "python"),
+                "DTRUNTIME_TEST_DIR": str(tmp_path),
+                "DTRUNTIME_HEARTBEAT_INTERVAL": "1",
+                "DTRUNTIME_WORKER_HOST": "127.0.0.1",
+                # ~0.1s per step x 3000 steps: training stays busy until cancelled.
+                "DTRUNTIME_TEST_STEP_DELAY": "0.1",
+            }
+        )
+        launcher = subprocess.Popen(
+            [
+                sys.executable, "-m", "dtruntime.launch",
+                "--coordinator", address,
+                "--run-name", run_name,
+                "--run-id", run_id,
+                "--nproc-per-node", "2",
+                "--world-size", "2",
+                "--backend", "gloo",
+                "--worker-host", "127.0.0.1",
+                str(EXAMPLE), "--steps", "3000",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+        )
+
+        # Give the workers time to rendezvous and start stepping, then cancel.
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            status = admin.get_run_status(run_id)
+            if status.state == runtime_pb2.RUN_STATE_RUNNING:
+                break
+            assert launcher.poll() is None, "launcher exited before training started"
+            time.sleep(1)
+        else:
+            pytest.fail("run never reached RUNNING")
+
+        admin.cancel_run(run_id, reason="integration test")
+
+        code = launcher.wait(timeout=120)
+        assert code == 3, f"launcher must exit 3 for a cancelled run, got {code}"
+        status = admin.get_run_status(run_id)
+        assert status.state == runtime_pb2.RUN_STATE_CANCELLED
+        assert "integration test" in status.state_reason
+        admin.close()
+    finally:
+        _stop(coordinator)
+
+
+def test_coordinator_restart_mid_training_is_transparent(tmp_path: Path) -> None:
+    """Coordinator failover semantics: kill the coordinator mid-training and
+    restart it on the same metadata DB.  The process group is independent of
+    the coordinator, worker heartbeats retry through the outage, run/worker
+    state rehydrates from the store, and training completes normally."""
+    _gate()
+    from dtruntime import RuntimeClient
+    from dtruntime.generated import runtime_pb2
+
+    db_path = tmp_path / "coordinator.db"
+    coordinator, address = _start_coordinator(
+        tmp_path, extra_args=["--metadata-db", str(db_path)]
+    )
+    launcher = None
+    try:
+        run_name = f"ddp-failover-{uuid.uuid4().hex[:8]}"
+        env = dict(os.environ)
+        env.update(
+            {
+                "PYTHONPATH": str(REPO_ROOT / "python"),
+                "DTRUNTIME_TEST_DIR": str(tmp_path),
+                "DTRUNTIME_HEARTBEAT_INTERVAL": "1",
+                "DTRUNTIME_WORKER_HOST": "127.0.0.1",
+                # ~40s of training: enough to cover the coordinator outage.
+                "DTRUNTIME_TEST_STEP_DELAY": "0.1",
+            }
+        )
+        launcher = subprocess.Popen(
+            [
+                sys.executable, "-m", "dtruntime.launch",
+                "--coordinator", address,
+                "--run-name", run_name,
+                "--nproc-per-node", "2",
+                "--world-size", "2",
+                "--backend", "gloo",
+                "--worker-host", "127.0.0.1",
+                str(EXAMPLE), "--steps", "400",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+        )
+
+        admin = RuntimeClient(address)
+        deadline = time.monotonic() + 120
+        run_id = None
+        while time.monotonic() < deadline:
+            try:
+                run_id = admin.register_run(
+                    run_name=run_name,
+                    world_size=2,
+                    assignment_policy=runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
+                    storage_backend_kind=runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
+                    idempotency_key=f"launch-{run_name}",
+                ).run_id.value
+                if admin.get_run_status(run_id).state == runtime_pb2.RUN_STATE_RUNNING:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            pytest.fail("run never reached RUNNING")
+        admin.close()
+
+        # Hard-kill the coordinator mid-training and restart on the same DB
+        # and address.
+        coordinator.kill()
+        coordinator.wait(timeout=30)
+        time.sleep(3)
+        coordinator = _restart_coordinator(
+            tmp_path, address, extra_args=["--metadata-db", str(db_path)]
+        )
+
+        code = launcher.wait(timeout=300)
+        assert code == 0, "training must survive a coordinator restart"
+
+        reports = _load_reports(tmp_path)
+        assert len(reports) == 2
+        assert all(r["param_sum_spread"] < 1e-5 for r in reports)
+
+        # The rehydrated run reached COMPLETED via graceful deregistration.
+        admin = RuntimeClient(address)
+        status = admin.get_run_status(run_id)
+        assert status.state == runtime_pb2.RUN_STATE_COMPLETED, status.state_reason
+        admin.close()
+    finally:
+        if launcher is not None and launcher.poll() is None:
+            launcher.kill()
         _stop(coordinator)
 
 

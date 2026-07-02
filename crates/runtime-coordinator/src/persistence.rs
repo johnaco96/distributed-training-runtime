@@ -59,6 +59,9 @@ pub struct AuditEventEntry {
 pub trait MetadataStore: Send + Sync {
     // ── original methods ──────────────────────────────────────────────────────
     fn save_run(&self, run: &RunRecord) -> PersistResult<()>;
+    /// Load every persisted run.  Called once on coordinator startup to
+    /// re-hydrate the run registry (durable run lifecycle states).
+    fn load_all_runs(&self) -> PersistResult<Vec<RunRecord>>;
     fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> PersistResult<()>;
     fn load_workers_for_run(&self, run_id: &str) -> PersistResult<Vec<(String, u32, u32, i32)>>;
     fn save_dataset(&self, d: &DatasetRecord) -> PersistResult<()>;
@@ -144,7 +147,16 @@ CREATE TABLE IF NOT EXISTS runs (
   name TEXT NOT NULL,
   status INTEGER NOT NULL,
   created_at_millis INTEGER NOT NULL,
-  idempotency_key TEXT
+  idempotency_key TEXT,
+  run_state INTEGER NOT NULL DEFAULT 1,
+  state_reason TEXT NOT NULL DEFAULT '',
+  world_size INTEGER NOT NULL DEFAULT 0,
+  min_world_size INTEGER NOT NULL DEFAULT 0,
+  max_world_size INTEGER NOT NULL DEFAULT 0,
+  settle_timeout_ms INTEGER NOT NULL DEFAULT 0,
+  assignment_policy INTEGER NOT NULL DEFAULT 0,
+  storage_backend_kind INTEGER NOT NULL DEFAULT 0,
+  run_version TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS workers (
   run_id TEXT NOT NULL,
@@ -239,13 +251,93 @@ CREATE TABLE IF NOT EXISTS audit_events (
   request_name       TEXT
 );
 ",
-        )
+        )?;
+        // Best-effort migration for databases created before the run
+        // lifecycle columns existed.  SQLite has no ADD COLUMN IF NOT EXISTS;
+        // a duplicate-column error means the column is already present.
+        // (A real migration framework lands with the Phase 6 storage work.)
+        for ddl in [
+            "ALTER TABLE runs ADD COLUMN run_state INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE runs ADD COLUMN state_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE runs ADD COLUMN world_size INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE runs ADD COLUMN min_world_size INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE runs ADD COLUMN max_world_size INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE runs ADD COLUMN settle_timeout_ms INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE runs ADD COLUMN assignment_policy INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE runs ADD COLUMN storage_backend_kind INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE runs ADD COLUMN run_version TEXT NOT NULL DEFAULT ''",
+        ] {
+            match conn.execute(ddl, []) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     pub fn save_run(&self, run: &RunRecord) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite");
-        conn.execute("INSERT OR REPLACE INTO runs(run_id,name,status,created_at_millis,idempotency_key) VALUES(?1,?2,?3,?4,NULL)",params![run.run_id,run.run_name,run.latest_checkpoint_state, to_millis(run.registered_at)])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO runs(run_id,name,status,created_at_millis,idempotency_key,\
+             run_state,state_reason,world_size,min_world_size,max_world_size,settle_timeout_ms,\
+             assignment_policy,storage_backend_kind,run_version) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                run.run_id,
+                run.run_name,
+                run.latest_checkpoint_state,
+                to_millis(run.registered_at),
+                if run.idempotency_key.is_empty() {
+                    None
+                } else {
+                    Some(run.idempotency_key.as_str())
+                },
+                run.state,
+                run.state_reason,
+                run.world_size,
+                run.min_world_size,
+                run.max_world_size,
+                run.rendezvous_settle_timeout_ms,
+                run.assignment_policy,
+                run.storage_backend_kind,
+                run.run_version,
+            ],
+        )?;
         Ok(())
+    }
+
+    pub fn load_all_runs(&self) -> rusqlite::Result<Vec<RunRecord>> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn.prepare(
+            "SELECT run_id,name,created_at_millis,idempotency_key,run_state,state_reason,\
+             world_size,min_world_size,max_world_size,settle_timeout_ms,assignment_policy,\
+             storage_backend_kind,run_version FROM runs ORDER BY run_id",
+        )?;
+        let runs = stmt
+            .query_map([], |r| {
+                Ok(RunRecord {
+                    run_id: r.get(0)?,
+                    run_name: r.get(1)?,
+                    registered_at: from_millis(r.get::<_, u64>(2)?),
+                    idempotency_key: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    state: r.get(4)?,
+                    state_reason: r.get(5)?,
+                    world_size: r.get(6)?,
+                    min_world_size: r.get(7)?,
+                    max_world_size: r.get(8)?,
+                    rendezvous_settle_timeout_ms: r.get(9)?,
+                    assignment_policy: r.get(10)?,
+                    storage_backend_kind: r.get(11)?,
+                    run_version: r.get(12)?,
+                    active_worker_count: 0,
+                    latest_checkpoint_id: None,
+                    latest_checkpoint_state: 0,
+                    state_updated_at: std::time::SystemTime::now(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(runs)
     }
     pub fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite");
@@ -500,6 +592,9 @@ impl MetadataStore for SqliteMetadataStore {
     fn save_run(&self, run: &RunRecord) -> PersistResult<()> {
         self.save_run(run).map_err(|e| Box::new(e) as _)
     }
+    fn load_all_runs(&self) -> PersistResult<Vec<RunRecord>> {
+        self.load_all_runs().map_err(|e| Box::new(e) as _)
+    }
     fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> PersistResult<()> {
         self.save_worker(w, world_size)
             .map_err(|e| Box::new(e) as _)
@@ -585,6 +680,10 @@ fn to_millis(t: std::time::SystemTime) -> i64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn from_millis(millis: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)
 }
 
 #[cfg(test)]

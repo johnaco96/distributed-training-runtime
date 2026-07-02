@@ -82,17 +82,22 @@ def rendezvous(
     """
     resolved_host = host or default_host()
     proposed_port = store_port if store_port is not None else free_port()
-
-    response = client.join_rendezvous(
-        run_id=run_id,
-        worker_id=worker_id,
-        host=resolved_host,
-        store_port=proposed_port,
-    )
-    info = response.info
-    joined_round = info.round
-
     deadline = time.monotonic() + timeout
+    joined_round = 0
+
+    def join() -> object:
+        return client.join_rendezvous(
+            run_id=run_id,
+            worker_id=worker_id,
+            host=resolved_host,
+            store_port=proposed_port,
+            previous_round=joined_round,
+        ).info
+
+    info = _with_failover_retry(join, deadline, poll_interval, run_id)
+    joined_round = info.round
+    needs_rejoin = False
+
     while True:
         if _is_complete(info):
             if info.has_rank:
@@ -106,15 +111,9 @@ def rendezvous(
             # The round completed without ranking this worker (it arrived
             # after an elastic round filled up).  Re-join to trigger the next
             # round rather than spinning on a round we can never be part of.
-            response = client.join_rendezvous(
-                run_id=run_id,
-                worker_id=worker_id,
-                host=resolved_host,
-                store_port=proposed_port,
-                previous_round=joined_round,
-            )
-            info = response.info
+            info = _with_failover_retry(join, deadline, poll_interval, run_id)
             joined_round = info.round
+            continue
 
         if time.monotonic() >= deadline:
             raise RendezvousTimeout(
@@ -122,7 +121,59 @@ def rendezvous(
                 f"(round {info.round}, {info.world_size} worker(s) joined)"
             )
         time.sleep(poll_interval)
-        info = client.get_rendezvous_state(run_id=run_id, worker_id=worker_id).info
+        if needs_rejoin:
+            # Recovering from a coordinator failover: our membership was
+            # in-memory, so re-assert it rather than polling a rendezvous the
+            # new leader has never heard of.
+            info = _with_failover_retry(join, deadline, poll_interval, run_id)
+            joined_round = info.round
+            needs_rejoin = False
+            continue
+        try:
+            info = client.get_rendezvous_state(run_id=run_id, worker_id=worker_id).info
+        except Exception as exc:  # noqa: BLE001
+            if not _is_transient_rpc_error(exc):
+                raise
+            needs_rejoin = True
+
+
+def _is_transient_rpc_error(exc: Exception) -> bool:
+    """True for transport-level failures worth retrying across a coordinator
+    restart/failover.  Application errors (terminal run, not-found, auth)
+    must propagate."""
+    try:
+        import grpc
+    except ImportError:  # pragma: no cover
+        return False
+    if not isinstance(exc, grpc.RpcError):
+        return False
+    code = exc.code()
+    return code in (
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.UNKNOWN,
+    )
+
+
+def _with_failover_retry(call, deadline: float, poll_interval: float, run_id: str):
+    """Invoke ``call`` until it succeeds or the rendezvous deadline passes.
+
+    Coordinator failover semantics: mutating calls carry idempotency keys and
+    rendezvous membership is re-assertable, so retrying transient transport
+    errors is safe.  Application errors propagate immediately.
+    """
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return call()
+        except Exception as exc:  # noqa: BLE001
+            if not _is_transient_rpc_error(exc):
+                raise
+            last_error = exc
+            time.sleep(max(poll_interval, 0.2))
+    raise RendezvousTimeout(
+        f"rendezvous RPCs for run {run_id} kept failing until the deadline: {last_error}"
+    )
 
 
 def _is_complete(info: object) -> bool:
