@@ -53,6 +53,27 @@ class MembershipChanged(RuntimeError):
     """
 
 
+class RunTerminated(RuntimeError):
+    """Raised when the run reached a terminal lifecycle state (cancelled or
+    failed) — the worker should stop training and exit."""
+
+    def __init__(self, run_state: int, message: str) -> None:
+        super().__init__(message)
+        self.run_state = run_state
+
+
+# RunState values mirrored from proto (numeric so this module never imports
+# generated code at import time).
+RUN_STATE_FAILED = 5
+RUN_STATE_CANCELLED = 6
+_TERMINAL_RUN_STATES = {4, 5, 6}  # completed, failed, cancelled
+
+# DeregisterReason values mirrored from proto.
+DEREGISTER_COMPLETED = 1
+DEREGISTER_PREEMPTED = 2
+DEREGISTER_ERROR = 3
+
+
 class _HeartbeatThread(threading.Thread):
     """Sends worker heartbeats and watches the rendezvous round.
 
@@ -68,6 +89,7 @@ class _HeartbeatThread(threading.Thread):
         worker_id: str,
         interval_seconds: float,
         membership_changed: threading.Event,
+        run_terminated: threading.Event,
     ) -> None:
         super().__init__(name=f"dtruntime-heartbeat-{worker_id}", daemon=True)
         self._client = client
@@ -75,6 +97,8 @@ class _HeartbeatThread(threading.Thread):
         self._worker_id = worker_id
         self._interval = interval_seconds
         self._membership_changed = membership_changed
+        self._run_terminated = run_terminated
+        self.terminal_run_state = 0
         self._stop = threading.Event()
         self._joined_round_lock = threading.Lock()
         self._joined_round = 0
@@ -96,6 +120,13 @@ class _HeartbeatThread(threading.Thread):
             except Exception as exc:  # noqa: BLE001 - keep heartbeating through transient errors
                 logger.warning("heartbeat failed (will retry): %s", exc)
                 continue
+            run_state = int(getattr(response, "run_state", 0))
+            if run_state in _TERMINAL_RUN_STATES:
+                if not self._run_terminated.is_set():
+                    logger.info("run reached terminal state %d; signalling exit", run_state)
+                self.terminal_run_state = run_state
+                self._run_terminated.set()
+                return
             with self._joined_round_lock:
                 joined = self._joined_round
             if joined and response.rendezvous_round > joined:
@@ -129,12 +160,14 @@ class TrainingContext:
         self._backend = backend
         self._pg_timeout = process_group_timeout
         self.membership_changed = threading.Event()
+        self.run_terminated = threading.Event()
         self._heartbeat = _HeartbeatThread(
             client,
             run_id,
             worker_id,
             heartbeat_interval,
             self.membership_changed,
+            self.run_terminated,
         )
         self._rendezvous_result: Optional[RendezvousResult] = None
         self._closed = False
@@ -158,19 +191,34 @@ class TrainingContext:
         self._rendezvous_and_init(rendezvous_timeout)
         return self
 
-    def shutdown(self) -> None:
-        """Stop heartbeating and leave the process group."""
+    def shutdown(self, reason: int = DEREGISTER_COMPLETED) -> None:
+        """Deregister from the coordinator, stop heartbeating, and leave the
+        process group.
+
+        ``reason`` defaults to graceful completion; pass
+        :data:`DEREGISTER_PREEMPTED` when exiting due to eviction or
+        :data:`DEREGISTER_ERROR` on unrecoverable local failure.
+        """
         if self._closed:
             return
         self._closed = True
         self._heartbeat.stop()
+        try:
+            self.client.deregister_worker(
+                run_id=self.run_id,
+                worker_id=self.worker_id,
+                reason=reason,
+                idempotency_key=f"deregister-{self.worker_id}",
+            )
+        except Exception as exc:  # noqa: BLE001 - departure must not mask the training result
+            logger.warning("deregister_worker failed (coordinator will age us out): %s", exc)
         self._destroy_process_group()
 
     def __enter__(self) -> "TrainingContext":
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        self.shutdown()
+        self.shutdown(DEREGISTER_COMPLETED if exc_type is None else DEREGISTER_ERROR)
 
     # ── properties ───────────────────────────────────────────────────────────
 
@@ -201,10 +249,17 @@ class TrainingContext:
         return _wrap_model(model, strategy=strategy, local_rank=self.local_rank, **kwargs)
 
     def raise_if_membership_changed(self) -> None:
-        """Raise :class:`MembershipChanged` when the round advanced.
+        """Raise :class:`RunTerminated` when the run was cancelled or failed,
+        or :class:`MembershipChanged` when the round advanced.
 
-        Call once per training step (cheap: a single Event check).
+        Call once per training step (cheap: two Event checks).
         """
+        if self.run_terminated.is_set():
+            raise RunTerminated(
+                self._heartbeat.terminal_run_state,
+                f"run {self.run_id} reached terminal state "
+                f"{self._heartbeat.terminal_run_state}; stopping",
+            )
         if self.membership_changed.is_set():
             raise MembershipChanged(
                 f"rendezvous round advanced past {self.rendezvous_round}; "
@@ -238,6 +293,10 @@ class TrainingContext:
             try:
                 train_fn(self)
                 return
+            except RunTerminated:
+                # Cancellation / run failure is not recoverable membership
+                # churn — surface it to the caller.
+                raise
             except MembershipChanged:
                 pass
             except RuntimeError:

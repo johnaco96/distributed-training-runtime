@@ -80,6 +80,18 @@ CREATE TABLE IF NOT EXISTS runs (
   idempotency_key      TEXT
 );
 
+-- Run lifecycle columns (idempotent for databases created before they existed;
+-- a real migration framework lands with the Phase 6 storage work).
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_state INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS state_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS world_size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS min_world_size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS max_world_size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS settle_timeout_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS assignment_policy INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS storage_backend_kind INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_version TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS workers (
   run_id               TEXT NOT NULL,
   worker_id            TEXT NOT NULL,
@@ -221,22 +233,115 @@ impl MetadataStore for PostgresMetadataStore {
         self.block(async {
             sqlx::query(
                 r#"
-INSERT INTO runs (run_id, name, status, created_at_millis, idempotency_key)
-VALUES ($1, $2, $3, $4, NULL)
+INSERT INTO runs (run_id, name, status, created_at_millis, idempotency_key,
+                  run_state, state_reason, world_size, min_world_size, max_world_size,
+                  settle_timeout_ms, assignment_policy, storage_backend_kind, run_version)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 ON CONFLICT (run_id) DO UPDATE SET
   name = EXCLUDED.name,
   status = EXCLUDED.status,
-  created_at_millis = EXCLUDED.created_at_millis
+  created_at_millis = EXCLUDED.created_at_millis,
+  idempotency_key = EXCLUDED.idempotency_key,
+  run_state = EXCLUDED.run_state,
+  state_reason = EXCLUDED.state_reason,
+  world_size = EXCLUDED.world_size,
+  min_world_size = EXCLUDED.min_world_size,
+  max_world_size = EXCLUDED.max_world_size,
+  settle_timeout_ms = EXCLUDED.settle_timeout_ms,
+  assignment_policy = EXCLUDED.assignment_policy,
+  storage_backend_kind = EXCLUDED.storage_backend_kind,
+  run_version = EXCLUDED.run_version
 "#,
             )
             .bind(&run.run_id)
             .bind(&run.run_name)
             .bind(run.latest_checkpoint_state)
             .bind(to_millis(run.registered_at))
+            .bind(if run.idempotency_key.is_empty() {
+                None
+            } else {
+                Some(run.idempotency_key.as_str())
+            })
+            .bind(run.state)
+            .bind(&run.state_reason)
+            .bind(run.world_size as i32)
+            .bind(run.min_world_size as i32)
+            .bind(run.max_world_size as i32)
+            .bind(run.rendezvous_settle_timeout_ms as i32)
+            .bind(run.assignment_policy)
+            .bind(run.storage_backend_kind)
+            .bind(&run.run_version)
             .execute(&self.pool)
             .await
             .map(|_| ())
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+
+    fn load_all_runs(&self) -> PersistResult<Vec<RunRecord>> {
+        self.block(async {
+            type Row = (
+                String,
+                String,
+                i64,
+                Option<String>,
+                i32,
+                String,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                String,
+            );
+            let rows: Vec<Row> = sqlx::query_as(
+                "SELECT run_id, name, created_at_millis, idempotency_key, run_state, state_reason, \
+                 world_size, min_world_size, max_world_size, settle_timeout_ms, assignment_policy, \
+                 storage_backend_kind, run_version FROM runs ORDER BY run_id",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(
+                        run_id,
+                        run_name,
+                        created_at_millis,
+                        idempotency_key,
+                        state,
+                        state_reason,
+                        world_size,
+                        min_world_size,
+                        max_world_size,
+                        settle_timeout_ms,
+                        assignment_policy,
+                        storage_backend_kind,
+                        run_version,
+                    )| RunRecord {
+                        run_id,
+                        run_name,
+                        registered_at: from_millis(created_at_millis.max(0) as u64),
+                        idempotency_key: idempotency_key.unwrap_or_default(),
+                        state,
+                        state_reason,
+                        world_size: world_size.max(0) as u32,
+                        min_world_size: min_world_size.max(0) as u32,
+                        max_world_size: max_world_size.max(0) as u32,
+                        rendezvous_settle_timeout_ms: settle_timeout_ms.max(0) as u32,
+                        assignment_policy,
+                        storage_backend_kind,
+                        run_version,
+                        active_worker_count: 0,
+                        latest_checkpoint_id: None,
+                        latest_checkpoint_state: 0,
+                        state_updated_at: std::time::SystemTime::now(),
+                    },
+                )
+                .collect())
         })
     }
 
@@ -736,4 +841,8 @@ fn to_millis(t: std::time::SystemTime) -> i64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn from_millis(millis: u64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)
 }
