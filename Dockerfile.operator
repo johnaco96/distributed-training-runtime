@@ -1,0 +1,24 @@
+# runtime-operator image: the Kubernetes operator that reconciles TrainingRun
+# resources.  Build from the repo root:
+#
+#   docker build -f Dockerfile.operator -t <registry>/runtime-operator:<tag> .
+FROM rust:1.95-bookworm AS builder
+WORKDIR /build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        libprotobuf-dev \
+        pkg-config \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ENV PROTOC=/usr/bin/protoc
+ENV PROTOC_INCLUDE=/usr/include
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY proto ./proto
+RUN cargo build --release -p runtime-operator
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /build/target/release/runtime-operator /usr/local/bin/runtime-operator
+USER nonroot
+ENTRYPOINT ["runtime-operator"]

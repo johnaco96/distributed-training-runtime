@@ -8,6 +8,7 @@ members = [
     "crates/runtime-dataset",
     "crates/runtime-checkpoint",
     "crates/runtime-bench",
+    "crates/runtime-operator",
 ]
 resolver = "2"
 

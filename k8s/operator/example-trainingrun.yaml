@@ -1,0 +1,52 @@
+# Example TrainingRun: 2 nodes x 2 processes of DDP training against an
+# operator-managed coordinator, on GPU nodes, gang-scheduled with Volcano.
+#
+# Minimal variant (plain kube-scheduler, external coordinator) below.
+apiVersion: dtruntime.io/v1alpha1
+kind: TrainingRun
+metadata:
+  name: mnist-ddp
+  namespace: training
+spec:
+  image: ghcr.io/example/trainer:latest        # contains dtruntime + train.py
+  script: ["train.py", "--epochs", "10"]
+  nodes: 2
+  nprocPerNode: 2
+  coordinator:
+    manage:
+      image: ghcr.io/example/runtime-coordinator:latest
+  backend: nccl
+  maxRestarts: 3
+  resources:
+    limits:
+      nvidia.com/gpu: "2"
+  scheduling:
+    backend: volcano            # or omit for plain kube-scheduler, or "kueue"
+    queue: research
+    nodeSelector:
+      node.kubernetes.io/instance-type: gpu-a100
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            dtruntime.io/training-run: mnist-ddp
+---
+# Minimal elastic CPU example against an existing coordinator.
+apiVersion: dtruntime.io/v1alpha1
+kind: TrainingRun
+metadata:
+  name: elastic-demo
+  namespace: training
+spec:
+  image: ghcr.io/example/trainer:latest
+  script: ["train.py"]
+  nodes: 4
+  coordinator:
+    address: coordinator.dtruntime:50051
+  elastic:
+    minWorkers: 2
+    maxWorkers: 4
+    settleTimeoutMs: 10000
+  backend: gloo
