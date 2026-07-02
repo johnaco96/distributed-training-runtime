@@ -38,6 +38,22 @@ service CoordinatorService {
   // failure deadline) and feeds the run lifecycle state machine.
   rpc DeregisterWorker(DeregisterWorkerRequest) returns (DeregisterWorkerResponse);
 
+  // Download a checkpoint artifact through the coordinator's storage backend.
+  // This is the restore data plane for multi-machine training: workers on any
+  // node can read artifacts regardless of whether the coordinator stores them
+  // on its local filesystem or in S3.
+  rpc FetchCheckpointArtifact(FetchCheckpointArtifactRequest) returns (stream FetchCheckpointArtifactChunk);
+
+  // List checkpoints for a run (newest step first), including their states.
+  // Used for corrupt-checkpoint fallback and admin inspection.
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+
+  // Report a committed checkpoint as corrupt (checksum mismatch or unreadable
+  // artifacts observed during restore).  The checkpoint is marked FAILED and
+  // the latest-checkpoint pointer falls back to the newest remaining
+  // committed checkpoint.
+  rpc ReportCheckpointCorrupt(ReportCheckpointCorruptRequest) returns (ReportCheckpointCorruptResponse);
+
   // Cancel a run (admin).  Terminal: workers observe RUN_STATE_CANCELLED on
   // their next heartbeat and exit; launchers stop restarting workers.
   rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
@@ -446,6 +462,56 @@ message DeregisterWorkerResponse {
   WorkerState state = 1;
   RunState run_state = 2;
   google.protobuf.Timestamp server_time = 3;
+}
+
+message FetchCheckpointArtifactRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  string artifact_name = 4;
+  // Owner of the artifact (artifacts are stored per uploading worker).
+  WorkerId owner_worker_id = 5;
+}
+
+message FetchCheckpointArtifactChunk {
+  bytes data = 1;
+  uint64 sequence = 2;
+  // Set on the final chunk: total bytes and the artifact checksum for
+  // client-side integrity verification.
+  bool last = 3;
+  int64 total_size_bytes = 4;
+  string checksum = 5;
+  string checksum_algorithm = 6;
+}
+
+message ListCheckpointsRequest {
+  RunId run_id = 1;
+  // Only return checkpoints in COMMITTED state.
+  bool committed_only = 2;
+  // 0 = no limit.
+  uint32 limit = 3;
+}
+
+message ListCheckpointsResponse {
+  // Newest step first.
+  repeated CheckpointManifest checkpoints = 1;
+}
+
+message ReportCheckpointCorruptRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  // What was observed (checksum mismatch, missing artifact, ...).
+  string reason = 4;
+  string idempotency_key = 5;
+}
+
+message ReportCheckpointCorruptResponse {
+  // State of the reported checkpoint after the report (FAILED).
+  CheckpointState state = 1;
+  // The new latest committed checkpoint for the run, if any remains.
+  CheckpointId fallback_checkpoint_id = 2;
+  bool has_fallback = 3;
 }
 
 message CancelRunRequest {

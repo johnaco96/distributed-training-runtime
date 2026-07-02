@@ -81,7 +81,7 @@ See `python/examples/` for complete working examples including PyTorch integrati
 | Run lifecycle | Durable states (pending/running/recovering/completed/failed/cancelled) surviving coordinator restarts; cancellation, stuck-run detection, retention cleanup |
 | Shard assignment | Deterministic by rank; cache-aware placement; configurable shard count |
 | Crash recovery | Per-shard progress offset persisted to SQLite or PostgreSQL; workers resume on restart |
-| Distributed checkpointing | Two-phase commit; globally committed only when all registered workers vote |
+| Distributed checkpointing | DCP-based model+optimizer state with world-size/strategy resharding; 2PC commit; corruption fallback; retention/GC; async save |
 | Coordinator HA | PostgreSQL advisory lock leader election; standby takeover in ~5 s |
 | S3-compatible storage | Checkpoint artifacts to any S3-compatible store (MinIO, AWS S3); configurable concurrency |
 | TLS / mTLS | cert-manager-compatible; ECDSA P-256 certs with automatic rotation |
@@ -207,6 +207,7 @@ cargo run -p runtime-bench -- logical-workers \
 - [Quickstart](docs/quickstart.md)
 - [torch.distributed execution](docs/torch-distributed.md)
 - [Run lifecycle & failure semantics](docs/run-lifecycle.md)
+- [Distributed checkpointing](docs/checkpointing-distributed.md)
 - [Kubernetes operator](docs/kubernetes-operator.md)
 - [Scheduler integrations](docs/schedulers.md)
 - [Architecture](docs/architecture.md)

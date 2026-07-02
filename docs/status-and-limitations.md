@@ -49,6 +49,16 @@ The following capabilities are implemented and locally validated:
   sweeping via the coordinator's periodic reconcile task.
 - Coordinator failover transparency for in-flight training (validated:
   hard-kill + restart on the same metadata DB mid-training completes the run).
+- Distributed model + optimizer checkpointing on torch.distributed.checkpoint
+  (`dtruntime.checkpointing.DistributedCheckpointer`): multi-process restore
+  through the coordinator data plane (`FetchCheckpointArtifact`), world-size
+  resharding (validated save@2 → restore@1), strategy-agnostic state dicts,
+  async save, partial-upload retry (see `docs/checkpointing-distributed.md`).
+- Corrupt-checkpoint detection (checksum verification on write, stream-out,
+  and download) with automatic fallback to the previous committed checkpoint
+  (`ReportCheckpointCorrupt`), plus `ListCheckpoints` for inspection.
+- Checkpoint retention/GC (`--checkpoint-keep-last`) removing old records and
+  local artifacts via the reconcile task.
 
 ## Current limitations and non-goals
 

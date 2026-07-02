@@ -88,6 +88,18 @@ pub trait MetadataStore: Send + Sync {
         &self,
         run_id: &str,
     ) -> PersistResult<Option<CoordinatorCheckpointRecord>>;
+    /// All checkpoints for a run, newest step first, with artifacts.
+    fn load_checkpoints_for_run(
+        &self,
+        run_id: &str,
+    ) -> PersistResult<Vec<CoordinatorCheckpointRecord>>;
+    /// Mark a checkpoint FAILED (corrupt-checkpoint reporting).
+    fn mark_checkpoint_failed(&self, run_id: &str, checkpoint_id: &str) -> PersistResult<()>;
+    /// Point (or clear) the run's latest-committed-checkpoint pointer.
+    fn set_latest_checkpoint(&self, run_id: &str, latest: Option<(&str, u64)>)
+        -> PersistResult<()>;
+    /// Remove a checkpoint's rows entirely (retention GC).
+    fn delete_checkpoint(&self, run_id: &str, checkpoint_id: &str) -> PersistResult<()>;
     fn load_dataset(
         &self,
         run_id: &str,
@@ -786,6 +798,129 @@ CREATE TABLE IF NOT EXISTS audit_events (
         }))
     }
 
+    pub fn load_checkpoints_for_run(
+        &self,
+        run_id: &str,
+    ) -> rusqlite::Result<Vec<CoordinatorCheckpointRecord>> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn.prepare(
+            "SELECT checkpoint_id,step,state,created_at_millis,updated_at_millis,\
+             committed_at_millis,initiated_by_worker_id FROM checkpoints \
+             WHERE run_id=?1 ORDER BY step DESC, checkpoint_id DESC",
+        )?;
+        type CkRow = (String, i64, i32, i64, i64, Option<i64>, String);
+        let rows: Vec<CkRow> = stmt
+            .query_map(params![run_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut artifact_stmt = conn.prepare(
+            "SELECT worker_id,artifact_name,artifact_uri,size_bytes,checksum,checksum_algorithm \
+             FROM checkpoint_artifacts WHERE run_id=?1 AND checkpoint_id=?2 \
+             ORDER BY worker_id,artifact_name",
+        )?;
+        let mut records = Vec::with_capacity(rows.len());
+        for (checkpoint_id, step, state, created, updated, committed_at, initiator) in rows {
+            let artifacts = artifact_stmt
+                .query_map(params![run_id, checkpoint_id], |r| {
+                    Ok(ArtifactRecord {
+                        worker_id: DomainWorkerId(r.get(0)?),
+                        artifact_name: r.get(1)?,
+                        storage_key: r.get(2)?,
+                        size_bytes: r.get::<_, i64>(3)? as u64,
+                        checksum: r.get(4)?,
+                        checksum_algorithm: r.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let expected_worker_ids: Vec<String> =
+                artifacts.iter().map(|a| a.worker_id.0.clone()).collect();
+            records.push(CoordinatorCheckpointRecord {
+                checkpoint: CheckpointRecord {
+                    run_id: DomainRunId(run_id.to_string()),
+                    checkpoint_id: DomainCheckpointId(checkpoint_id),
+                    step: step as u64,
+                    state: checkpoint_state_from_i32(state),
+                    artifacts,
+                    created_at_millis: created as u64,
+                    updated_at_millis: updated as u64,
+                },
+                initiated_by_worker_id: initiator,
+                committed_at_millis: committed_at.map(|v| v as u64),
+                expected_artifact_count: expected_worker_ids.len() as u32,
+                expected_worker_ids,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn mark_checkpoint_failed(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "UPDATE checkpoints SET state=?3, updated_at_millis=?4 WHERE run_id=?1 AND checkpoint_id=?2",
+            params![
+                run_id,
+                checkpoint_id,
+                DomainCheckpointState::Failed as i32,
+                now_millis_i64()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_latest_checkpoint(
+        &self,
+        run_id: &str,
+        latest: Option<(&str, u64)>,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("sqlite");
+        match latest {
+            Some((checkpoint_id, committed_at_millis)) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO latest_checkpoints(run_id,checkpoint_id,committed_at_millis) VALUES(?1,?2,?3)",
+                    params![run_id, checkpoint_id, committed_at_millis as i64],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "DELETE FROM latest_checkpoints WHERE run_id=?1",
+                    params![run_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_checkpoint(&self, run_id: &str, checkpoint_id: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "DELETE FROM checkpoint_artifacts WHERE run_id=?1 AND checkpoint_id=?2",
+            params![run_id, checkpoint_id],
+        )?;
+        conn.execute(
+            "DELETE FROM checkpoint_commits WHERE run_id=?1 AND checkpoint_id=?2",
+            params![run_id, checkpoint_id],
+        )?;
+        conn.execute(
+            "DELETE FROM checkpoints WHERE run_id=?1 AND checkpoint_id=?2",
+            params![run_id, checkpoint_id],
+        )?;
+        Ok(())
+    }
+
     pub fn load_dataset(
         &self,
         run_id: &str,
@@ -967,6 +1102,29 @@ impl MetadataStore for SqliteMetadataStore {
         self.load_latest_checkpoint(run_id)
             .map_err(|e| Box::new(e) as _)
     }
+    fn load_checkpoints_for_run(
+        &self,
+        run_id: &str,
+    ) -> PersistResult<Vec<CoordinatorCheckpointRecord>> {
+        self.load_checkpoints_for_run(run_id)
+            .map_err(|e| Box::new(e) as _)
+    }
+    fn mark_checkpoint_failed(&self, run_id: &str, checkpoint_id: &str) -> PersistResult<()> {
+        self.mark_checkpoint_failed(run_id, checkpoint_id)
+            .map_err(|e| Box::new(e) as _)
+    }
+    fn set_latest_checkpoint(
+        &self,
+        run_id: &str,
+        latest: Option<(&str, u64)>,
+    ) -> PersistResult<()> {
+        self.set_latest_checkpoint(run_id, latest)
+            .map_err(|e| Box::new(e) as _)
+    }
+    fn delete_checkpoint(&self, run_id: &str, checkpoint_id: &str) -> PersistResult<()> {
+        self.delete_checkpoint(run_id, checkpoint_id)
+            .map_err(|e| Box::new(e) as _)
+    }
     fn load_dataset(
         &self,
         run_id: &str,
@@ -1028,6 +1186,13 @@ fn to_millis(t: std::time::SystemTime) -> i64 {
 
 fn from_millis(millis: u64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)
+}
+
+fn now_millis_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 /// Round-trip a persisted `state as i32` back to the domain enum.

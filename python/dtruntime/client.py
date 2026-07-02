@@ -401,6 +401,75 @@ class RuntimeClient:
         )
         return self._stub.GetLatestCheckpoint(request, metadata=self.rpc_metadata())
 
+    def list_checkpoints(
+        self,
+        run_id: str,
+        committed_only: bool = False,
+        limit: int = 0,
+    ) -> "runtime_pb2.ListCheckpointsResponse":
+        """List checkpoints for a run, newest step first."""
+        request = self._runtime_pb2.ListCheckpointsRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            committed_only=committed_only,
+            limit=limit,
+        )
+        return self._stub.ListCheckpoints(request, metadata=self.rpc_metadata())
+
+    def report_checkpoint_corrupt(
+        self,
+        run_id: str,
+        worker_id: str,
+        checkpoint_id: str,
+        reason: str,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.ReportCheckpointCorruptResponse":
+        """Mark a checkpoint corrupt; the latest pointer falls back to the
+        newest remaining committed checkpoint."""
+        request = self._runtime_pb2.ReportCheckpointCorruptRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.ReportCheckpointCorrupt(
+            request, metadata=self.rpc_metadata(worker_id=worker_id)
+        )
+
+    def fetch_checkpoint_artifact(
+        self,
+        run_id: str,
+        worker_id: str,
+        checkpoint_id: str,
+        artifact_name: str,
+        owner_worker_id: str,
+        destination: "str | Path",
+    ) -> tuple[int, str]:
+        """Download one checkpoint artifact through the coordinator into
+        ``destination``.  Returns (size_bytes, checksum) as computed by the
+        coordinator while streaming; callers verify against the manifest."""
+        request = self._runtime_pb2.FetchCheckpointArtifactRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
+            artifact_name=artifact_name,
+            owner_worker_id=self._runtime_pb2.WorkerId(value=owner_worker_id),
+        )
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        total = 0
+        checksum = ""
+        with destination.open("wb") as out:
+            for chunk in self._stub.FetchCheckpointArtifact(
+                request, metadata=self.rpc_metadata(worker_id=worker_id)
+            ):
+                if chunk.data:
+                    out.write(chunk.data)
+                    total += len(chunk.data)
+                if chunk.last:
+                    checksum = chunk.checksum
+        return total, checksum
+
     def join_rendezvous(
         self,
         run_id: str,

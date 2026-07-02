@@ -35,6 +35,7 @@ pub enum AuditEventKind {
     CheckpointStarted,
     CheckpointArtifactReported,
     CheckpointCommitted,
+    CheckpointCorruptReported,
     LatestCheckpointRead,
     RuntimeInfoRead,
     SecurityConfigurationError,

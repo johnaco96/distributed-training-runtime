@@ -59,6 +59,9 @@ struct CoordinatorCliArgs {
     /// How long terminal runs keep their in-memory state before cleanup
     /// (durable rows are retained).
     terminal_run_retention_secs: u64,
+    /// Checkpoint retention: keep the newest N committed checkpoints per run
+    /// and garbage-collect the rest (records + local artifacts).  0 disables.
+    checkpoint_keep_last: usize,
     show_help: bool,
 }
 
@@ -232,10 +235,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let interval = std::time::Duration::from_secs(args.reconcile_interval_secs.max(1));
         let stuck_after = std::time::Duration::from_secs(args.stuck_after_secs.max(1));
         let retention = std::time::Duration::from_secs(args.terminal_run_retention_secs.max(1));
+        let checkpoint_keep_last = args.checkpoint_keep_last;
+        let gc_storage_root = args.storage_root.clone();
         info!(
             interval_secs = interval.as_secs(),
             stuck_after_secs = stuck_after.as_secs(),
             terminal_run_retention_secs = retention.as_secs(),
+            checkpoint_keep_last,
             "starting periodic reconcile task"
         );
         tokio::spawn(async move {
@@ -249,6 +255,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::warn!(count = stuck, "marked stuck run(s) as failed");
                 }
                 reconcile_state.cleanup_terminal_runs(retention);
+
+                // Checkpoint retention: drop records beyond keep-last, then
+                // delete the reclaimed artifacts from local storage.  (S3
+                // objects are expected to be covered by bucket lifecycle
+                // rules until Phase 6 S3 hardening adds delete support.)
+                if checkpoint_keep_last > 0 {
+                    let removed =
+                        reconcile_state.enforce_checkpoint_retention(checkpoint_keep_last);
+                    if let Some(root) = &gc_storage_root {
+                        for (run_id, checkpoint_id) in removed {
+                            let mut dir = root.clone();
+                            dir.push("runs");
+                            dir.push(&run_id);
+                            dir.push("checkpoints");
+                            dir.push(&checkpoint_id);
+                            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                                if e.kind() != std::io::ErrorKind::NotFound {
+                                    tracing::warn!(
+                                        path = %dir.display(),
+                                        error = %e,
+                                        "checkpoint retention: artifact directory removal failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -395,6 +428,7 @@ fn coordinator_args(
         reconcile_interval_secs: 10,
         stuck_after_secs: 1800,
         terminal_run_retention_secs: 24 * 60 * 60,
+        checkpoint_keep_last: 0,
         show_help: false,
     };
 
@@ -457,6 +491,12 @@ fn coordinator_args(
                 .ok_or("--terminal-run-retention-secs requires a value")?
                 .parse()
                 .map_err(|_| "--terminal-run-retention-secs must be a positive integer")?;
+        } else if arg == "--checkpoint-keep-last" {
+            parsed.checkpoint_keep_last = args
+                .next()
+                .ok_or("--checkpoint-keep-last requires a value")?
+                .parse()
+                .map_err(|_| "--checkpoint-keep-last must be a non-negative integer")?;
         } else if arg == "--max-s3-concurrent-ops" {
             let raw = args
                 .next()
@@ -518,6 +558,7 @@ mod tests {
                 reconcile_interval_secs: 10,
                 stuck_after_secs: 1800,
                 terminal_run_retention_secs: 24 * 60 * 60,
+                checkpoint_keep_last: 0,
                 show_help: false,
             }
         );

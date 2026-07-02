@@ -713,6 +713,134 @@ ON CONFLICT (run_id) DO UPDATE SET
         })
     }
 
+    fn load_checkpoints_for_run(
+        &self,
+        run_id: &str,
+    ) -> PersistResult<Vec<CoordinatorCheckpointRecord>> {
+        self.block(async {
+            type CkRow = (String, i64, i32, i64, i64, Option<i64>, String);
+            let rows: Vec<CkRow> = sqlx::query_as(
+                "SELECT checkpoint_id, step, state, created_at_millis, updated_at_millis, \
+                 committed_at_millis, initiated_by_worker_id \
+                 FROM checkpoints WHERE run_id = $1 ORDER BY step DESC, checkpoint_id DESC",
+            )
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+            let mut records = Vec::with_capacity(rows.len());
+            for (checkpoint_id, step, state, created, updated, committed_at, initiator) in rows {
+                let artifact_rows: Vec<(String, String, String, i64, String, String)> =
+                    sqlx::query_as(
+                        "SELECT worker_id, artifact_name, artifact_uri, size_bytes, checksum, checksum_algorithm \
+                         FROM checkpoint_artifacts WHERE run_id = $1 AND checkpoint_id = $2 \
+                         ORDER BY worker_id, artifact_name",
+                    )
+                    .bind(run_id)
+                    .bind(&checkpoint_id)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let artifacts: Vec<ArtifactRecord> = artifact_rows
+                    .into_iter()
+                    .map(|(wid, name, uri, size, cksum, algo)| ArtifactRecord {
+                        worker_id: DomainWorkerId(wid),
+                        artifact_name: name,
+                        storage_key: uri,
+                        size_bytes: size as u64,
+                        checksum: cksum,
+                        checksum_algorithm: algo,
+                    })
+                    .collect();
+                let expected_worker_ids: Vec<String> =
+                    artifacts.iter().map(|a| a.worker_id.0.clone()).collect();
+                records.push(CoordinatorCheckpointRecord {
+                    checkpoint: CheckpointRecord {
+                        run_id: DomainRunId(run_id.to_string()),
+                        checkpoint_id: DomainCheckpointId(checkpoint_id),
+                        step: step as u64,
+                        state: crate::persistence::checkpoint_state_from_i32(state),
+                        artifacts,
+                        created_at_millis: created as u64,
+                        updated_at_millis: updated as u64,
+                    },
+                    initiated_by_worker_id: initiator,
+                    committed_at_millis: committed_at.map(|v| v as u64),
+                    expected_artifact_count: expected_worker_ids.len() as u32,
+                    expected_worker_ids,
+                });
+            }
+            Ok(records)
+        })
+    }
+
+    fn mark_checkpoint_failed(&self, run_id: &str, checkpoint_id: &str) -> PersistResult<()> {
+        self.block(async {
+            sqlx::query(
+                "UPDATE checkpoints SET state = $3, updated_at_millis = $4 \
+                 WHERE run_id = $1 AND checkpoint_id = $2",
+            )
+            .bind(run_id)
+            .bind(checkpoint_id)
+            .bind(DomainCheckpointState::Failed as i32)
+            .bind(to_millis(std::time::SystemTime::now()))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+
+    fn set_latest_checkpoint(
+        &self,
+        run_id: &str,
+        latest: Option<(&str, u64)>,
+    ) -> PersistResult<()> {
+        self.block(async {
+            match latest {
+                Some((checkpoint_id, committed_at_millis)) => sqlx::query(
+                    "INSERT INTO latest_checkpoints (run_id, checkpoint_id, committed_at_millis) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (run_id) DO UPDATE SET \
+                     checkpoint_id = EXCLUDED.checkpoint_id, \
+                     committed_at_millis = EXCLUDED.committed_at_millis",
+                )
+                .bind(run_id)
+                .bind(checkpoint_id)
+                .bind(committed_at_millis as i64)
+                .execute(&self.pool)
+                .await
+                .map(|_| ())
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                None => sqlx::query("DELETE FROM latest_checkpoints WHERE run_id = $1")
+                    .bind(run_id)
+                    .execute(&self.pool)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            }
+        })
+    }
+
+    fn delete_checkpoint(&self, run_id: &str, checkpoint_id: &str) -> PersistResult<()> {
+        self.block(async {
+            for sql in [
+                "DELETE FROM checkpoint_artifacts WHERE run_id = $1 AND checkpoint_id = $2",
+                "DELETE FROM checkpoint_commits WHERE run_id = $1 AND checkpoint_id = $2",
+                "DELETE FROM checkpoints WHERE run_id = $1 AND checkpoint_id = $2",
+            ] {
+                sqlx::query(sql)
+                    .bind(run_id)
+                    .bind(checkpoint_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+            Ok(())
+        })
+    }
+
     fn load_dataset(
         &self,
         run_id: &str,

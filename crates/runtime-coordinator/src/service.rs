@@ -1164,7 +1164,9 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetLatestCheckpointRequest>,
     ) -> Result<Response<GetLatestCheckpointResponse>, Status> {
-        self.require_admin(&request, "admin_request")?;
+        // Read-only checkpoint metadata: workers need it to restore, admins
+        // to inspect.  Any authenticated principal is accepted.
+        self.auth_context(&request, "checkpoint_read")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -1191,40 +1193,221 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
         self.metrics.inc_latest_checkpoint_reads_total();
 
-        let manifest = CheckpointManifest {
-            run_id: Some(RunId {
-                value: checkpoint.checkpoint.run_id.0,
-            }),
-            checkpoint_id: Some(CheckpointId {
-                value: checkpoint.checkpoint.checkpoint_id.0,
-            }),
-            step: checkpoint.checkpoint.step,
-            state: checkpoint_state_to_proto(checkpoint.checkpoint.state),
-            storage_backend_kind: self
-                .state
-                .get_run(&run_id)
-                .ok_or_else(|| Status::failed_precondition("run metadata missing"))?
-                .storage_backend_kind,
-            artifacts: checkpoint
-                .checkpoint
-                .artifacts
-                .into_iter()
-                .map(|artifact| ArtifactReport {
-                    artifact_name: artifact.artifact_name,
-                    artifact_uri: artifact.storage_key,
-                    size_bytes: artifact.size_bytes as i64,
-                    checksum: artifact.checksum,
-                    checksum_algorithm: artifact.checksum_algorithm,
-                    uploaded_at: Some(millis_to_timestamp(checkpoint.checkpoint.updated_at_millis)),
-                })
-                .collect(),
-            created_at: Some(millis_to_timestamp(checkpoint.checkpoint.created_at_millis)),
-            committed_at: checkpoint.committed_at_millis.map(millis_to_timestamp),
-        };
+        let storage_backend_kind = self
+            .state
+            .get_run(&run_id)
+            .ok_or_else(|| Status::failed_precondition("run metadata missing"))?
+            .storage_backend_kind;
+        let manifest = record_to_manifest(checkpoint, storage_backend_kind);
 
         Ok(Response::new(GetLatestCheckpointResponse {
             manifest: Some(manifest),
         }))
+    }
+
+    async fn list_checkpoints(
+        &self,
+        request: Request<ListCheckpointsRequest>,
+    ) -> Result<Response<ListCheckpointsResponse>, Status> {
+        self.auth_context(&request, "checkpoint_read")?;
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let records = self
+            .state
+            .list_checkpoints(
+                &run_id.value,
+                request.committed_only,
+                request.limit as usize,
+            )
+            .map_err(|error| match error {
+                crate::state::ListCheckpointsError::RunNotFound => {
+                    not_found(format!("run {} was not found", run_id.value))
+                }
+                crate::state::ListCheckpointsError::PersistenceUnavailable => {
+                    Status::unavailable("metadata store unavailable; retry")
+                }
+            })?;
+
+        let storage_backend_kind = self
+            .state
+            .get_run(&run_id)
+            .map(|r| r.storage_backend_kind)
+            .unwrap_or_default();
+        Ok(Response::new(ListCheckpointsResponse {
+            checkpoints: records
+                .into_iter()
+                .map(|record| record_to_manifest(record, storage_backend_kind))
+                .collect(),
+        }))
+    }
+
+    async fn report_checkpoint_corrupt(
+        &self,
+        request: Request<ReportCheckpointCorruptRequest>,
+    ) -> Result<Response<ReportCheckpointCorruptResponse>, Status> {
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .map(|w| w.value.clone())
+            .unwrap_or_default();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("report_checkpoint_corrupt", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let checkpoint_id = request
+            .checkpoint_id
+            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?;
+
+        let fallback = self
+            .state
+            .report_checkpoint_corrupt(&run_id.value, &checkpoint_id.value, &request.reason)
+            .map_err(|error| match error {
+                crate::state::ReportCorruptError::RunNotFound => {
+                    not_found(format!("run {} was not found", run_id.value))
+                }
+                crate::state::ReportCorruptError::CheckpointNotFound => not_found(format!(
+                    "checkpoint {} was not found under run {}",
+                    checkpoint_id.value, run_id.value
+                )),
+                crate::state::ReportCorruptError::PersistenceUnavailable => {
+                    Status::unavailable("metadata store unavailable; retry")
+                }
+            })?;
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::CheckpointCorruptReported),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            checkpoint_id: Some(checkpoint_id.value.clone()),
+            reason: Some(request.reason.clone()),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(ReportCheckpointCorruptResponse {
+            state: CheckpointState::Failed as i32,
+            has_fallback: fallback.is_some(),
+            fallback_checkpoint_id: fallback.map(|value| CheckpointId { value }),
+        }))
+    }
+
+    type FetchCheckpointArtifactStream = std::pin::Pin<
+        Box<
+            dyn futures_core::Stream<Item = Result<FetchCheckpointArtifactChunk, Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    async fn fetch_checkpoint_artifact(
+        &self,
+        request: Request<FetchCheckpointArtifactRequest>,
+    ) -> Result<Response<Self::FetchCheckpointArtifactStream>, Status> {
+        self.auth_context(&request, "checkpoint_read")?;
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?
+            .value;
+        let checkpoint_id = request
+            .checkpoint_id
+            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?
+            .value;
+        let owner_worker_id = request
+            .owner_worker_id
+            .ok_or_else(|| Status::invalid_argument("owner_worker_id is required"))?
+            .value;
+        let artifact_name = request.artifact_name;
+        if artifact_name.trim().is_empty() {
+            return Err(invalid_argument("artifact_name must be non-empty"));
+        }
+
+        let storage_root = self.storage_root.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "coordinator storage root not configured; start with --storage-root <path>",
+            )
+        })?;
+        let artifact_key = runtime_storage::checkpoint_worker_artifact(
+            &run_id,
+            &checkpoint_id,
+            &owner_worker_id,
+            &artifact_name,
+        );
+        let mut artifact_path = storage_root.as_ref().clone();
+        for segment in artifact_key.as_str().split('/') {
+            artifact_path.push(segment);
+        }
+
+        let mut file = tokio::fs::File::open(&artifact_path).await.map_err(|e| {
+            not_found(format!(
+                "artifact {artifact_name} of checkpoint {checkpoint_id} not found in coordinator storage: {e}"
+            ))
+        })?;
+
+        let metrics = self.metrics.clone();
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<FetchCheckpointArtifactChunk, Status>>(8);
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            const CHUNK: usize = 512 * 1024;
+            let mut hasher = Sha256::new();
+            let mut sequence: u64 = 0;
+            let mut total: i64 = 0;
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                match file.read(&mut buf).await {
+                    Ok(0) => {
+                        let checksum = hex::encode(hasher.finalize());
+                        let _ = tx
+                            .send(Ok(FetchCheckpointArtifactChunk {
+                                data: Vec::new(),
+                                sequence,
+                                last: true,
+                                total_size_bytes: total,
+                                checksum,
+                                checksum_algorithm: "sha256".to_string(),
+                            }))
+                            .await;
+                        metrics.add_storage_bytes_read(total.max(0) as u64);
+                        break;
+                    }
+                    Ok(n) => {
+                        hasher.update(&buf[..n]);
+                        total += n as i64;
+                        if tx
+                            .send(Ok(FetchCheckpointArtifactChunk {
+                                data: buf[..n].to_vec(),
+                                sequence,
+                                last: false,
+                                total_size_bytes: 0,
+                                checksum: String::new(),
+                                checksum_algorithm: String::new(),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break; // client went away
+                        }
+                        sequence += 1;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("artifact read failed: {e}"))))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     async fn get_run_status(
@@ -1466,6 +1649,38 @@ fn rendezvous_snapshot_to_proto(snapshot: crate::rendezvous::RendezvousSnapshot)
         store_addr: snapshot.store_addr,
         store_port: snapshot.store_port,
         server_time: Some(std::time::SystemTime::now().into()),
+    }
+}
+
+fn record_to_manifest(
+    record: crate::state::CoordinatorCheckpointRecord,
+    storage_backend_kind: i32,
+) -> CheckpointManifest {
+    CheckpointManifest {
+        run_id: Some(RunId {
+            value: record.checkpoint.run_id.0,
+        }),
+        checkpoint_id: Some(CheckpointId {
+            value: record.checkpoint.checkpoint_id.0,
+        }),
+        step: record.checkpoint.step,
+        state: checkpoint_state_to_proto(record.checkpoint.state),
+        storage_backend_kind,
+        artifacts: record
+            .checkpoint
+            .artifacts
+            .into_iter()
+            .map(|artifact| ArtifactReport {
+                artifact_name: artifact.artifact_name,
+                artifact_uri: artifact.storage_key,
+                size_bytes: artifact.size_bytes as i64,
+                checksum: artifact.checksum,
+                checksum_algorithm: artifact.checksum_algorithm,
+                uploaded_at: Some(millis_to_timestamp(record.checkpoint.updated_at_millis)),
+            })
+            .collect(),
+        created_at: Some(millis_to_timestamp(record.checkpoint.created_at_millis)),
+        committed_at: record.committed_at_millis.map(millis_to_timestamp),
     }
 }
 
@@ -2033,17 +2248,17 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert_permission_denied(
-            service
-                .get_latest_checkpoint(request_as_worker(
-                    &worker_id.value,
-                    GetLatestCheckpointRequest {
-                        run_id: Some(run_id.clone()),
-                    },
-                ))
-                .await
-                .expect_err("worker denied"),
-        );
+        // Checkpoint metadata reads are allowed for workers too: restore runs
+        // under worker identity.
+        service
+            .get_latest_checkpoint(request_as_worker(
+                &worker_id.value,
+                GetLatestCheckpointRequest {
+                    run_id: Some(run_id.clone()),
+                },
+            ))
+            .await
+            .expect("worker may read checkpoint metadata for restore");
 
         service
             .get_runtime_info(request_as_admin(GetRuntimeInfoRequest {}))
@@ -3002,6 +3217,8 @@ mod tests {
             .into_inner();
         assert!(second.accepted);
 
+        // A second *distinct* artifact from the same worker is legitimate:
+        // distributed checkpoint formats write several files per rank.
         let third = service
             .report_checkpoint_artifact(Request::new(artifact_request(
                 run_id.clone(),
@@ -3012,12 +3229,30 @@ mod tests {
                 "artifact-key-2",
             )))
             .await
+            .unwrap()
+            .into_inner();
+        assert!(third.accepted);
+
+        // Re-reporting an existing artifact name with different metadata is a
+        // conflict.
+        let mut conflicting = artifact_request(
+            run_id.clone(),
+            worker_id.clone(),
+            "ckpt-1",
+            "a.bin",
+            "s3://bucket/a.bin",
+            "artifact-key-3",
+        );
+        conflicting.artifact_report.as_mut().unwrap().checksum = "different-sum".to_string();
+        let fourth = service
+            .report_checkpoint_artifact(Request::new(conflicting))
+            .await
             .unwrap_err();
-        assert_eq!(third.code(), tonic::Code::InvalidArgument);
-        assert!(third
+        assert_eq!(fourth.code(), tonic::Code::InvalidArgument);
+        assert!(fourth
             .message()
             .contains("worker already reported conflicting artifact metadata"));
-        assert_eq!(service.metrics_snapshot().storage_bytes_written, 20);
+        assert_eq!(service.metrics_snapshot().storage_bytes_written, 30);
     }
 
     #[tokio::test]
