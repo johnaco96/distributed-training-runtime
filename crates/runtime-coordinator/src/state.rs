@@ -12,9 +12,9 @@ use runtime_checkpoint::{
     CheckpointState as DomainCheckpointState, RunId as DomainRunId, WorkerId as DomainWorkerId,
 };
 use runtime_proto::runtime::v1::{
-    CheckpointId, CheckpointState, DatasetId, DatasetMetadata, RegisterDatasetRequest,
-    RegisterRunRequest, RegisterWorkerRequest, RunId, ShardId, ShardLeaseState, ShardMetadata,
-    WorkerId, WorkerState,
+    CheckpointId, CheckpointState, DatasetId, DatasetMetadata, DeregisterReason,
+    RegisterDatasetRequest, RegisterRunRequest, RegisterWorkerRequest, RunId, RunState, ShardId,
+    ShardLeaseState, ShardMetadata, WorkerId, WorkerState,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -110,6 +110,26 @@ pub struct RunRecord {
     pub max_world_size: u32,
     /// Elastic rendezvous settle window in milliseconds; 0 = server default.
     pub rendezvous_settle_timeout_ms: u32,
+    /// Durable run lifecycle state ([`RunState`] as i32); see the proto for
+    /// the transition diagram.
+    pub state: i32,
+    /// Human-readable explanation of the current state.
+    pub state_reason: String,
+    /// Registration idempotency key, persisted so a restarted coordinator
+    /// still deduplicates RegisterRun retries.
+    pub idempotency_key: String,
+    /// When `state` last changed (in-memory only; used for retention cleanup
+    /// of terminal runs — the clock restarts after a coordinator restart).
+    pub state_updated_at: SystemTime,
+}
+
+impl RunRecord {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            RunState::try_from(self.state),
+            Ok(RunState::Completed) | Ok(RunState::Failed) | Ok(RunState::Cancelled)
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -192,6 +212,9 @@ pub struct WorkerHeartbeat {
     pub state: i32,
     pub next_heartbeat_deadline: SystemTime,
     pub server_time: SystemTime,
+    /// Current run lifecycle state, so workers observe cancellation and
+    /// other terminal transitions without extra RPCs.
+    pub run_state: i32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -323,6 +346,20 @@ pub enum RendezvousError {
     RunNotFound,
     WorkerNotFound,
     MissingHost,
+    /// The run is in a terminal state; the worker should exit instead of
+    /// re-forming a process group.
+    RunTerminal(i32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeregisterWorkerError {
+    RunNotFound,
+    WorkerNotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CancelRunError {
+    RunNotFound,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,6 +425,56 @@ impl CoordinatorState {
     /// so the coordinator can resume mid-shard reads and in-flight 2PC commits
     /// without requiring workers to re-send progress reports.
     fn hydrate_from_store(&mut self, store: &dyn MetadataStore) {
+        // Durable run lifecycle: restore the run registry (including terminal
+        // runs, which remain queryable until retention cleanup) and each
+        // run's worker roster.  Restored workers get fresh heartbeat
+        // deadlines — live workers re-assert themselves within one interval,
+        // dead ones age out through the normal stale→failed path.
+        if let Ok(runs) = store.load_all_runs() {
+            let now = SystemTime::now();
+            for run in runs {
+                if !run.idempotency_key.is_empty() {
+                    self.run_idempotency_keys
+                        .insert(run.idempotency_key.clone(), run.run_id.clone());
+                }
+                if let Ok(workers) = store.load_workers_for_run(&run.run_id) {
+                    let map: HashMap<String, WorkerRecord> = workers
+                        .into_iter()
+                        .map(|(worker_id, rank, _world_size, state)| {
+                            (
+                                worker_id.clone(),
+                                WorkerRecord {
+                                    run_id: run.run_id.clone(),
+                                    worker_id,
+                                    rank,
+                                    host: String::new(),
+                                    sdk_version: String::new(),
+                                    protocol_version: String::new(),
+                                    state,
+                                    registered_at: now,
+                                    last_heartbeat_at: now,
+                                    next_heartbeat_deadline: now + HEARTBEAT_INTERVAL,
+                                    failure_deadline: now + WORKER_FAILURE_INTERVAL,
+                                },
+                            )
+                        })
+                        .collect();
+                    if !map.is_empty() {
+                        self.workers_by_run
+                            .insert(run.run_id.clone(), Arc::new(RwLock::new(map)));
+                    }
+                }
+                // Keep generated run ids collision-free with restored ones.
+                if let Some(numeric) = run
+                    .run_id
+                    .strip_prefix("run-")
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    self.next_run_id.fetch_max(numeric, Ordering::Relaxed);
+                }
+                self.runs.insert(run.run_id.clone(), run);
+            }
+        }
         // Gap 1: restore shard-progress offsets so workers get the correct
         // resume position on GetShardAssignment after a coordinator restart.
         if let Ok(entries) = store.load_all_shard_progress() {
@@ -1006,6 +1093,10 @@ impl CoordinatorState {
             min_world_size: request.min_world_size,
             max_world_size: request.max_world_size,
             rendezvous_settle_timeout_ms: request.rendezvous_settle_timeout_ms,
+            state: RunState::Pending as i32,
+            state_reason: String::new(),
+            idempotency_key: request.idempotency_key.clone(),
+            state_updated_at: registered_at,
         };
 
         self.runs.insert(run_id.clone(), record.clone());
@@ -1082,17 +1173,289 @@ impl CoordinatorState {
         let now = SystemTime::now();
         let newly_failed = reconcile_worker_liveness(&self.runs, &self.workers_by_run, now);
         for (run_id, worker_id) in newly_failed {
-            if let Some(rendezvous) = self.rendezvous_by_run.get(&run_id) {
-                let invalidated = rendezvous.lock().unwrap().on_worker_failed(&worker_id, now);
-                if invalidated {
-                    tracing::info!(
-                        run_id = %run_id,
-                        worker_id = %worker_id,
-                        "worker failure invalidated rendezvous round; remaining workers must re-join"
-                    );
+            let invalidated = self
+                .rendezvous_by_run
+                .get(&run_id)
+                .map(|r| r.lock().unwrap().on_worker_failed(&worker_id, now))
+                .unwrap_or(false);
+            if invalidated {
+                tracing::info!(
+                    run_id = %run_id,
+                    worker_id = %worker_id,
+                    "worker failure invalidated rendezvous round; remaining workers must re-join"
+                );
+                self.set_run_state(
+                    &run_id,
+                    RunState::Recovering,
+                    format!(
+                        "worker {worker_id} failed (heartbeat timeout); re-forming process group"
+                    ),
+                );
+            }
+        }
+    }
+
+    // ── run lifecycle ────────────────────────────────────────────────────────
+
+    /// Transition a run's lifecycle state and persist it.  Terminal states
+    /// are final: further transitions are silently ignored (cancellation and
+    /// completion may race with recovery, and terminal must win).
+    fn set_run_state(&self, run_id: &str, state: RunState, reason: impl Into<String>) {
+        let snapshot = {
+            let Some(mut run) = self.runs.get_mut(run_id) else {
+                return;
+            };
+            if run.is_terminal() || run.state == state as i32 {
+                return;
+            }
+            run.state = state as i32;
+            run.state_reason = reason.into();
+            run.state_updated_at = SystemTime::now();
+            run.clone()
+        };
+        tracing::info!(
+            run_id = %run_id,
+            state = ?state,
+            reason = %snapshot.state_reason,
+            "run state transition"
+        );
+        self.persist_run(&snapshot);
+    }
+
+    /// Whether a run exists and is in a terminal state (used by handlers to
+    /// reject registrations against finished runs).
+    pub fn run_is_terminal(&self, run_id: &str) -> Option<bool> {
+        self.runs.get(run_id).map(|r| r.is_terminal())
+    }
+
+    /// Graceful worker departure.  Takes effect immediately: the rendezvous
+    /// membership changes now rather than after the heartbeat failure
+    /// deadline, and the run lifecycle advances when the roster empties.
+    pub fn deregister_worker(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        reason: DeregisterReason,
+    ) -> Result<(i32, i32), DeregisterWorkerError> {
+        if !self.runs.contains_key(run_id) {
+            return Err(DeregisterWorkerError::RunNotFound);
+        }
+        let workers_arc = self
+            .workers_by_run
+            .get(run_id)
+            .ok_or(DeregisterWorkerError::WorkerNotFound)?
+            .clone();
+
+        let new_worker_state = match reason {
+            DeregisterReason::Completed => WorkerState::Completed,
+            DeregisterReason::Preempted => WorkerState::Removed,
+            _ => WorkerState::Failed,
+        };
+        let (worker_snapshot, world_size) = {
+            let mut workers = workers_arc.write().unwrap();
+            let worker = workers
+                .get_mut(worker_id)
+                .ok_or(DeregisterWorkerError::WorkerNotFound)?;
+            worker.state = new_worker_state as i32;
+            let snapshot = worker.clone();
+            let world_size = self
+                .runs
+                .get(run_id)
+                .map(|r| r.world_size)
+                .unwrap_or_default();
+            (snapshot, world_size)
+        };
+        refresh_active_worker_count(&self.runs, &self.workers_by_run, run_id);
+        self.persist_worker(&worker_snapshot, world_size);
+
+        let now = SystemTime::now();
+        // A completed worker leaving is expected (everyone finishes together
+        // under DDP) and must not force survivors to re-rendezvous; any other
+        // departure invalidates the round like a failure would.
+        if reason != DeregisterReason::Completed {
+            let invalidated = self
+                .rendezvous_by_run
+                .get(run_id)
+                .map(|r| r.lock().unwrap().on_worker_failed(worker_id, now))
+                .unwrap_or(false);
+            if invalidated {
+                self.set_run_state(
+                    run_id,
+                    RunState::Recovering,
+                    format!(
+                        "worker {worker_id} deregistered ({reason:?}); re-forming process group"
+                    ),
+                );
+            }
+        }
+
+        // Run completion/failure from the roster.
+        let roster: Vec<i32> = workers_arc
+            .read()
+            .unwrap()
+            .values()
+            .map(|w| w.state)
+            .collect();
+        let all = |target: WorkerState| -> bool {
+            !roster.is_empty() && roster.iter().all(|s| *s == target as i32)
+        };
+        if all(WorkerState::Completed) {
+            self.set_run_state(run_id, RunState::Completed, "all workers completed");
+        } else if !roster.is_empty()
+            && roster.iter().all(|s| {
+                *s == WorkerState::Failed as i32
+                    || *s == WorkerState::Removed as i32
+                    || *s == WorkerState::Completed as i32
+            })
+            && roster.contains(&(WorkerState::Failed as i32))
+        {
+            self.set_run_state(
+                run_id,
+                RunState::Failed,
+                "no live workers remain and at least one reported an error",
+            );
+        }
+
+        let run_state = self.runs.get(run_id).map(|r| r.state).unwrap_or_default();
+        Ok((new_worker_state as i32, run_state))
+    }
+
+    /// Cancel a run (terminal, idempotent).  Workers observe the state on
+    /// their next heartbeat and exit; launchers stop restarting workers.
+    pub fn cancel_run(&self, run_id: &str, reason: &str) -> Result<i32, CancelRunError> {
+        if !self.runs.contains_key(run_id) {
+            return Err(CancelRunError::RunNotFound);
+        }
+        let reason = if reason.is_empty() {
+            "cancelled by administrator".to_string()
+        } else {
+            format!("cancelled: {reason}")
+        };
+        self.set_run_state(run_id, RunState::Cancelled, reason);
+        Ok(self.runs.get(run_id).map(|r| r.state).unwrap_or_default())
+    }
+
+    /// Stuck-run detection: a non-terminal run whose entire roster has been
+    /// silent (no heartbeats) for `stuck_after` — or that never attracted a
+    /// worker at all — is failed with an explanatory reason.  Called from the
+    /// coordinator's periodic reconcile task.
+    pub fn detect_stuck_runs(&self, stuck_after: Duration) -> usize {
+        let now = SystemTime::now();
+        // Collect candidates first: never hold a `runs` iteration guard while
+        // taking per-run worker locks (lock-order discipline).
+        let candidates: Vec<(String, SystemTime)> = self
+            .runs
+            .iter()
+            .filter(|r| !r.is_terminal())
+            .map(|r| (r.key().clone(), r.registered_at))
+            .collect();
+
+        let mut count = 0;
+        for (run_id, registered_at) in candidates {
+            let last_activity = self
+                .workers_by_run
+                .get(&run_id)
+                .and_then(|arc| {
+                    arc.read()
+                        .unwrap()
+                        .values()
+                        .map(|w| w.last_heartbeat_at)
+                        .max()
+                })
+                .unwrap_or(registered_at);
+            let Ok(silence) = now.duration_since(last_activity) else {
+                continue;
+            };
+            if silence >= stuck_after {
+                count += 1;
+                self.set_run_state(
+                    &run_id,
+                    RunState::Failed,
+                    format!(
+                        "stuck: no worker activity for {}s (threshold {}s)",
+                        silence.as_secs(),
+                        stuck_after.as_secs()
+                    ),
+                );
+            }
+        }
+        count
+    }
+
+    /// Retention cleanup: drop the in-memory footprint (worker rosters,
+    /// datasets, checkpoints, rendezvous, shard progress, idempotency keys)
+    /// of runs that have been terminal for longer than `retention`, plus any
+    /// orphaned per-run maps whose run no longer exists.  Durable rows stay
+    /// in the metadata store for history/audit.  Returns the number of runs
+    /// cleaned up.
+    pub fn cleanup_terminal_runs(&self, retention: Duration) -> usize {
+        let now = SystemTime::now();
+        let expired: Vec<String> = self
+            .runs
+            .iter()
+            .filter(|r| {
+                r.is_terminal()
+                    && now
+                        .duration_since(r.state_updated_at)
+                        .map(|age| age >= retention)
+                        .unwrap_or(false)
+            })
+            .map(|r| r.key().clone())
+            .collect();
+
+        for run_id in &expired {
+            self.runs.remove(run_id);
+            tracing::info!(run_id = %run_id, "retention cleanup: removed terminal run state");
+        }
+
+        // Orphaned per-run maps: entries for runs that no longer exist
+        // (expired above, or vanished for any other reason).  Keys are
+        // collected before any cross-map lookups so no iteration guard is
+        // held while another map's shard lock is taken.
+        fn sweep<V>(map: &DashMap<String, V>, runs: &DashMap<String, RunRecord>) {
+            let keys: Vec<String> = map.iter().map(|e| e.key().clone()).collect();
+            for key in keys {
+                if !runs.contains_key(&key) {
+                    map.remove(&key);
                 }
             }
         }
+        sweep(&self.workers_by_run, &self.runs);
+        sweep(&self.datasets_by_run, &self.runs);
+        sweep(&self.checkpoints_by_run, &self.runs);
+        sweep(&self.rendezvous_by_run, &self.runs);
+
+        let progress_keys: Vec<ShardProgressKey> = self
+            .shard_progress
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        for key in progress_keys {
+            if !self.runs.contains_key(&key.run_id) {
+                self.shard_progress.remove(&key);
+            }
+        }
+        let commit_keys: Vec<(String, String)> = self
+            .checkpoint_commits
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        for key in commit_keys {
+            if !self.runs.contains_key(&key.0) {
+                self.checkpoint_commits.remove(&key);
+            }
+        }
+        let idem_keys: Vec<String> = self
+            .run_idempotency_keys
+            .iter()
+            .filter(|e| !self.runs.contains_key(e.value()))
+            .map(|e| e.key().clone())
+            .collect();
+        for key in idem_keys {
+            self.run_idempotency_keys.remove(&key);
+        }
+
+        expired.len()
     }
 
     // ── rendezvous ───────────────────────────────────────────────────────────
@@ -1151,12 +1514,25 @@ impl CoordinatorState {
             return Err(RendezvousError::MissingHost);
         }
         let run = self.require_registered_worker(run_id, worker_id)?;
+        if run.is_terminal() {
+            return Err(RendezvousError::RunTerminal(run.state));
+        }
         let rendezvous = self.rendezvous_for_run(&run);
         let snapshot =
             rendezvous
                 .lock()
                 .unwrap()
                 .join(worker_id, host, store_port, SystemTime::now());
+        if snapshot.complete {
+            self.set_run_state(
+                run_id,
+                RunState::Running,
+                format!(
+                    "rendezvous round {} complete (world size {})",
+                    snapshot.round, snapshot.world_size
+                ),
+            );
+        }
         Ok(snapshot)
     }
 
@@ -1166,11 +1542,26 @@ impl CoordinatorState {
         worker_id: &str,
     ) -> Result<RendezvousSnapshot, RendezvousError> {
         let run = self.require_registered_worker(run_id, worker_id)?;
+        if run.is_terminal() {
+            return Err(RendezvousError::RunTerminal(run.state));
+        }
         let rendezvous = self.rendezvous_for_run(&run);
         let snapshot = rendezvous
             .lock()
             .unwrap()
             .state_for(worker_id, SystemTime::now());
+        if snapshot.complete {
+            // Elastic settle windows complete lazily on polls, so the
+            // PENDING/RECOVERING → RUNNING transition can land here too.
+            self.set_run_state(
+                run_id,
+                RunState::Running,
+                format!(
+                    "rendezvous round {} complete (world size {})",
+                    snapshot.round, snapshot.world_size
+                ),
+            );
+        }
         Ok(snapshot)
     }
 
@@ -1617,22 +2008,32 @@ impl CoordinatorState {
         let mut workers = workers_arc.write().unwrap();
         let worker = workers.get_mut(&worker_id.value)?;
 
+        let (run_state, run_terminal, world_size) = {
+            let run = self
+                .runs
+                .get(&run_id.value)
+                .expect("run must exist when recording heartbeat");
+            (run.state, run.is_terminal(), run.world_size)
+        };
+
         let now = SystemTime::now();
         let next_heartbeat_deadline = now + HEARTBEAT_INTERVAL;
         let failure_deadline = now + WORKER_FAILURE_INTERVAL;
         worker.last_heartbeat_at = now;
         worker.next_heartbeat_deadline = next_heartbeat_deadline;
         worker.failure_deadline = failure_deadline;
-        worker.state = WorkerState::Active as i32;
+        // A heartbeat re-activates a stale/failed worker, but never resurrects
+        // one that already deregistered, and never revives workers of a
+        // terminal run — the response tells them to exit instead.
+        if !run_terminal
+            && worker.state != WorkerState::Completed as i32
+            && worker.state != WorkerState::Removed as i32
+        {
+            worker.state = WorkerState::Active as i32;
+        }
         let state = worker.state;
         let worker_snapshot = worker.clone();
         drop(workers);
-
-        let world_size = self
-            .runs
-            .get(&run_id.value)
-            .expect("run must exist when recording heartbeat")
-            .world_size;
 
         refresh_active_worker_count(&self.runs, &self.workers_by_run, &run_id.value);
         self.persist_worker(&worker_snapshot, world_size);
@@ -1641,6 +2042,7 @@ impl CoordinatorState {
             state,
             next_heartbeat_deadline,
             server_time: now,
+            run_state,
         })
     }
 
@@ -3004,5 +3406,269 @@ mod tests {
         assert_eq!(progress.progress_offset, 42);
         assert_eq!(progress.worker_id, worker_id.value);
         assert!(!progress.is_complete);
+    }
+
+    // ── run lifecycle ────────────────────────────────────────────────────────
+
+    fn register_lifecycle_run(state: &CoordinatorState, world_size: u32) -> RunId {
+        let registered = state.register_run(RegisterRunRequest {
+            idempotency_key: format!("lifecycle-{world_size}"),
+            run_name: "lifecycle".to_string(),
+            assignment_policy: AssignmentPolicy::StaticRank as i32,
+            storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
+            world_size,
+            run_version: "v1".to_string(),
+            ..Default::default()
+        });
+        registered.run_id
+    }
+
+    fn register_lifecycle_worker(state: &CoordinatorState, run_id: &RunId, name: &str) {
+        state
+            .register_worker(RegisterWorkerRequest {
+                idempotency_key: String::new(),
+                run_id: Some(run_id.clone()),
+                worker_id: Some(WorkerId {
+                    value: name.to_string(),
+                }),
+                rank: 0,
+                host: "host".to_string(),
+                sdk_version: String::new(),
+                protocol_version: String::new(),
+            })
+            .expect("worker registers");
+    }
+
+    fn run_state_of(state: &CoordinatorState, run_id: &RunId) -> i32 {
+        state.get_run(run_id).expect("run exists").state
+    }
+
+    #[test]
+    fn run_starts_pending_and_becomes_running_when_rendezvous_completes() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 2);
+        assert_eq!(run_state_of(&state, &run_id), RunState::Pending as i32);
+
+        register_lifecycle_worker(&state, &run_id, "w0");
+        register_lifecycle_worker(&state, &run_id, "w1");
+        state.join_rendezvous(&run_id.value, "w0", "h0", 0).unwrap();
+        assert_eq!(run_state_of(&state, &run_id), RunState::Pending as i32);
+        state.join_rendezvous(&run_id.value, "w1", "h1", 0).unwrap();
+        assert_eq!(run_state_of(&state, &run_id), RunState::Running as i32);
+    }
+
+    #[test]
+    fn worker_heartbeat_failure_moves_running_run_to_recovering() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 2);
+        register_lifecycle_worker(&state, &run_id, "w0");
+        register_lifecycle_worker(&state, &run_id, "w1");
+        state.join_rendezvous(&run_id.value, "w0", "h0", 0).unwrap();
+        state.join_rendezvous(&run_id.value, "w1", "h1", 0).unwrap();
+        assert_eq!(run_state_of(&state, &run_id), RunState::Running as i32);
+
+        // Drive w1 through stale → failed via expired deadlines.
+        let past = SystemTime::now() - Duration::from_secs(1);
+        let w1 = WorkerId {
+            value: "w1".to_string(),
+        };
+        assert!(state.set_worker_heartbeat_deadline_for_test(&run_id, &w1, past));
+        assert!(state.set_worker_failure_deadline_for_test(&run_id, &w1, past));
+        // Two passes: active → stale, then stale → failed.
+        state.reconcile_worker_liveness();
+        state.reconcile_worker_liveness();
+
+        assert_eq!(run_state_of(&state, &run_id), RunState::Recovering as i32);
+        let run = state.get_run(&run_id).unwrap();
+        assert!(
+            run.state_reason.contains("w1"),
+            "reason: {}",
+            run.state_reason
+        );
+
+        // Replacement joins; survivors re-join → RUNNING again.
+        state.join_rendezvous(&run_id.value, "w0", "h0", 0).unwrap();
+        register_lifecycle_worker(&state, &run_id, "w2");
+        state.join_rendezvous(&run_id.value, "w2", "h2", 0).unwrap();
+        assert_eq!(run_state_of(&state, &run_id), RunState::Running as i32);
+    }
+
+    #[test]
+    fn all_workers_completing_marks_run_completed_and_terminal_is_final() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 2);
+        register_lifecycle_worker(&state, &run_id, "w0");
+        register_lifecycle_worker(&state, &run_id, "w1");
+
+        let (worker_state, run_state) = state
+            .deregister_worker(&run_id.value, "w0", DeregisterReason::Completed)
+            .unwrap();
+        assert_eq!(worker_state, WorkerState::Completed as i32);
+        assert_ne!(run_state, RunState::Completed as i32);
+
+        let (_, run_state) = state
+            .deregister_worker(&run_id.value, "w1", DeregisterReason::Completed)
+            .unwrap();
+        assert_eq!(run_state, RunState::Completed as i32);
+
+        // Terminal states are final: cancel after completion is a no-op.
+        state.cancel_run(&run_id.value, "too late").unwrap();
+        assert_eq!(run_state_of(&state, &run_id), RunState::Completed as i32);
+    }
+
+    #[test]
+    fn completed_worker_is_not_resurrected_by_heartbeat() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 2);
+        register_lifecycle_worker(&state, &run_id, "w0");
+        state
+            .deregister_worker(&run_id.value, "w0", DeregisterReason::Completed)
+            .unwrap();
+
+        let heartbeat = state
+            .record_heartbeat(
+                &run_id,
+                &WorkerId {
+                    value: "w0".to_string(),
+                },
+            )
+            .expect("heartbeat still answered");
+        assert_eq!(heartbeat.state, WorkerState::Completed as i32);
+    }
+
+    #[test]
+    fn preempted_deregistration_invalidates_round_and_recovers() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 2);
+        register_lifecycle_worker(&state, &run_id, "w0");
+        register_lifecycle_worker(&state, &run_id, "w1");
+        state.join_rendezvous(&run_id.value, "w0", "h0", 0).unwrap();
+        state.join_rendezvous(&run_id.value, "w1", "h1", 0).unwrap();
+
+        let (worker_state, run_state) = state
+            .deregister_worker(&run_id.value, "w1", DeregisterReason::Preempted)
+            .unwrap();
+        assert_eq!(worker_state, WorkerState::Removed as i32);
+        assert_eq!(run_state, RunState::Recovering as i32);
+    }
+
+    #[test]
+    fn cancel_run_is_terminal_and_visible_to_heartbeats() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+        register_lifecycle_worker(&state, &run_id, "w0");
+
+        let cancelled = state.cancel_run(&run_id.value, "user requested").unwrap();
+        assert_eq!(cancelled, RunState::Cancelled as i32);
+
+        let heartbeat = state
+            .record_heartbeat(
+                &run_id,
+                &WorkerId {
+                    value: "w0".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(heartbeat.run_state, RunState::Cancelled as i32);
+
+        // Joining the rendezvous of a cancelled run is refused.
+        assert_eq!(
+            state.join_rendezvous(&run_id.value, "w0", "h0", 0),
+            Err(RendezvousError::RunTerminal(RunState::Cancelled as i32))
+        );
+
+        // Idempotent.
+        assert_eq!(
+            state.cancel_run(&run_id.value, "again").unwrap(),
+            RunState::Cancelled as i32
+        );
+    }
+
+    #[test]
+    fn cancel_unknown_run_errors() {
+        let state = CoordinatorState::default();
+        assert_eq!(
+            state.cancel_run("no-such-run", ""),
+            Err(CancelRunError::RunNotFound)
+        );
+    }
+
+    #[test]
+    fn silent_run_is_detected_as_stuck_and_failed() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+        register_lifecycle_worker(&state, &run_id, "w0");
+
+        // Nothing is stuck yet at a generous threshold.
+        assert_eq!(state.detect_stuck_runs(Duration::from_secs(3600)), 0);
+        // With a zero threshold the run's silence exceeds it immediately.
+        assert_eq!(state.detect_stuck_runs(Duration::from_secs(0)), 1);
+        let run = state.get_run(&run_id).unwrap();
+        assert_eq!(run.state, RunState::Failed as i32);
+        assert!(run.state_reason.contains("stuck"), "{}", run.state_reason);
+        // Terminal runs are skipped on later sweeps.
+        assert_eq!(state.detect_stuck_runs(Duration::from_secs(0)), 0);
+    }
+
+    #[test]
+    fn cleanup_removes_terminal_runs_after_retention_and_orphans() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+        register_lifecycle_worker(&state, &run_id, "w0");
+        state.join_rendezvous(&run_id.value, "w0", "h0", 0).unwrap();
+        state.cancel_run(&run_id.value, "cleanup test").unwrap();
+
+        // Inside retention: nothing removed.
+        assert_eq!(state.cleanup_terminal_runs(Duration::from_secs(3600)), 0);
+        assert!(state.get_run(&run_id).is_some());
+
+        // Past retention: the run and every per-run map entry disappear.
+        assert_eq!(state.cleanup_terminal_runs(Duration::from_secs(0)), 1);
+        assert!(state.get_run(&run_id).is_none());
+        assert_eq!(state.current_rendezvous_round(&run_id.value), 0);
+        assert!(state
+            .record_heartbeat(
+                &run_id,
+                &WorkerId {
+                    value: "w0".to_string()
+                }
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn run_lifecycle_state_survives_coordinator_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lifecycle.db");
+
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+        let state = CoordinatorState::with_metadata_store(Arc::new(store));
+
+        let run_id = register_lifecycle_run(&state, 1);
+        register_lifecycle_worker(&state, &run_id, "w0");
+        state.cancel_run(&run_id.value, "restart survival").unwrap();
+        drop(state);
+
+        let reopened = SqliteMetadataStore::open(&path).unwrap();
+        reopened.init_schema().unwrap();
+        let recreated = CoordinatorState::with_metadata_store(Arc::new(reopened));
+
+        let run = recreated.get_run(&run_id).expect("run rehydrated");
+        assert_eq!(run.state, RunState::Cancelled as i32);
+        assert!(run.state_reason.contains("restart survival"));
+
+        // RegisterRun idempotency also survives: re-registering with the same
+        // key returns the existing (cancelled) run instead of a new one.
+        let again = recreated.register_run(RegisterRunRequest {
+            idempotency_key: "lifecycle-1".to_string(),
+            run_name: "lifecycle".to_string(),
+            assignment_policy: AssignmentPolicy::StaticRank as i32,
+            storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
+            world_size: 1,
+            run_version: "v1".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(again.run_id, run_id);
     }
 }

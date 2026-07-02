@@ -117,6 +117,16 @@ class CoordinatorServiceStub:
                 request_serializer=runtime__pb2.GetRendezvousStateRequest.SerializeToString,
                 response_deserializer=runtime__pb2.GetRendezvousStateResponse.FromString,
                 _registered_method=True)
+        self.DeregisterWorker = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/DeregisterWorker',
+                request_serializer=runtime__pb2.DeregisterWorkerRequest.SerializeToString,
+                response_deserializer=runtime__pb2.DeregisterWorkerResponse.FromString,
+                _registered_method=True)
+        self.CancelRun = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/CancelRun',
+                request_serializer=runtime__pb2.CancelRunRequest.SerializeToString,
+                response_deserializer=runtime__pb2.CancelRunResponse.FromString,
+                _registered_method=True)
 
 
 class CoordinatorServiceServicer:
@@ -224,6 +234,24 @@ class CoordinatorServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def DeregisterWorker(self, request, context):
+        """Graceful worker departure: completed training, preempted, or erroring
+        out.  Unlike heartbeat-timeout failure detection this takes effect
+        immediately (rendezvous membership changes without waiting out the
+        failure deadline) and feeds the run lifecycle state machine.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CancelRun(self, request, context):
+        """Cancel a run (admin).  Terminal: workers observe RUN_STATE_CANCELLED on
+        their next heartbeat and exit; launchers stop restarting workers.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_CoordinatorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -306,6 +334,16 @@ def add_CoordinatorServiceServicer_to_server(servicer, server):
                     servicer.GetRendezvousState,
                     request_deserializer=runtime__pb2.GetRendezvousStateRequest.FromString,
                     response_serializer=runtime__pb2.GetRendezvousStateResponse.SerializeToString,
+            ),
+            'DeregisterWorker': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeregisterWorker,
+                    request_deserializer=runtime__pb2.DeregisterWorkerRequest.FromString,
+                    response_serializer=runtime__pb2.DeregisterWorkerResponse.SerializeToString,
+            ),
+            'CancelRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.CancelRun,
+                    request_deserializer=runtime__pb2.CancelRunRequest.FromString,
+                    response_serializer=runtime__pb2.CancelRunResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -743,6 +781,60 @@ class CoordinatorService:
             '/runtime.v1.CoordinatorService/GetRendezvousState',
             runtime__pb2.GetRendezvousStateRequest.SerializeToString,
             runtime__pb2.GetRendezvousStateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeregisterWorker(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/DeregisterWorker',
+            runtime__pb2.DeregisterWorkerRequest.SerializeToString,
+            runtime__pb2.DeregisterWorkerResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CancelRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/CancelRun',
+            runtime__pb2.CancelRunRequest.SerializeToString,
+            runtime__pb2.CancelRunResponse.FromString,
             options,
             channel_credentials,
             insecure,

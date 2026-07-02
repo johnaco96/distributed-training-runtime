@@ -196,6 +196,14 @@ class _Child:
     restarts: int = 0
 
 
+# Run lifecycle states mirrored from proto (numeric to avoid importing
+# generated code at module import time).
+_RUN_STATE_COMPLETED = 4
+_RUN_STATE_FAILED = 5
+_RUN_STATE_CANCELLED = 6
+_TERMINAL_RUN_STATES = {_RUN_STATE_COMPLETED, _RUN_STATE_FAILED, _RUN_STATE_CANCELLED}
+
+
 class WorkerSupervisor:
     """Spawns and supervises the node's worker processes."""
 
@@ -204,6 +212,21 @@ class WorkerSupervisor:
         self._run_id = run_id
         self._children: list[_Child] = []
         self._restarts_used = 0
+
+    def _run_state(self) -> int:
+        """Best-effort lifecycle check before restarting a failed worker, so a
+        cancelled or failed run is not kept alive by the restart loop."""
+        from dtruntime.client import RuntimeClient
+
+        try:
+            client = RuntimeClient(self._config.coordinator)
+            try:
+                return int(client.get_run_status(self._run_id, timeout=2.0).state)
+            finally:
+                client.close()
+        except Exception as exc:  # noqa: BLE001 - unreachable coordinator must not kill the node
+            logger.warning("could not read run state (%s); assuming run is live", exc)
+            return 0
 
     def _spawn(self, local_rank: int) -> subprocess.Popen:
         command = [sys.executable, self._config.script, *self._config.script_args]
@@ -227,6 +250,17 @@ class WorkerSupervisor:
                         continue
                     if code == 0:
                         continue
+                    run_state = self._run_state()
+                    if run_state in _TERMINAL_RUN_STATES:
+                        logger.info(
+                            "worker local_rank=%d exited with %d but the run is in "
+                            "terminal state %d; not restarting",
+                            child.local_rank,
+                            code,
+                            run_state,
+                        )
+                        self.terminate_all()
+                        return 0 if run_state == _RUN_STATE_COMPLETED else 3
                     if self._restarts_used >= self._config.max_restarts:
                         logger.error(
                             "worker local_rank=%d exited with %d and the restart "

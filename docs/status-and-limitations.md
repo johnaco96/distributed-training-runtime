@@ -40,6 +40,15 @@ The following capabilities are implemented and locally validated:
   Batch (see `docs/schedulers.md`).
 - GPU/accelerator requests, node selectors, tolerations, affinity, topology
   spread constraints, and priority classes on TrainingRun specs.
+- Durable run lifecycle states (pending/running/recovering/completed/failed/
+  cancelled) persisted and rehydrated across coordinator restarts (see
+  `docs/run-lifecycle.md`).
+- Graceful worker deregistration (`DeregisterWorker`: completed/preempted/
+  error) and admin run cancellation (`CancelRun`).
+- Stuck-run detection, terminal-run retention cleanup, and orphaned-state
+  sweeping via the coordinator's periodic reconcile task.
+- Coordinator failover transparency for in-flight training (validated:
+  hard-kill + restart on the same metadata DB mid-training completes the run).
 
 ## Current limitations and non-goals
 

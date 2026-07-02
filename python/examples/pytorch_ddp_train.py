@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -53,9 +54,12 @@ def train(ctx: torch_dist.TrainingContext, steps: int, report: dict) -> None:
     test_dir = os.environ.get("DTRUNTIME_TEST_DIR")
 
     generator = torch.Generator().manual_seed(1234 + ctx.rank)
+    step_delay = float(os.environ.get("DTRUNTIME_TEST_STEP_DELAY", "0"))
     loss_value = float("nan")
     for step in range(steps):
         ctx.raise_if_membership_changed()
+        if step_delay:
+            time.sleep(step_delay)
 
         if ctx.rank == fail_rank and step == fail_step and test_dir:
             crash_marker = Path(test_dir) / f"crashed-{os.environ['DTRUNTIME_WORKER_ID']}"
@@ -110,6 +114,12 @@ def main() -> int:
             max_rejoin=args.max_rejoin,
             collective_error_grace=float(os.environ.get("DTRUNTIME_TEST_GRACE", "150")),
         )
+    except torch_dist.RunTerminated as exc:
+        # Cancelled or failed by the coordinator: stop quietly with a distinct
+        # exit code so supervisors can tell this apart from a crash.
+        print(f"[worker] run terminated by coordinator: {exc}", flush=True)
+        ctx.shutdown(torch_dist.DEREGISTER_ERROR)
+        return 75
     finally:
         ctx.shutdown()
 

@@ -318,15 +318,17 @@ fn already_exists(message: impl Into<String>) -> Status {
 }
 
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
-const RUNTIME_CAPABILITIES: [&str; 8] = [
+const RUNTIME_CAPABILITIES: [&str; 10] = [
     "checkpoint-cleanup-library",
     "elastic-training",
     "idempotency-key-validation",
     "lease-active-worker-gate",
     "local-scaling-benchmarks",
     "rendezvous",
+    "run-lifecycle",
     "s3-storage",
     "stream-checkpoint-artifact",
+    "worker-deregistration",
 ];
 
 fn validate_idempotency_key(operation: &str, idempotency_key: &str) -> Result<(), Status> {
@@ -407,6 +409,13 @@ impl CoordinatorService for CoordinatorServiceImpl {
             .clone()
             .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
 
+        if self.state.run_is_terminal(&run_id.value) == Some(true) {
+            return Err(failed_precondition(format!(
+                "run {} is in a terminal state and no longer accepts workers",
+                run_id.value
+            )));
+        }
+
         let registered = self
             .state
             .register_worker(request)
@@ -471,6 +480,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
             next_heartbeat_deadline: Some(heartbeat.next_heartbeat_deadline.into()),
             server_time: Some(heartbeat.server_time.into()),
             rendezvous_round: self.state.current_rendezvous_round(&run_id.value),
+            run_state: heartbeat.run_state,
         };
         self.metrics.inc_heartbeats_total();
         self.update_worker_metrics(&run_id);
@@ -1244,9 +1254,107 @@ impl CoordinatorService for CoordinatorServiceImpl {
             latest_checkpoint_state: record.latest_checkpoint_state,
             active_worker_count: record.active_worker_count,
             server_time: Some(std::time::SystemTime::now().into()),
+            state: record.state,
+            state_reason: record.state_reason,
         };
 
         Ok(Response::new(response))
+    }
+
+    async fn deregister_worker(
+        &self,
+        request: Request<DeregisterWorkerRequest>,
+    ) -> Result<Response<DeregisterWorkerResponse>, Status> {
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
+            .value
+            .clone();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("deregister_worker", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let worker_id = request
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let reason =
+            DeregisterReason::try_from(request.reason).unwrap_or(DeregisterReason::Unspecified);
+
+        let (worker_state, run_state) = self
+            .state
+            .deregister_worker(&run_id.value, &worker_id.value, reason)
+            .map_err(|error| match error {
+                crate::state::DeregisterWorkerError::RunNotFound => {
+                    not_found(format!("run {} was not found", run_id.value))
+                }
+                crate::state::DeregisterWorkerError::WorkerNotFound => not_found(format!(
+                    "worker {} was not found under run {}",
+                    worker_id.value, run_id.value
+                )),
+            })?;
+        self.update_worker_metrics(&run_id);
+        info!(
+            run_id = %run_id.value,
+            worker_id = %worker_id.value,
+            reason = ?reason,
+            "worker deregistered"
+        );
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::WorkerDeregistered),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            worker_id: Some(worker_id.value.clone()),
+            reason: Some(format!("{reason:?}")),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(DeregisterWorkerResponse {
+            state: worker_state,
+            run_state,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn cancel_run(
+        &self,
+        request: Request<CancelRunRequest>,
+    ) -> Result<Response<CancelRunResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("cancel_run", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let state = self
+            .state
+            .cancel_run(&run_id.value, &request.reason)
+            .map_err(|crate::state::CancelRunError::RunNotFound| {
+                not_found(format!("run {} was not found", run_id.value))
+            })?;
+        info!(run_id = %run_id.value, reason = %request.reason, "run cancelled");
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunCancelled),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            reason: if request.reason.is_empty() {
+                None
+            } else {
+                Some(request.reason.clone())
+            },
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(CancelRunResponse {
+            state,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
     }
 
     async fn join_rendezvous(
@@ -1337,6 +1445,10 @@ fn map_rendezvous_error(error: crate::state::RendezvousError) -> Status {
             not_found("worker was not found; call RegisterWorker before JoinRendezvous")
         }
         crate::state::RendezvousError::MissingHost => invalid_argument("host is required"),
+        crate::state::RendezvousError::RunTerminal(state) => failed_precondition(format!(
+            "run is in terminal state {:?}; workers should exit",
+            RunState::try_from(state).unwrap_or(RunState::Unspecified)
+        )),
     }
 }
 
@@ -3871,6 +3983,87 @@ mod tests {
             .expect("heartbeat should succeed")
             .into_inner();
         assert_eq!(after.rendezvous_round, info.round);
+    }
+
+    #[tokio::test]
+    async fn cancel_run_flows_through_heartbeat_and_blocks_new_workers() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        register_rendezvous_worker(&service, &run_id, "w0").await;
+
+        let cancelled = service
+            .cancel_run(Request::new(CancelRunRequest {
+                run_id: Some(run_id.clone()),
+                reason: "test".to_string(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect("cancel_run should succeed")
+            .into_inner();
+        assert_eq!(cancelled.state, RunState::Cancelled as i32);
+
+        let heartbeat = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(WorkerId {
+                    value: "w0".to_string(),
+                }),
+                idempotency_key: String::new(),
+                client_time: None,
+                active_shard_ids: vec![],
+            }))
+            .await
+            .expect("heartbeat still answered")
+            .into_inner();
+        assert_eq!(heartbeat.run_state, RunState::Cancelled as i32);
+
+        let status = service
+            .register_worker(Request::new(RegisterWorkerRequest {
+                idempotency_key: String::new(),
+                run_id: Some(run_id.clone()),
+                worker_id: Some(WorkerId {
+                    value: "late".to_string(),
+                }),
+                rank: 0,
+                host: "h".to_string(),
+                sdk_version: String::new(),
+                protocol_version: String::new(),
+            }))
+            .await
+            .expect_err("terminal runs must reject new workers");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn deregister_worker_completes_run_when_roster_finishes() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 1).await;
+        register_rendezvous_worker(&service, &run_id, "w0").await;
+
+        let response = service
+            .deregister_worker(Request::new(DeregisterWorkerRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(WorkerId {
+                    value: "w0".to_string(),
+                }),
+                reason: DeregisterReason::Completed as i32,
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect("deregister should succeed")
+            .into_inner();
+        assert_eq!(response.state, WorkerState::Completed as i32);
+        assert_eq!(response.run_state, RunState::Completed as i32);
+
+        let status = service
+            .get_run_status(Request::new(GetRunStatusRequest {
+                run_id: Some(run_id.clone()),
+            }))
+            .await
+            .expect("status should succeed")
+            .into_inner();
+        assert_eq!(status.state, RunState::Completed as i32);
+        assert!(status.state_reason.contains("completed"));
     }
 
     #[tokio::test]

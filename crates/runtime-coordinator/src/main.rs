@@ -50,6 +50,15 @@ struct CoordinatorCliArgs {
     /// with `--no-verify-checkpoint-artifacts` for maximum throughput when
     /// storage reliability is otherwise guaranteed.
     verify_checkpoint_artifacts: bool,
+    /// How often the background reconcile task runs (liveness, stuck-run
+    /// detection, retention cleanup).
+    reconcile_interval_secs: u64,
+    /// A non-terminal run with no worker heartbeat for this long is marked
+    /// FAILED ("stuck").
+    stuck_after_secs: u64,
+    /// How long terminal runs keep their in-memory state before cleanup
+    /// (durable rows are retained).
+    terminal_run_retention_secs: u64,
     show_help: bool,
 }
 
@@ -214,6 +223,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Failure-semantics reconcile loop: worker liveness, stuck-run detection,
+    // and retention cleanup of terminal runs run continuously rather than
+    // only piggybacked on RPCs, so failures are detected even when no client
+    // is polling.
+    {
+        let reconcile_state = state.clone();
+        let interval = std::time::Duration::from_secs(args.reconcile_interval_secs.max(1));
+        let stuck_after = std::time::Duration::from_secs(args.stuck_after_secs.max(1));
+        let retention = std::time::Duration::from_secs(args.terminal_run_retention_secs.max(1));
+        info!(
+            interval_secs = interval.as_secs(),
+            stuck_after_secs = stuck_after.as_secs(),
+            terminal_run_retention_secs = retention.as_secs(),
+            "starting periodic reconcile task"
+        );
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                reconcile_state.reconcile_worker_liveness();
+                let stuck = reconcile_state.detect_stuck_runs(stuck_after);
+                if stuck > 0 {
+                    tracing::warn!(count = stuck, "marked stuck run(s) as failed");
+                }
+                reconcile_state.cleanup_terminal_runs(retention);
+            }
+        });
+    }
+
     let mut builder = Server::builder();
     if let Some(tls) = load_tls_config(&args, &audit)? {
         builder = builder.tls_config(tls)?;
@@ -293,7 +332,7 @@ fn load_tls_config(
 }
 
 fn print_usage() {
-    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--metadata-db-url <URL>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--max-s3-concurrent-ops <N>] [--help|-h]");
+    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--metadata-db-url <URL>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--max-s3-concurrent-ops <N>] [--reconcile-interval-secs <N>] [--stuck-after-secs <N>] [--terminal-run-retention-secs <N>] [--help|-h]");
     println!("\nOptions:");
     println!("  --addr <ADDR>              Coordinator listen address (default: {DEFAULT_ADDR})");
     println!(
@@ -353,6 +392,9 @@ fn coordinator_args(
         s3_region: std::env::var("DTRUNTIME_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
         max_s3_concurrent_ops: None,
         verify_checkpoint_artifacts: true,
+        reconcile_interval_secs: 10,
+        stuck_after_secs: 1800,
+        terminal_run_retention_secs: 24 * 60 * 60,
         show_help: false,
     };
 
@@ -397,6 +439,24 @@ fn coordinator_args(
             parsed.s3_secret_key = Some(args.next().ok_or("--s3-secret-key requires a value")?);
         } else if arg == "--s3-region" {
             parsed.s3_region = args.next().ok_or("--s3-region requires a value")?;
+        } else if arg == "--reconcile-interval-secs" {
+            parsed.reconcile_interval_secs = args
+                .next()
+                .ok_or("--reconcile-interval-secs requires a value")?
+                .parse()
+                .map_err(|_| "--reconcile-interval-secs must be a positive integer")?;
+        } else if arg == "--stuck-after-secs" {
+            parsed.stuck_after_secs = args
+                .next()
+                .ok_or("--stuck-after-secs requires a value")?
+                .parse()
+                .map_err(|_| "--stuck-after-secs must be a positive integer")?;
+        } else if arg == "--terminal-run-retention-secs" {
+            parsed.terminal_run_retention_secs = args
+                .next()
+                .ok_or("--terminal-run-retention-secs requires a value")?
+                .parse()
+                .map_err(|_| "--terminal-run-retention-secs must be a positive integer")?;
         } else if arg == "--max-s3-concurrent-ops" {
             let raw = args
                 .next()
@@ -455,6 +515,9 @@ mod tests {
                     .unwrap_or_else(|_| "us-east-1".to_string()),
                 max_s3_concurrent_ops: None,
                 verify_checkpoint_artifacts: true,
+                reconcile_interval_secs: 10,
+                stuck_after_secs: 1800,
+                terminal_run_retention_secs: 24 * 60 * 60,
                 show_help: false,
             }
         );

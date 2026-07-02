@@ -440,6 +440,55 @@ class RuntimeClient:
             request, metadata=self.rpc_metadata(worker_id=worker_id)
         )
 
+    def deregister_worker(
+        self,
+        run_id: str,
+        worker_id: str,
+        reason: int = 0,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.DeregisterWorkerResponse":
+        """Gracefully deregister a worker (completed, preempted, or error).
+
+        Takes effect immediately: the rendezvous membership changes without
+        waiting out the heartbeat failure deadline, and the run transitions to
+        COMPLETED once every worker has deregistered as completed.
+        """
+        request = self._runtime_pb2.DeregisterWorkerRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.DeregisterWorker(
+            request, metadata=self.rpc_metadata(worker_id=worker_id)
+        )
+
+    def cancel_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.CancelRunResponse":
+        """Cancel a run (admin).  Terminal and idempotent; workers observe the
+        state on their next heartbeat and exit."""
+        request = self._runtime_pb2.CancelRunRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.CancelRun(request, metadata=self.rpc_metadata())
+
+    def get_run_status(
+        self, run_id: str, timeout: float | None = None
+    ) -> "runtime_pb2.GetRunStatusResponse":
+        """Fetch run status including the lifecycle state (admin)."""
+        request = self._runtime_pb2.GetRunStatusRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+        )
+        return self._stub.GetRunStatus(
+            request, metadata=self.rpc_metadata(), timeout=timeout
+        )
+
     def heartbeat(
         self,
         run_id: str,

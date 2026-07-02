@@ -31,6 +31,40 @@ service CoordinatorService {
   // the c10d store endpoint, and workers poll until the round completes.
   rpc JoinRendezvous(JoinRendezvousRequest) returns (JoinRendezvousResponse);
   rpc GetRendezvousState(GetRendezvousStateRequest) returns (GetRendezvousStateResponse);
+
+  // Graceful worker departure: completed training, preempted, or erroring
+  // out.  Unlike heartbeat-timeout failure detection this takes effect
+  // immediately (rendezvous membership changes without waiting out the
+  // failure deadline) and feeds the run lifecycle state machine.
+  rpc DeregisterWorker(DeregisterWorkerRequest) returns (DeregisterWorkerResponse);
+
+  // Cancel a run (admin).  Terminal: workers observe RUN_STATE_CANCELLED on
+  // their next heartbeat and exit; launchers stop restarting workers.
+  rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+}
+
+// Durable run lifecycle.  Persisted to the metadata store and rehydrated on
+// coordinator restart.
+//
+//   PENDING ──► RUNNING ◄──► RECOVERING          (rendezvous formed / broken)
+//                  │                │
+//                  ├──► COMPLETED   ├──► FAILED  (all workers done / stuck,
+//                  │                │             restart budget exhausted)
+//                  └──────► CANCELLED ◄──────────(admin, from any live state)
+//
+// COMPLETED, FAILED, and CANCELLED are terminal.
+enum RunState {
+  RUN_STATE_UNSPECIFIED = 0;
+  // Registered; the first rendezvous round has not completed yet.
+  RUN_STATE_PENDING = 1;
+  // A rendezvous round is complete and workers hold ranks.
+  RUN_STATE_RUNNING = 2;
+  // A previously complete round was invalidated (worker died or membership
+  // changed); surviving workers are re-forming the process group.
+  RUN_STATE_RECOVERING = 3;
+  RUN_STATE_COMPLETED = 4;
+  RUN_STATE_FAILED = 5;
+  RUN_STATE_CANCELLED = 6;
 }
 
 message ProtocolVersion {
@@ -66,6 +100,8 @@ enum WorkerState {
   WORKER_STATE_FAILED = 4;
   WORKER_STATE_RECOVERING = 5;
   WORKER_STATE_REMOVED = 6;
+  // Worker deregistered gracefully after finishing its work.
+  WORKER_STATE_COMPLETED = 7;
 }
 
 enum ShardLeaseState {
@@ -192,6 +228,9 @@ message HeartbeatResponse {
   // Workers compare this to the round they joined; a larger value means the
   // membership changed and the worker must re-join the rendezvous.
   uint64 rendezvous_round = 4;
+  // Current run lifecycle state.  Workers exit when they observe a terminal
+  // state (most importantly RUN_STATE_CANCELLED).
+  RunState run_state = 5;
 }
 
 message GetShardAssignmentRequest {
@@ -380,6 +419,44 @@ message GetRunStatusResponse {
   CheckpointState latest_checkpoint_state = 6;
   uint32 active_worker_count = 7;
   google.protobuf.Timestamp server_time = 8;
+  RunState state = 9;
+  // Human-readable explanation for the current state (failure cause,
+  // cancellation reason, stuck-detection detail).
+  string state_reason = 10;
+}
+
+enum DeregisterReason {
+  DEREGISTER_REASON_UNSPECIFIED = 0;
+  // Training finished successfully on this worker.
+  DEREGISTER_REASON_COMPLETED = 1;
+  // The worker is being evicted (spot reclaim, drain, elastic scale-down).
+  DEREGISTER_REASON_PREEMPTED = 2;
+  // The worker is exiting due to an unrecoverable local error.
+  DEREGISTER_REASON_ERROR = 3;
+}
+
+message DeregisterWorkerRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  DeregisterReason reason = 3;
+  string idempotency_key = 4;
+}
+
+message DeregisterWorkerResponse {
+  WorkerState state = 1;
+  RunState run_state = 2;
+  google.protobuf.Timestamp server_time = 3;
+}
+
+message CancelRunRequest {
+  RunId run_id = 1;
+  string reason = 2;
+  string idempotency_key = 3;
+}
+
+message CancelRunResponse {
+  RunState state = 1;
+  google.protobuf.Timestamp server_time = 2;
 }
 
 // ─── rendezvous ──────────────────────────────────────────────────────────────

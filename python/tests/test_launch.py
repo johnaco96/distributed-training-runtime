@@ -108,7 +108,11 @@ def _supervisor(tmp_path: Path, script_body: str, max_restarts: int = 3) -> Work
         max_restarts=max_restarts,
         node_id="testnode",
     )
-    return WorkerSupervisor(config, "run-test")
+    supervisor = WorkerSupervisor(config, "run-test")
+    # Keep these tests hermetic: no coordinator exists, so the pre-restart
+    # lifecycle check reports "unknown / live" without touching gRPC.
+    supervisor._run_state = lambda: 0
+    return supervisor
 
 
 def test_supervisor_returns_zero_when_all_workers_exit_cleanly(tmp_path: Path) -> None:
