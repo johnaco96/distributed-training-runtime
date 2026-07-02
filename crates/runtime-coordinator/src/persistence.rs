@@ -12,6 +12,7 @@ use runtime_checkpoint::{
     ArtifactRecord, CheckpointId as DomainCheckpointId, CheckpointRecord,
     CheckpointState as DomainCheckpointState, RunId as DomainRunId, WorkerId as DomainWorkerId,
 };
+use runtime_proto::runtime::v1::CheckpointId as ProtoCheckpointId;
 
 /// Boxed error returned by all [`MetadataStore`] methods.
 ///
@@ -123,6 +124,26 @@ pub trait MetadataStore: Send + Sync {
 
     /// Append one audit event to durable storage.
     fn insert_audit_event(&self, event: &AuditEventEntry) -> PersistResult<()>;
+
+    // ── durable run state machine (full hydration on restart) ────────────────
+
+    /// Upsert one idempotency-key mapping.
+    /// `scope` IN (run, worker, dataset, checkpoint, checkpoint_artifact).
+    fn save_idempotency_key(&self, scope: &str, key: &str, value: &str) -> PersistResult<()>;
+
+    /// Return every (scope, key, value) idempotency mapping.
+    fn load_all_idempotency_keys(&self) -> PersistResult<Vec<(String, String, String)>>;
+
+    /// Return every worker across all runs. Deadline fields are placeholders;
+    /// the caller must re-arm liveness deadlines after a restart.
+    fn load_all_workers(&self) -> PersistResult<Vec<WorkerRecord>>;
+
+    /// Return every dataset (with shards) across all runs.
+    fn load_all_datasets(&self) -> PersistResult<Vec<DatasetRecord>>;
+
+    /// Return every checkpoint (any state) with artifacts and the expected
+    /// worker set, as `(run_id, record)` pairs.
+    fn load_all_checkpoints(&self) -> PersistResult<Vec<(String, CoordinatorCheckpointRecord)>>;
 }
 
 #[derive(Clone, Debug)]
@@ -156,7 +177,8 @@ CREATE TABLE IF NOT EXISTS runs (
   settle_timeout_ms INTEGER NOT NULL DEFAULT 0,
   assignment_policy INTEGER NOT NULL DEFAULT 0,
   storage_backend_kind INTEGER NOT NULL DEFAULT 0,
-  run_version TEXT NOT NULL DEFAULT ''
+  run_version TEXT NOT NULL DEFAULT '',
+  latest_checkpoint_id TEXT
 );
 CREATE TABLE IF NOT EXISTS workers (
   run_id TEXT NOT NULL,
@@ -166,6 +188,10 @@ CREATE TABLE IF NOT EXISTS workers (
   status INTEGER NOT NULL,
   last_heartbeat_millis INTEGER,
   idempotency_key TEXT,
+  host TEXT NOT NULL DEFAULT '',
+  sdk_version TEXT NOT NULL DEFAULT '',
+  protocol_version TEXT NOT NULL DEFAULT '',
+  registered_at_millis INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (run_id, worker_id)
 );
 CREATE TABLE IF NOT EXISTS datasets (
@@ -174,6 +200,11 @@ CREATE TABLE IF NOT EXISTS datasets (
   name TEXT NOT NULL,
   num_shards INTEGER NOT NULL,
   idempotency_key TEXT,
+  dataset_uri TEXT NOT NULL DEFAULT '',
+  format TEXT NOT NULL DEFAULT '',
+  dataset_version TEXT NOT NULL DEFAULT '',
+  labels_json TEXT NOT NULL DEFAULT '{}',
+  registered_at_millis INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (run_id, dataset_id)
 );
 CREATE TABLE IF NOT EXISTS shards (
@@ -184,6 +215,10 @@ CREATE TABLE IF NOT EXISTS shards (
   shard_uri TEXT NOT NULL,
   num_records INTEGER,
   size_bytes INTEGER,
+  byte_range_start INTEGER NOT NULL DEFAULT 0,
+  byte_range_end INTEGER NOT NULL DEFAULT 0,
+  checksum TEXT NOT NULL DEFAULT '',
+  checksum_algorithm TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (run_id, dataset_id, shard_id)
 );
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -196,7 +231,17 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   updated_at_millis INTEGER NOT NULL,
   committed_at_millis INTEGER,
   idempotency_key TEXT,
+  expected_worker_ids_json TEXT NOT NULL DEFAULT '[]',
   PRIMARY KEY (run_id, checkpoint_id)
+);
+-- Durable idempotency-key maps: one row per in-memory DashMap entry so
+-- retried RPCs stay idempotent across coordinator restarts.
+-- scope IN (run, worker, dataset, checkpoint, checkpoint_artifact).
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  scope TEXT NOT NULL,
+  key   TEXT NOT NULL,
+  value TEXT NOT NULL,
+  PRIMARY KEY (scope, key)
 );
 CREATE TABLE IF NOT EXISTS checkpoint_artifacts (
   run_id TEXT NOT NULL,
@@ -252,25 +297,65 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 ",
         )?;
-        // Best-effort migration for databases created before the run
-        // lifecycle columns existed.  SQLite has no ADD COLUMN IF NOT EXISTS;
-        // a duplicate-column error means the column is already present.
-        // (A real migration framework lands with the Phase 6 storage work.)
-        for ddl in [
-            "ALTER TABLE runs ADD COLUMN run_state INTEGER NOT NULL DEFAULT 1",
-            "ALTER TABLE runs ADD COLUMN state_reason TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE runs ADD COLUMN world_size INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE runs ADD COLUMN min_world_size INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE runs ADD COLUMN max_world_size INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE runs ADD COLUMN settle_timeout_ms INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE runs ADD COLUMN assignment_policy INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE runs ADD COLUMN storage_backend_kind INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE runs ADD COLUMN run_version TEXT NOT NULL DEFAULT ''",
-        ] {
-            match conn.execute(ddl, []) {
-                Ok(_) => {}
-                Err(e) if e.to_string().contains("duplicate column name") => {}
-                Err(e) => return Err(e),
+        drop(conn);
+        self.migrate_schema()
+    }
+
+    /// Add columns introduced after a table was first created (idempotent).
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` covers fresh databases only; databases
+    /// created by earlier builds need the new columns retrofitted.  Column
+    /// presence is checked via PRAGMA rather than swallowing ALTER errors.
+    /// (A full migration framework lands with the Phase 6 storage work.)
+    fn migrate_schema(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("sqlite lock poisoned");
+        let additions: &[(&str, &str, &str)] = &[
+            ("runs", "run_state", "INTEGER NOT NULL DEFAULT 1"),
+            ("runs", "state_reason", "TEXT NOT NULL DEFAULT ''"),
+            ("runs", "world_size", "INTEGER NOT NULL DEFAULT 0"),
+            ("runs", "min_world_size", "INTEGER NOT NULL DEFAULT 0"),
+            ("runs", "max_world_size", "INTEGER NOT NULL DEFAULT 0"),
+            ("runs", "settle_timeout_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("runs", "assignment_policy", "INTEGER NOT NULL DEFAULT 0"),
+            ("runs", "storage_backend_kind", "INTEGER NOT NULL DEFAULT 0"),
+            ("runs", "run_version", "TEXT NOT NULL DEFAULT ''"),
+            ("runs", "latest_checkpoint_id", "TEXT"),
+            ("workers", "host", "TEXT NOT NULL DEFAULT ''"),
+            ("workers", "sdk_version", "TEXT NOT NULL DEFAULT ''"),
+            ("workers", "protocol_version", "TEXT NOT NULL DEFAULT ''"),
+            (
+                "workers",
+                "registered_at_millis",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("datasets", "dataset_uri", "TEXT NOT NULL DEFAULT ''"),
+            ("datasets", "format", "TEXT NOT NULL DEFAULT ''"),
+            ("datasets", "dataset_version", "TEXT NOT NULL DEFAULT ''"),
+            ("datasets", "labels_json", "TEXT NOT NULL DEFAULT '{}'"),
+            (
+                "datasets",
+                "registered_at_millis",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("shards", "byte_range_start", "INTEGER NOT NULL DEFAULT 0"),
+            ("shards", "byte_range_end", "INTEGER NOT NULL DEFAULT 0"),
+            ("shards", "checksum", "TEXT NOT NULL DEFAULT ''"),
+            ("shards", "checksum_algorithm", "TEXT NOT NULL DEFAULT ''"),
+            (
+                "checkpoints",
+                "expected_worker_ids_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            ),
+        ];
+        for (table, column, decl) in additions {
+            let exists: bool = conn
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .any(|name| name == column);
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
             }
         }
         Ok(())
@@ -281,8 +366,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
         conn.execute(
             "INSERT OR REPLACE INTO runs(run_id,name,status,created_at_millis,idempotency_key,\
              run_state,state_reason,world_size,min_world_size,max_world_size,settle_timeout_ms,\
-             assignment_policy,storage_backend_kind,run_version) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+             assignment_policy,storage_backend_kind,run_version,latest_checkpoint_id) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 run.run_id,
                 run.run_name,
@@ -302,6 +387,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
                 run.assignment_policy,
                 run.storage_backend_kind,
                 run.run_version,
+                run.latest_checkpoint_id.as_ref().map(|c| c.value.clone()),
             ],
         )?;
         Ok(())
@@ -312,7 +398,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
         let mut stmt = conn.prepare(
             "SELECT run_id,name,created_at_millis,idempotency_key,run_state,state_reason,\
              world_size,min_world_size,max_world_size,settle_timeout_ms,assignment_policy,\
-             storage_backend_kind,run_version FROM runs ORDER BY run_id",
+             storage_backend_kind,run_version,status,latest_checkpoint_id FROM runs \
+             ORDER BY run_id",
         )?;
         let runs = stmt
             .query_map([], |r| {
@@ -331,8 +418,10 @@ CREATE TABLE IF NOT EXISTS audit_events (
                     storage_backend_kind: r.get(11)?,
                     run_version: r.get(12)?,
                     active_worker_count: 0,
-                    latest_checkpoint_id: None,
-                    latest_checkpoint_state: 0,
+                    latest_checkpoint_state: r.get(13)?,
+                    latest_checkpoint_id: r
+                        .get::<_, Option<String>>(14)?
+                        .map(|value| ProtoCheckpointId { value }),
                     state_updated_at: std::time::SystemTime::now(),
                 })
             })?
@@ -341,8 +430,54 @@ CREATE TABLE IF NOT EXISTS audit_events (
     }
     pub fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite");
-        conn.execute("INSERT OR REPLACE INTO workers(run_id,worker_id,rank,world_size,status,last_heartbeat_millis,idempotency_key) VALUES(?1,?2,?3,?4,?5,?6,NULL)",params![w.run_id,w.worker_id,w.rank,world_size,w.state,to_millis(w.last_heartbeat_at)])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO workers(run_id,worker_id,rank,world_size,status,\
+             last_heartbeat_millis,idempotency_key,host,sdk_version,protocol_version,\
+             registered_at_millis) VALUES(?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9,?10)",
+            params![
+                w.run_id,
+                w.worker_id,
+                w.rank,
+                world_size,
+                w.state,
+                to_millis(w.last_heartbeat_at),
+                w.host,
+                w.sdk_version,
+                w.protocol_version,
+                to_millis(w.registered_at)
+            ],
+        )?;
         Ok(())
+    }
+
+    pub fn load_all_workers(&self) -> rusqlite::Result<Vec<WorkerRecord>> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn.prepare(
+            "SELECT run_id,worker_id,rank,status,last_heartbeat_millis,host,\
+             sdk_version,protocol_version,registered_at_millis FROM workers",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let last_heartbeat =
+                    from_millis(r.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64);
+                Ok(WorkerRecord {
+                    run_id: r.get(0)?,
+                    worker_id: r.get(1)?,
+                    rank: r.get::<_, i64>(2)? as u32,
+                    state: r.get(3)?,
+                    last_heartbeat_at: last_heartbeat,
+                    host: r.get(5)?,
+                    sdk_version: r.get(6)?,
+                    protocol_version: r.get(7)?,
+                    registered_at: from_millis(r.get::<_, i64>(8)?.max(0) as u64),
+                    // Deadlines are re-armed by CoordinatorState hydration —
+                    // pre-crash deadlines must not be trusted after a restart.
+                    next_heartbeat_deadline: last_heartbeat,
+                    failure_deadline: last_heartbeat,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
     pub fn load_workers_for_run(
         &self,
@@ -367,22 +502,214 @@ CREATE TABLE IF NOT EXISTS audit_events (
         Ok(workers)
     }
     pub fn save_dataset(&self, d: &DatasetRecord) -> rusqlite::Result<()> {
+        let labels_json = serde_json::to_string(&d.labels).unwrap_or_else(|_| "{}".to_string());
         let conn = self.conn.lock().expect("sqlite");
-        conn.execute("INSERT OR REPLACE INTO datasets(run_id,dataset_id,name,num_shards,idempotency_key) VALUES(?1,?2,?3,?4,NULL)",params![d.run_id,d.dataset_id,d.name,d.shard_count])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO datasets(run_id,dataset_id,name,num_shards,\
+             idempotency_key,dataset_uri,format,dataset_version,labels_json,\
+             registered_at_millis) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,?8,?9)",
+            params![
+                d.run_id,
+                d.dataset_id,
+                d.name,
+                d.shard_count,
+                d.dataset_uri,
+                d.format,
+                d.dataset_version,
+                labels_json,
+                to_millis(d.registered_at)
+            ],
+        )?;
         for (idx, s) in d.shards.iter().enumerate() {
-            conn.execute("INSERT OR REPLACE INTO shards(run_id,dataset_id,shard_id,shard_index,shard_uri,num_records,size_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![d.run_id,d.dataset_id,s.shard_id,idx as i64,s.shard_uri,Option::<i64>::None,s.size_bytes])?;
+            conn.execute(
+                "INSERT OR REPLACE INTO shards(run_id,dataset_id,shard_id,shard_index,\
+                 shard_uri,num_records,size_bytes,byte_range_start,byte_range_end,\
+                 checksum,checksum_algorithm) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    d.run_id,
+                    d.dataset_id,
+                    s.shard_id,
+                    idx as i64,
+                    s.shard_uri,
+                    Option::<i64>::None,
+                    s.size_bytes,
+                    s.byte_range_start,
+                    s.byte_range_end,
+                    s.checksum,
+                    s.checksum_algorithm
+                ],
+            )?;
         }
         Ok(())
     }
+
+    pub fn load_all_datasets(&self) -> rusqlite::Result<Vec<DatasetRecord>> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn.prepare(
+            "SELECT run_id,dataset_id,name,num_shards,dataset_uri,format,\
+             dataset_version,labels_json,registered_at_millis FROM datasets",
+        )?;
+        let mut datasets = stmt
+            .query_map([], |r| {
+                let labels_json: String = r.get(7)?;
+                Ok(DatasetRecord {
+                    run_id: r.get(0)?,
+                    dataset_id: r.get(1)?,
+                    name: r.get(2)?,
+                    shard_count: r.get::<_, i64>(3)? as u32,
+                    dataset_uri: r.get(4)?,
+                    format: r.get(5)?,
+                    dataset_version: r.get(6)?,
+                    labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                    registered_at: from_millis(r.get::<_, i64>(8)?.max(0) as u64),
+                    shards: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut shard_stmt = conn.prepare(
+            "SELECT shard_id,shard_uri,size_bytes,byte_range_start,byte_range_end,\
+             checksum,checksum_algorithm FROM shards WHERE run_id=?1 AND dataset_id=?2 \
+             ORDER BY shard_index",
+        )?;
+        for dataset in &mut datasets {
+            dataset.shards = shard_stmt
+                .query_map(params![dataset.run_id, dataset.dataset_id], |r| {
+                    Ok(ShardRecord {
+                        shard_id: r.get(0)?,
+                        dataset_id: dataset.dataset_id.clone(),
+                        shard_uri: r.get(1)?,
+                        size_bytes: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        byte_range_start: r.get(3)?,
+                        byte_range_end: r.get(4)?,
+                        checksum: r.get(5)?,
+                        checksum_algorithm: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
+        Ok(datasets)
+    }
+
     pub fn save_checkpoint(
         &self,
         run_id: &str,
         idempotency_key: &str,
         rec: &CoordinatorCheckpointRecord,
     ) -> rusqlite::Result<()> {
+        let expected_json =
+            serde_json::to_string(&rec.expected_worker_ids).unwrap_or_else(|_| "[]".to_string());
         let conn = self.conn.lock().expect("sqlite");
-        conn.execute("INSERT OR REPLACE INTO checkpoints(run_id,checkpoint_id,state,initiated_by_worker_id,step,created_at_millis,updated_at_millis,committed_at_millis,idempotency_key) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![run_id,rec.checkpoint.checkpoint_id.0, rec.checkpoint.state as i32, rec.initiated_by_worker_id, rec.checkpoint.step as i64, rec.checkpoint.created_at_millis as i64, rec.checkpoint.updated_at_millis as i64, rec.committed_at_millis.map(|v| v as i64), if idempotency_key.is_empty(){None::<String>}else{Some(idempotency_key.to_string())}])?;
+        conn.execute("INSERT OR REPLACE INTO checkpoints(run_id,checkpoint_id,state,initiated_by_worker_id,step,created_at_millis,updated_at_millis,committed_at_millis,idempotency_key,expected_worker_ids_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![run_id,rec.checkpoint.checkpoint_id.0, rec.checkpoint.state as i32, rec.initiated_by_worker_id, rec.checkpoint.step as i64, rec.checkpoint.created_at_millis as i64, rec.checkpoint.updated_at_millis as i64, rec.committed_at_millis.map(|v| v as i64), if idempotency_key.is_empty(){None::<String>}else{Some(idempotency_key.to_string())}, expected_json])?;
         Ok(())
+    }
+
+    /// Load every checkpoint (any state, committed or in-flight) with its
+    /// artifacts and the expected worker set recorded at BeginCheckpoint.
+    pub fn load_all_checkpoints(
+        &self,
+    ) -> rusqlite::Result<Vec<(String, CoordinatorCheckpointRecord)>> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn.prepare(
+            "SELECT run_id,checkpoint_id,state,initiated_by_worker_id,step,\
+             created_at_millis,updated_at_millis,committed_at_millis,\
+             expected_worker_ids_json FROM checkpoints",
+        )?;
+        type CkptRow = (
+            String,
+            String,
+            i32,
+            String,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            String,
+        );
+        let rows: Vec<CkptRow> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut artifact_stmt = conn.prepare(
+            "SELECT worker_id,artifact_name,artifact_uri,size_bytes,checksum,\
+             checksum_algorithm FROM checkpoint_artifacts \
+             WHERE run_id=?1 AND checkpoint_id=?2 ORDER BY worker_id,artifact_name",
+        )?;
+        let mut records = Vec::with_capacity(rows.len());
+        for (run_id, ckpt_id, state, initiator, step, created, updated, committed, expected_json) in
+            rows
+        {
+            let artifacts = artifact_stmt
+                .query_map(params![run_id, ckpt_id], |r| {
+                    Ok(ArtifactRecord {
+                        worker_id: DomainWorkerId(r.get(0)?),
+                        artifact_name: r.get(1)?,
+                        storage_key: r.get(2)?,
+                        size_bytes: r.get::<_, i64>(3)? as u64,
+                        checksum: r.get(4)?,
+                        checksum_algorithm: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let expected_worker_ids: Vec<String> =
+                serde_json::from_str(&expected_json).unwrap_or_default();
+            records.push((
+                run_id.clone(),
+                CoordinatorCheckpointRecord {
+                    checkpoint: CheckpointRecord {
+                        run_id: DomainRunId(run_id),
+                        checkpoint_id: DomainCheckpointId(ckpt_id),
+                        step: step as u64,
+                        state: checkpoint_state_from_i32(state),
+                        artifacts,
+                        created_at_millis: created as u64,
+                        updated_at_millis: updated as u64,
+                    },
+                    initiated_by_worker_id: initiator,
+                    committed_at_millis: committed.map(|v| v as u64),
+                    expected_artifact_count: expected_worker_ids.len() as u32,
+                    expected_worker_ids,
+                },
+            ));
+        }
+        Ok(records)
+    }
+
+    pub fn save_idempotency_key_inner(
+        &self,
+        scope: &str,
+        key: &str,
+        value: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("sqlite");
+        conn.execute(
+            "INSERT OR REPLACE INTO idempotency_keys(scope,key,value) VALUES(?1,?2,?3)",
+            params![scope, key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_all_idempotency_keys_inner(
+        &self,
+    ) -> rusqlite::Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().expect("sqlite");
+        let mut stmt = conn.prepare("SELECT scope,key,value FROM idempotency_keys")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
     pub fn save_checkpoint_artifact(
         &self,
@@ -674,6 +1001,23 @@ impl MetadataStore for SqliteMetadataStore {
         self.insert_audit_event_inner(event)
             .map_err(|e| Box::new(e) as _)
     }
+    fn save_idempotency_key(&self, scope: &str, key: &str, value: &str) -> PersistResult<()> {
+        self.save_idempotency_key_inner(scope, key, value)
+            .map_err(|e| Box::new(e) as _)
+    }
+    fn load_all_idempotency_keys(&self) -> PersistResult<Vec<(String, String, String)>> {
+        self.load_all_idempotency_keys_inner()
+            .map_err(|e| Box::new(e) as _)
+    }
+    fn load_all_workers(&self) -> PersistResult<Vec<WorkerRecord>> {
+        self.load_all_workers().map_err(|e| Box::new(e) as _)
+    }
+    fn load_all_datasets(&self) -> PersistResult<Vec<DatasetRecord>> {
+        self.load_all_datasets().map_err(|e| Box::new(e) as _)
+    }
+    fn load_all_checkpoints(&self) -> PersistResult<Vec<(String, CoordinatorCheckpointRecord)>> {
+        self.load_all_checkpoints().map_err(|e| Box::new(e) as _)
+    }
 }
 
 fn to_millis(t: std::time::SystemTime) -> i64 {
@@ -684,6 +1028,24 @@ fn to_millis(t: std::time::SystemTime) -> i64 {
 
 fn from_millis(millis: u64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)
+}
+
+/// Round-trip a persisted `state as i32` back to the domain enum.
+pub(crate) fn checkpoint_state_from_i32(value: i32) -> DomainCheckpointState {
+    use DomainCheckpointState as S;
+    for candidate in [
+        S::Initiated,
+        S::UploadInProgress,
+        S::Validating,
+        S::Committed,
+        S::Failed,
+        S::Aborted,
+    ] {
+        if candidate as i32 == value {
+            return candidate;
+        }
+    }
+    S::Initiated
 }
 
 #[cfg(test)]

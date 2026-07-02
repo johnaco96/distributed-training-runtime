@@ -4,20 +4,20 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use fs4::fs_std::FileExt;
-
-/// Single-writer guard for the SQLite metadata store.
+/// Single-node coordinator lock for the SQLite metadata store.
 ///
-/// Uses an OS advisory lock (`LockFileEx` / `flock`) on a sidecar `.lock`
-/// file rather than create-new sentinel semantics: the kernel releases the
-/// lock when the process dies, so a hard-killed coordinator can always be
-/// restarted on the same metadata DB without manual lock cleanup, while a
-/// concurrently *running* coordinator is still refused.
+/// Holds an OS advisory lock (`File::try_lock`) on `<metadata-db>.lock` for
+/// the lifetime of the guard. The OS releases the lock when the process
+/// exits — including crashes and SIGKILL — so a crashed coordinator never
+/// leaves a stale lock behind and can always restart immediately.
+///
+/// (The previous implementation created the file with `create_new` and
+/// removed it in `Drop`; any hard kill left the file in place and blocked
+/// every subsequent restart, which defeats crash recovery.)
 pub struct CoordinatorLockGuard {
-    lock_path: PathBuf,
-    // Held open for the process lifetime; the advisory lock lives on this
-    // handle.
+    /// Keeps the OS lock alive; dropping the handle releases it.
     _file: File,
+    lock_path: PathBuf,
 }
 
 impl CoordinatorLockGuard {
@@ -27,8 +27,6 @@ impl CoordinatorLockGuard {
         fs::create_dir_all(parent).map_err(|e| format!("failed to create lock directory: {e}"))?;
         let mut file = OpenOptions::new()
             .create(true)
-            // Never truncate before the lock is held: a stale file's contents
-            // are only overwritten by the process that wins the lock below.
             .truncate(false)
             .write(true)
             .open(&lock_path)
@@ -38,32 +36,23 @@ impl CoordinatorLockGuard {
                     lock_path.display()
                 )
             })?;
-        let locked = file.try_lock_exclusive().map_err(|e| {
+        file.try_lock().map_err(|e| {
             format!(
-                "failed to lock metadata-db lock file at {}: {e}",
+                "metadata-db lock already held by a live coordinator at {}: {e}",
                 lock_path.display()
             )
         })?;
-        if !locked {
-            return Err(format!(
-                "metadata-db lock already held by a running coordinator at {}",
-                lock_path.display()
-            ));
-        }
+        // Best-effort breadcrumb for operators inspecting the lock file.
         let pid = std::process::id();
         let _ = writeln!(file, "pid={pid}");
         Ok(Self {
-            lock_path,
             _file: file,
+            lock_path,
         })
     }
-}
 
-impl Drop for CoordinatorLockGuard {
-    fn drop(&mut self) {
-        // Best-effort tidy-up; correctness never depends on this because the
-        // OS releases the advisory lock with the process.
-        let _ = fs::remove_file(&self.lock_path);
+    pub fn path(&self) -> &Path {
+        &self.lock_path
     }
 }
 
@@ -92,7 +81,7 @@ mod tests {
         let lock_path = db.with_extension("lock");
 
         // Simulate a hard-killed coordinator: the lock file exists but no
-        // process holds the advisory lock.
+        // process holds the OS advisory lock.
         fs::write(&lock_path, "pid=99999\n").unwrap();
 
         CoordinatorLockGuard::acquire(&db)

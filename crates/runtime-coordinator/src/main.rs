@@ -629,6 +629,29 @@ mod ha_lock_tests {
         let second = CoordinatorLockGuard::acquire(&db);
         assert!(second.is_err());
     }
+
+    #[test]
+    fn metadata_lock_is_reacquirable_after_release() {
+        // The OS lock dies with the holder (even on SIGKILL), so a stale lock
+        // FILE on disk must never block a restarted coordinator.
+        let base = std::env::temp_dir().join(format!(
+            "dtruntime_lock_test_release_{}",
+            std::process::id()
+        ));
+        let db = base.join("coordinator.db");
+        let first = CoordinatorLockGuard::acquire(&db).expect("first lock");
+        let lock_path = first.path().to_path_buf();
+        drop(first);
+        assert!(
+            lock_path.exists(),
+            "lock file remains on disk after release"
+        );
+        let second = CoordinatorLockGuard::acquire(&db);
+        assert!(
+            second.is_ok(),
+            "lock must be reacquirable once the previous holder is gone"
+        );
+    }
 }
 
 /// Strip credentials from a PostgreSQL DSN before emitting it to logs.
