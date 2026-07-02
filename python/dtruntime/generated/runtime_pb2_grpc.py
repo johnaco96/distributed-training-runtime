@@ -107,6 +107,16 @@ class CoordinatorServiceStub:
                 request_serializer=runtime__pb2.GetRunStatusRequest.SerializeToString,
                 response_deserializer=runtime__pb2.GetRunStatusResponse.FromString,
                 _registered_method=True)
+        self.JoinRendezvous = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/JoinRendezvous',
+                request_serializer=runtime__pb2.JoinRendezvousRequest.SerializeToString,
+                response_deserializer=runtime__pb2.JoinRendezvousResponse.FromString,
+                _registered_method=True)
+        self.GetRendezvousState = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/GetRendezvousState',
+                request_serializer=runtime__pb2.GetRendezvousStateRequest.SerializeToString,
+                response_deserializer=runtime__pb2.GetRendezvousStateResponse.FromString,
+                _registered_method=True)
 
 
 class CoordinatorServiceServicer:
@@ -199,6 +209,21 @@ class CoordinatorServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def JoinRendezvous(self, request, context):
+        """Rendezvous barrier for torch.distributed process-group formation.
+        Workers join, the coordinator assigns ranks and elects the rank-0 host as
+        the c10d store endpoint, and workers poll until the round completes.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetRendezvousState(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_CoordinatorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -271,6 +296,16 @@ def add_CoordinatorServiceServicer_to_server(servicer, server):
                     servicer.GetRunStatus,
                     request_deserializer=runtime__pb2.GetRunStatusRequest.FromString,
                     response_serializer=runtime__pb2.GetRunStatusResponse.SerializeToString,
+            ),
+            'JoinRendezvous': grpc.unary_unary_rpc_method_handler(
+                    servicer.JoinRendezvous,
+                    request_deserializer=runtime__pb2.JoinRendezvousRequest.FromString,
+                    response_serializer=runtime__pb2.JoinRendezvousResponse.SerializeToString,
+            ),
+            'GetRendezvousState': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetRendezvousState,
+                    request_deserializer=runtime__pb2.GetRendezvousStateRequest.FromString,
+                    response_serializer=runtime__pb2.GetRendezvousStateResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -654,6 +689,60 @@ class CoordinatorService:
             '/runtime.v1.CoordinatorService/GetRunStatus',
             runtime__pb2.GetRunStatusRequest.SerializeToString,
             runtime__pb2.GetRunStatusResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def JoinRendezvous(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/JoinRendezvous',
+            runtime__pb2.JoinRendezvousRequest.SerializeToString,
+            runtime__pb2.JoinRendezvousResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetRendezvousState(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/GetRendezvousState',
+            runtime__pb2.GetRendezvousStateRequest.SerializeToString,
+            runtime__pb2.GetRendezvousStateResponse.FromString,
             options,
             channel_credentials,
             insecure,

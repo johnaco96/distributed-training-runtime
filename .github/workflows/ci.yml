@@ -49,3 +49,12 @@ jobs:
 
       - name: Python tests
         run: python -m pytest python/tests -q
+
+      - name: Python integration tests (coordinator gRPC + torch.distributed)
+        run: >
+          python -m pytest -q
+          python/tests/test_local_integration.py
+          python/tests/test_torch_distributed_integration.py
+        env:
+          DTRUNTIME_RUN_LOCAL_INTEGRATION: "1"
+          DTRUNTIME_RUN_TORCH_INTEGRATION: "1"

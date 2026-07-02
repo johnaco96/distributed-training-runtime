@@ -25,6 +25,12 @@ service CoordinatorService {
   rpc GetLatestCheckpoint(GetLatestCheckpointRequest) returns (GetLatestCheckpointResponse);
 
   rpc GetRunStatus(GetRunStatusRequest) returns (GetRunStatusResponse);
+
+  // Rendezvous barrier for torch.distributed process-group formation.
+  // Workers join, the coordinator assigns ranks and elects the rank-0 host as
+  // the c10d store endpoint, and workers poll until the round completes.
+  rpc JoinRendezvous(JoinRendezvousRequest) returns (JoinRendezvousResponse);
+  rpc GetRendezvousState(GetRendezvousStateRequest) returns (GetRendezvousStateResponse);
 }
 
 message ProtocolVersion {
@@ -100,6 +106,16 @@ message RegisterRunRequest {
   StorageBackendKind storage_backend_kind = 4;
   uint32 world_size = 5;
   string run_version = 6;
+  // Elastic training bounds.  When both are zero the run is fixed-size and a
+  // rendezvous round completes only when exactly `world_size` workers join.
+  // When set (min <= max), a round may complete with any world size in
+  // [min_world_size, max_world_size]: the round completes immediately at max,
+  // or after `rendezvous_settle_timeout_ms` once min is reached.
+  uint32 min_world_size = 7;
+  uint32 max_world_size = 8;
+  // How long the coordinator waits for extra workers after min_world_size is
+  // reached before completing an elastic rendezvous round.  0 = server default.
+  uint32 rendezvous_settle_timeout_ms = 9;
 }
 
 message RegisterRunResponse {
@@ -172,6 +188,10 @@ message HeartbeatResponse {
   WorkerState state = 1;
   google.protobuf.Timestamp next_heartbeat_deadline = 2;
   google.protobuf.Timestamp server_time = 3;
+  // Latest rendezvous round for the run (0 when no rendezvous has started).
+  // Workers compare this to the round they joined; a larger value means the
+  // membership changed and the worker must re-join the rendezvous.
+  uint64 rendezvous_round = 4;
 }
 
 message GetShardAssignmentRequest {
@@ -360,4 +380,59 @@ message GetRunStatusResponse {
   CheckpointState latest_checkpoint_state = 6;
   uint32 active_worker_count = 7;
   google.protobuf.Timestamp server_time = 8;
+}
+
+// ─── rendezvous ──────────────────────────────────────────────────────────────
+
+enum RendezvousRoundState {
+  RENDEZVOUS_ROUND_STATE_UNSPECIFIED = 0;
+  // Workers are still joining; the round has not reached its target size.
+  RENDEZVOUS_ROUND_STATE_WAITING = 1;
+  // Ranks are assigned and the c10d store endpoint is elected; workers may
+  // call torch.distributed.init_process_group.
+  RENDEZVOUS_ROUND_STATE_COMPLETE = 2;
+}
+
+message JoinRendezvousRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  // Address other workers can reach this worker's host on.  If this worker is
+  // elected rank 0 it becomes the c10d TCPStore host.
+  string host = 3;
+  // Port this worker will bind the c10d TCPStore to if elected rank 0.
+  // 0 lets the coordinator substitute the conventional default (29500).
+  uint32 store_port = 4;
+  // The round this worker last participated in (0 on first join).  Used to
+  // detect stale re-joins after coordinator failover.
+  uint64 previous_round = 5;
+  string idempotency_key = 6;
+}
+
+message RendezvousInfo {
+  uint64 round = 1;
+  RendezvousRoundState state = 2;
+  // World size of the completed round (or current participant count while
+  // waiting).
+  uint32 world_size = 3;
+  // Rank assigned to the requesting worker.  Only meaningful when state is
+  // COMPLETE and has_rank is true.
+  uint32 rank = 4;
+  bool has_rank = 5;
+  // c10d TCPStore endpoint for torch.distributed.init_process_group.
+  string store_addr = 6;
+  uint32 store_port = 7;
+  google.protobuf.Timestamp server_time = 8;
+}
+
+message JoinRendezvousResponse {
+  RendezvousInfo info = 1;
+}
+
+message GetRendezvousStateRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+}
+
+message GetRendezvousStateResponse {
+  RendezvousInfo info = 1;
 }

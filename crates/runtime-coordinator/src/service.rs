@@ -318,11 +318,13 @@ fn already_exists(message: impl Into<String>) -> Status {
 }
 
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
-const RUNTIME_CAPABILITIES: [&str; 6] = [
+const RUNTIME_CAPABILITIES: [&str; 8] = [
     "checkpoint-cleanup-library",
+    "elastic-training",
     "idempotency-key-validation",
     "lease-active-worker-gate",
     "local-scaling-benchmarks",
+    "rendezvous",
     "s3-storage",
     "stream-checkpoint-artifact",
 ];
@@ -365,6 +367,16 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("register_run", &request.idempotency_key)?;
+        if request.min_world_size > 0 && request.max_world_size < request.min_world_size {
+            return Err(invalid_argument(
+                "max_world_size must be >= min_world_size for elastic runs",
+            ));
+        }
+        if request.min_world_size == 0 && request.max_world_size > 0 {
+            return Err(invalid_argument(
+                "min_world_size is required when max_world_size is set",
+            ));
+        }
         let registered = self.state.register_run(request);
         self.metrics.inc_runs_total();
 
@@ -458,10 +470,13 @@ impl CoordinatorService for CoordinatorServiceImpl {
             state: heartbeat.state,
             next_heartbeat_deadline: Some(heartbeat.next_heartbeat_deadline.into()),
             server_time: Some(heartbeat.server_time.into()),
+            rendezvous_round: self.state.current_rendezvous_round(&run_id.value),
         };
         self.metrics.inc_heartbeats_total();
         self.update_worker_metrics(&run_id);
-        info!(run_id = %run_id.value, worker_id = %worker_id.value, "heartbeat accepted");
+        // debug: heartbeats arrive continuously from every worker; info-level
+        // logging here floods production logs.
+        tracing::debug!(run_id = %run_id.value, worker_id = %worker_id.value, "heartbeat accepted");
 
         self.audit.emit(AuditEvent {
             kind: Some(AuditEventKind::WorkerHeartbeat),
@@ -1233,6 +1248,113 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
         Ok(Response::new(response))
     }
+
+    async fn join_rendezvous(
+        &self,
+        request: Request<JoinRendezvousRequest>,
+    ) -> Result<Response<JoinRendezvousResponse>, Status> {
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
+            .value
+            .clone();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("join_rendezvous", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let worker_id = request
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+
+        // Reconcile first so a dead worker's stale round is invalidated before
+        // this join lands in it.
+        self.state.reconcile_worker_liveness();
+
+        let snapshot = self
+            .state
+            .join_rendezvous(
+                &run_id.value,
+                &worker_id.value,
+                &request.host,
+                request.store_port,
+            )
+            .map_err(map_rendezvous_error)?;
+        info!(
+            run_id = %run_id.value,
+            worker_id = %worker_id.value,
+            round = snapshot.round,
+            complete = snapshot.complete,
+            world_size = snapshot.world_size,
+            "rendezvous join"
+        );
+
+        Ok(Response::new(JoinRendezvousResponse {
+            info: Some(rendezvous_snapshot_to_proto(snapshot)),
+        }))
+    }
+
+    async fn get_rendezvous_state(
+        &self,
+        request: Request<GetRendezvousStateRequest>,
+    ) -> Result<Response<GetRendezvousStateResponse>, Status> {
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
+            .value
+            .clone();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let worker_id = request
+            .worker_id
+            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+
+        self.state.reconcile_worker_liveness();
+
+        let snapshot = self
+            .state
+            .get_rendezvous_state(&run_id.value, &worker_id.value)
+            .map_err(map_rendezvous_error)?;
+
+        Ok(Response::new(GetRendezvousStateResponse {
+            info: Some(rendezvous_snapshot_to_proto(snapshot)),
+        }))
+    }
+}
+
+fn map_rendezvous_error(error: crate::state::RendezvousError) -> Status {
+    match error {
+        crate::state::RendezvousError::RunNotFound => not_found("run was not found"),
+        crate::state::RendezvousError::WorkerNotFound => {
+            not_found("worker was not found; call RegisterWorker before JoinRendezvous")
+        }
+        crate::state::RendezvousError::MissingHost => invalid_argument("host is required"),
+    }
+}
+
+fn rendezvous_snapshot_to_proto(snapshot: crate::rendezvous::RendezvousSnapshot) -> RendezvousInfo {
+    RendezvousInfo {
+        round: snapshot.round,
+        state: if snapshot.complete {
+            RendezvousRoundState::Complete as i32
+        } else {
+            RendezvousRoundState::Waiting as i32
+        },
+        world_size: snapshot.world_size,
+        rank: snapshot.rank.unwrap_or(0),
+        has_rank: snapshot.rank.is_some(),
+        store_addr: snapshot.store_addr,
+        store_port: snapshot.store_port,
+        server_time: Some(std::time::SystemTime::now().into()),
+    }
 }
 
 fn checkpoint_state_to_proto(state: runtime_checkpoint::CheckpointState) -> i32 {
@@ -1276,6 +1398,7 @@ mod tests {
             storage_backend_kind: StorageBackendKind::S3Compatible as i32,
             world_size,
             run_version: "2026-05-18".to_string(),
+            ..Default::default()
         }
     }
 
@@ -3575,5 +3698,198 @@ mod tests {
             RUNTIME_CAPABILITIES.contains(&"stream-checkpoint-artifact"),
             "capabilities must advertise stream-checkpoint-artifact"
         );
+    }
+
+    // ── rendezvous ────────────────────────────────────────────────────────────
+
+    async fn register_rendezvous_worker(
+        service: &CoordinatorServiceImpl,
+        run_id: &RunId,
+        worker_id: &str,
+    ) {
+        service
+            .register_worker(Request::new(RegisterWorkerRequest {
+                idempotency_key: format!("rdzv-{worker_id}"),
+                run_id: Some(run_id.clone()),
+                worker_id: Some(WorkerId {
+                    value: worker_id.to_string(),
+                }),
+                rank: 0,
+                host: "worker-host".to_string(),
+                sdk_version: "sdk-0.1.0".to_string(),
+                protocol_version: "runtime.v1".to_string(),
+            }))
+            .await
+            .expect("register_worker should succeed");
+    }
+
+    async fn join(
+        service: &CoordinatorServiceImpl,
+        run_id: &RunId,
+        worker_id: &str,
+        host: &str,
+        store_port: u32,
+    ) -> RendezvousInfo {
+        service
+            .join_rendezvous(Request::new(JoinRendezvousRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(WorkerId {
+                    value: worker_id.to_string(),
+                }),
+                host: host.to_string(),
+                store_port,
+                previous_round: 0,
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect("join_rendezvous should succeed")
+            .into_inner()
+            .info
+            .expect("join response should include info")
+    }
+
+    #[tokio::test]
+    async fn join_rendezvous_completes_and_assigns_distinct_ranks() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 2).await;
+        register_rendezvous_worker(&service, &run_id, "w0").await;
+        register_rendezvous_worker(&service, &run_id, "w1").await;
+
+        let first = join(&service, &run_id, "w0", "10.0.0.1", 29501).await;
+        assert_eq!(first.state, RendezvousRoundState::Waiting as i32);
+        assert!(!first.has_rank);
+
+        let second = join(&service, &run_id, "w1", "10.0.0.2", 29502).await;
+        assert_eq!(second.state, RendezvousRoundState::Complete as i32);
+        assert_eq!(second.world_size, 2);
+        assert!(second.has_rank);
+
+        let poll = service
+            .get_rendezvous_state(Request::new(GetRendezvousStateRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(WorkerId {
+                    value: "w0".to_string(),
+                }),
+            }))
+            .await
+            .expect("get_rendezvous_state should succeed")
+            .into_inner()
+            .info
+            .expect("state response should include info");
+        assert_eq!(poll.state, RendezvousRoundState::Complete as i32);
+        assert!(poll.has_rank);
+        assert_ne!(poll.rank, second.rank, "ranks must be distinct");
+        // Store endpoint is the rank-0 participant's host/port.
+        let expected = if poll.rank == 0 {
+            ("10.0.0.1", 29501)
+        } else {
+            ("10.0.0.2", 29502)
+        };
+        assert_eq!(poll.store_addr, expected.0);
+        assert_eq!(poll.store_port, expected.1);
+        assert_eq!(poll.store_addr, second.store_addr);
+    }
+
+    #[tokio::test]
+    async fn join_rendezvous_requires_registered_worker() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 1).await;
+
+        let status = service
+            .join_rendezvous(Request::new(JoinRendezvousRequest {
+                run_id: Some(run_id),
+                worker_id: Some(WorkerId {
+                    value: "ghost".to_string(),
+                }),
+                host: "10.0.0.9".to_string(),
+                store_port: 0,
+                previous_round: 0,
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect_err("join for unregistered worker must fail");
+        assert_eq!(status.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn join_rendezvous_requires_host() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 1).await;
+        register_rendezvous_worker(&service, &run_id, "w0").await;
+
+        let status = service
+            .join_rendezvous(Request::new(JoinRendezvousRequest {
+                run_id: Some(run_id),
+                worker_id: Some(WorkerId {
+                    value: "w0".to_string(),
+                }),
+                host: String::new(),
+                store_port: 0,
+                previous_round: 0,
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect_err("join without host must fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_current_rendezvous_round() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run_with_world_size(&service, 1).await;
+        register_rendezvous_worker(&service, &run_id, "w0").await;
+
+        let before = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(WorkerId {
+                    value: "w0".to_string(),
+                }),
+                idempotency_key: String::new(),
+                client_time: None,
+                active_shard_ids: vec![],
+            }))
+            .await
+            .expect("heartbeat should succeed")
+            .into_inner();
+        assert_eq!(before.rendezvous_round, 0, "no rendezvous exists yet");
+
+        let info = join(&service, &run_id, "w0", "10.0.0.1", 0).await;
+        assert_eq!(info.state, RendezvousRoundState::Complete as i32);
+
+        let after = service
+            .heartbeat(Request::new(HeartbeatRequest {
+                run_id: Some(run_id.clone()),
+                worker_id: Some(WorkerId {
+                    value: "w0".to_string(),
+                }),
+                idempotency_key: String::new(),
+                client_time: None,
+                active_shard_ids: vec![],
+            }))
+            .await
+            .expect("heartbeat should succeed")
+            .into_inner();
+        assert_eq!(after.rendezvous_round, info.round);
+    }
+
+    #[tokio::test]
+    async fn register_run_rejects_invalid_elastic_bounds() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let status = service
+            .register_run(Request::new(RegisterRunRequest {
+                idempotency_key: "elastic-invalid".to_string(),
+                run_name: "elastic".to_string(),
+                assignment_policy: AssignmentPolicy::StaticRank as i32,
+                storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
+                world_size: 4,
+                run_version: "v1".to_string(),
+                min_world_size: 3,
+                max_world_size: 2,
+                rendezvous_settle_timeout_ms: 0,
+            }))
+            .await
+            .expect_err("min > max must be rejected");
+        assert_eq!(status.code(), Code::InvalidArgument);
     }
 }

@@ -24,6 +24,14 @@ The following capabilities are implemented and locally validated:
 - SQLite and PostgreSQL metadata persistence backends.
 - Local Kubernetes manifests (`k8s/local/`) and secure local Kubernetes path (`k8s/local-secure/`).
 - Health endpoints: `/healthz` (liveness) and `/readyz` (readiness).
+- Real `torch.distributed` execution: coordinator-backed rendezvous
+  (`JoinRendezvous`/`GetRendezvousState`), coordinator-assigned ranks, and
+  process-group formation over c10d TCPStore (see `docs/torch-distributed.md`).
+- Worker launcher/orchestration: `python -m dtruntime.launch` (torchrun-style
+  supervision with restart budget and multi-node idempotent run registration).
+- Rank replacement after worker failure and elastic world-size changes
+  (min/max worker bounds with a settle window).
+- DDP, FSDP, and DeepSpeed strategy wrappers (`dtruntime.strategies`).
 
 ## Current limitations and non-goals
 
@@ -31,8 +39,9 @@ This project currently does **not** claim:
 
 - Production scheduler integration.
 - Production Kubernetes deployment/orchestration support (beyond local/dev manifests).
-- Real `torch.distributed` execution.
-- Real multi-node ML orchestration.
+- Multi-node training validated on a real GPU cluster (the torch.distributed
+  path is validated with multi-process gloo on a single machine; NCCL
+  multi-node uses the same rendezvous protocol but is not yet cluster-proven).
 - Production-ready cloud deployment posture.
 - Proven production fault tolerance at scale.
 - Large-scale benchmark claims without measured evidence.
