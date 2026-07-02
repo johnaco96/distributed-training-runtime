@@ -17,6 +17,9 @@ dependencies = [
     "numpy",
 ]
 
+[project.scripts]
+dtruntime-launch = "dtruntime.launch:main"
+
 [project.optional-dependencies]
 dev = [
     # Pinned so regenerated stubs (scripts/generate_python_proto.py) embed a

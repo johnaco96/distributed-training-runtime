@@ -401,6 +401,45 @@ class RuntimeClient:
         )
         return self._stub.GetLatestCheckpoint(request, metadata=self.rpc_metadata())
 
+    def join_rendezvous(
+        self,
+        run_id: str,
+        worker_id: str,
+        host: str,
+        store_port: int = 0,
+        previous_round: int = 0,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.JoinRendezvousResponse":
+        """Join the rendezvous barrier for torch.distributed process-group formation.
+
+        ``host`` must be reachable by the other workers; if this worker is
+        elected rank 0 it hosts the c10d TCPStore on ``store_port`` (0 lets the
+        coordinator substitute the conventional default, 29500).
+        """
+        request = self._runtime_pb2.JoinRendezvousRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            host=host,
+            store_port=store_port,
+            previous_round=previous_round,
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.JoinRendezvous(request, metadata=self.rpc_metadata(worker_id=worker_id))
+
+    def get_rendezvous_state(
+        self,
+        run_id: str,
+        worker_id: str,
+    ) -> "runtime_pb2.GetRendezvousStateResponse":
+        """Poll the rendezvous state for this worker's run."""
+        request = self._runtime_pb2.GetRendezvousStateRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+        )
+        return self._stub.GetRendezvousState(
+            request, metadata=self.rpc_metadata(worker_id=worker_id)
+        )
+
     def heartbeat(
         self,
         run_id: str,

@@ -24,6 +24,7 @@ const SHARD_LEASE_DURATION: Duration = Duration::from_secs(30);
 #[cfg(test)]
 use crate::persistence::SqliteMetadataStore;
 use crate::persistence::{MetadataStore, ShardProgressEntry};
+use crate::rendezvous::{RendezvousConfig, RendezvousSnapshot, RunRendezvous};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatasetPlacementPolicy {
@@ -72,6 +73,12 @@ pub struct CoordinatorState {
     // The global commit fires when commit_set.len() == expected_artifact_count.
     checkpoint_commits: DashMap<(String, String), Arc<Mutex<HashSet<String>>>>,
 
+    // Per-run rendezvous barrier for torch.distributed process-group
+    // formation.  In-memory only: after a coordinator restart or failover the
+    // workers re-join and form a fresh round (round numbers are wall-clock
+    // seeded so they stay monotonic).
+    rendezvous_by_run: DashMap<String, Arc<Mutex<RunRendezvous>>>,
+
     placement_policy: DatasetPlacementPolicy,
     /// Optional persistence back-end.  Either [`SqliteMetadataStore`] (single-
     /// node) or [`crate::pg_store::PostgresMetadataStore`] (distributed HA).
@@ -98,6 +105,11 @@ pub struct RunRecord {
     pub active_worker_count: u32,
     pub latest_checkpoint_id: Option<CheckpointId>,
     pub latest_checkpoint_state: i32,
+    /// Elastic training bounds; both zero for fixed-size runs.
+    pub min_world_size: u32,
+    pub max_world_size: u32,
+    /// Elastic rendezvous settle window in milliseconds; 0 = server default.
+    pub rendezvous_settle_timeout_ms: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -307,6 +319,13 @@ pub enum RenewShardLeaseError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RendezvousError {
+    RunNotFound,
+    WorkerNotFound,
+    MissingHost,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReportShardProgressError {
     RunNotFound,
     WorkerNotFound,
@@ -334,6 +353,7 @@ impl Default for CoordinatorState {
             checkpoint_idempotency_keys: DashMap::new(),
             checkpoint_artifact_idempotency_keys: DashMap::new(),
             checkpoint_commits: DashMap::new(),
+            rendezvous_by_run: DashMap::new(),
             metadata_store: None,
             next_run_id: AtomicU64::new(0),
             next_worker_id: AtomicU64::new(0),
@@ -983,6 +1003,9 @@ impl CoordinatorState {
             active_worker_count: 0,
             latest_checkpoint_id: None,
             latest_checkpoint_state: CheckpointState::Unspecified as i32,
+            min_world_size: request.min_world_size,
+            max_world_size: request.max_world_size,
+            rendezvous_settle_timeout_ms: request.rendezvous_settle_timeout_ms,
         };
 
         self.runs.insert(run_id.clone(), record.clone());
@@ -1051,9 +1074,114 @@ impl CoordinatorState {
     /// Reconciles in-memory worker liveness against the current server time.
     ///
     /// Marks active workers stale when heartbeat deadlines pass and stale
-    /// workers failed when the longer failure deadline passes.
+    /// workers failed when the longer failure deadline passes.  Workers that
+    /// newly transition to FAILED are removed from their run's rendezvous:
+    /// a completed round they held a rank in is invalidated so the surviving
+    /// workers re-rendezvous (rank replacement / elastic shrink).
     pub fn reconcile_worker_liveness(&self) {
-        reconcile_worker_liveness(&self.runs, &self.workers_by_run, SystemTime::now());
+        let now = SystemTime::now();
+        let newly_failed = reconcile_worker_liveness(&self.runs, &self.workers_by_run, now);
+        for (run_id, worker_id) in newly_failed {
+            if let Some(rendezvous) = self.rendezvous_by_run.get(&run_id) {
+                let invalidated = rendezvous.lock().unwrap().on_worker_failed(&worker_id, now);
+                if invalidated {
+                    tracing::info!(
+                        run_id = %run_id,
+                        worker_id = %worker_id,
+                        "worker failure invalidated rendezvous round; remaining workers must re-join"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── rendezvous ───────────────────────────────────────────────────────────
+
+    /// Fetch or lazily create the rendezvous for a run using the run's
+    /// world-size / elasticity configuration.
+    fn rendezvous_for_run(&self, run: &RunRecord) -> Arc<Mutex<RunRendezvous>> {
+        self.rendezvous_by_run
+            .entry(run.run_id.clone())
+            .or_insert_with(|| {
+                let settle_timeout = if run.rendezvous_settle_timeout_ms > 0 {
+                    Duration::from_millis(u64::from(run.rendezvous_settle_timeout_ms))
+                } else {
+                    crate::rendezvous::DEFAULT_SETTLE_TIMEOUT
+                };
+                Arc::new(Mutex::new(RunRendezvous::new(RendezvousConfig {
+                    world_size: run.world_size,
+                    min_world_size: run.min_world_size,
+                    max_world_size: run.max_world_size,
+                    settle_timeout,
+                })))
+            })
+            .value()
+            .clone()
+    }
+
+    fn require_registered_worker(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+    ) -> Result<RunRecord, RendezvousError> {
+        let run = self
+            .runs
+            .get(run_id)
+            .map(|r| r.clone())
+            .ok_or(RendezvousError::RunNotFound)?;
+        let known = self
+            .workers_by_run
+            .get(run_id)
+            .map(|arc| arc.read().unwrap().contains_key(worker_id))
+            .unwrap_or(false);
+        if !known {
+            return Err(RendezvousError::WorkerNotFound);
+        }
+        Ok(run)
+    }
+
+    pub fn join_rendezvous(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        host: &str,
+        store_port: u32,
+    ) -> Result<RendezvousSnapshot, RendezvousError> {
+        if host.is_empty() {
+            return Err(RendezvousError::MissingHost);
+        }
+        let run = self.require_registered_worker(run_id, worker_id)?;
+        let rendezvous = self.rendezvous_for_run(&run);
+        let snapshot =
+            rendezvous
+                .lock()
+                .unwrap()
+                .join(worker_id, host, store_port, SystemTime::now());
+        Ok(snapshot)
+    }
+
+    pub fn get_rendezvous_state(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+    ) -> Result<RendezvousSnapshot, RendezvousError> {
+        let run = self.require_registered_worker(run_id, worker_id)?;
+        let rendezvous = self.rendezvous_for_run(&run);
+        let snapshot = rendezvous
+            .lock()
+            .unwrap()
+            .state_for(worker_id, SystemTime::now());
+        Ok(snapshot)
+    }
+
+    /// Latest rendezvous round for a run, or 0 when no rendezvous exists.
+    /// Reported on heartbeat responses so workers can cheaply detect
+    /// membership changes.
+    pub fn current_rendezvous_round(&self, run_id: &str) -> u64 {
+        self.rendezvous_by_run
+            .get(run_id)
+            .map(|r| r.lock().unwrap().current_round())
+            .unwrap_or(0)
     }
 
     pub fn get_dataset(&self, run_id: &RunId, dataset_id: &DatasetId) -> Option<DatasetRecord> {
@@ -1628,12 +1756,16 @@ impl CoordinatorState {
 
 // ─── free helper functions ────────────────────────────────────────────────────
 
+/// Returns the (run_id, worker_id) pairs of workers that newly transitioned
+/// to FAILED during this pass, so the caller can propagate the failure to
+/// per-run rendezvous state.
 fn reconcile_worker_liveness(
     runs: &DashMap<String, RunRecord>,
     workers_by_run: &DashMap<String, Arc<RwLock<HashMap<String, WorkerRecord>>>>,
     now: SystemTime,
-) {
+) -> Vec<(String, String)> {
     let mut changed_run_ids = Vec::new();
+    let mut newly_failed = Vec::new();
 
     for run_entry in workers_by_run.iter() {
         let run_id = run_entry.key().clone();
@@ -1650,6 +1782,7 @@ fn reconcile_worker_liveness(
                 } else if worker.state == WorkerState::Stale as i32 && worker.failure_deadline < now
                 {
                     worker.state = WorkerState::Failed as i32;
+                    newly_failed.push((run_id.clone(), worker.worker_id.clone()));
                     changed = true;
                 }
             }
@@ -1662,6 +1795,8 @@ fn reconcile_worker_liveness(
     for run_id in changed_run_ids {
         refresh_active_worker_count(runs, workers_by_run, &run_id);
     }
+
+    newly_failed
 }
 
 fn refresh_active_worker_count(
@@ -1769,6 +1904,7 @@ mod tests {
             storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
             world_size: 4,
             run_version: "v1".to_string(),
+            ..Default::default()
         }
     }
 

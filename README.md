@@ -76,6 +76,7 @@ See `python/examples/` for complete working examples including PyTorch integrati
 
 | Feature | Details |
 |---|---|
+| torch.distributed execution | Coordinator-backed rendezvous, rank assignment/replacement, elastic world size; DDP/FSDP/DeepSpeed wrappers; `python -m dtruntime.launch` |
 | Shard assignment | Deterministic by rank; cache-aware placement; configurable shard count |
 | Crash recovery | Per-shard progress offset persisted to SQLite or PostgreSQL; workers resume on restart |
 | Distributed checkpointing | Two-phase commit; globally committed only when all registered workers vote |
@@ -202,6 +203,7 @@ cargo run -p runtime-bench -- logical-workers \
 ## Documentation
 
 - [Quickstart](docs/quickstart.md)
+- [torch.distributed execution](docs/torch-distributed.md)
 - [Architecture](docs/architecture.md)
 - [Dataset sharding](docs/dataset-sharding.md)
 - [Checkpoint protocol](docs/checkpoint-protocol.md)

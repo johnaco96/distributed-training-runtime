@@ -77,6 +77,17 @@ PYTHONPATH=python python python/examples/pytorch_train.py --epochs 2 --samples 3
 PYTHONPATH=python python python/examples/pytorch_train.py --epochs 1 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-no-checkpoint --no-checkpoint
 ```
 
+Real torch.distributed DDP via the coordinator-backed launcher (start the
+coordinator first — see section D — then run; details in
+[torch-distributed.md](torch-distributed.md)):
+
+```bash
+PYTHONPATH=python python -m dtruntime.launch \
+    --coordinator localhost:50051 --run-name ddp-demo \
+    --nproc-per-node 2 --backend gloo \
+    python/examples/pytorch_ddp_train.py --steps 50
+```
+
 Simulated distributed-style fresh/resume/no-checkpoint:
 
 ```bash

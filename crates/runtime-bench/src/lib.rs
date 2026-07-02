@@ -746,6 +746,7 @@ async fn run_worker_rpc_async(
             storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
             world_size: workers as u32,
             run_version: "bench".into(),
+            ..Default::default()
         }))
         .await;
     let run_id = run_res
@@ -987,6 +988,7 @@ async fn run_logical_workers_async(
             storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
             world_size: workers as u32,
             run_version: "bench".into(),
+            ..Default::default()
         }))
         .await;
     let run_id = run_resp
@@ -1426,6 +1428,7 @@ async fn run_sharded_data_load_async(
             storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
             world_size: worker_count.max(1) as u32,
             run_version: "bench".into(),
+            ..Default::default()
         }))
         .await
         .map_err(|e| format!("register_run: {e}"))?;
