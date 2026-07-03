@@ -266,6 +266,11 @@ message ShardAssignment {
   google.protobuf.Timestamp lease_expires_at = 7;
   int64 progress_offset = 8;
   string shard_uri = 9;
+  // Integrity metadata carried from registration so the data pipeline can
+  // verify shard bytes on download without a second RPC.
+  string checksum = 10;
+  string checksum_algorithm = 11;
+  int64 size_bytes = 12;
 }
 
 message GetShardAssignmentResponse {

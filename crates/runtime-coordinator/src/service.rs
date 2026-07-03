@@ -588,6 +588,9 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 lease_expires_at: Some(assignment.lease_expires_at.into()),
                 progress_offset: assignment.progress_offset,
                 shard_uri: assignment.shard_uri,
+                checksum: assignment.checksum,
+                checksum_algorithm: assignment.checksum_algorithm,
+                size_bytes: assignment.size_bytes,
             })
             .collect();
 

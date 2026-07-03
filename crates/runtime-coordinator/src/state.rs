@@ -235,6 +235,9 @@ pub struct ShardAssignmentRecord {
     pub lease_expires_at: SystemTime,
     pub progress_offset: i64,
     pub shard_uri: String,
+    pub checksum: String,
+    pub checksum_algorithm: String,
+    pub size_bytes: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2005,6 +2008,9 @@ impl CoordinatorState {
                     .map(|p| p.progress_offset)
                     .unwrap_or_default(),
                 shard_uri: shard.shard_uri,
+                checksum: shard.checksum,
+                checksum_algorithm: shard.checksum_algorithm,
+                size_bytes: shard.size_bytes,
             })
             .collect();
 

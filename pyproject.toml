@@ -30,6 +30,10 @@ dev = [
 minio = [
     "boto3",
 ]
+# Optional dataset formats for dtruntime.data.
+parquet = [
+    "pyarrow",
+]
 
 [tool.setuptools.packages.find]
 where = ["python"]

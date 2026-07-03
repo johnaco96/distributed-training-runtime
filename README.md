@@ -80,6 +80,7 @@ See `python/examples/` for complete working examples including PyTorch integrati
 | Kubernetes operator | TrainingRun CRD → managed coordinator + Indexed worker Jobs; GPU/placement/topology aware; Volcano gang scheduling and Kueue queueing backends |
 | Run lifecycle | Durable states (pending/running/recovering/completed/failed/cancelled) surviving coordinator restarts; cancellation, stuck-run detection, retention cleanup |
 | Shard assignment | Deterministic by rank; cache-aware placement; configurable shard count |
+| Data pipeline | Streaming `IterableDataset` for PyTorch `DataLoader`; deterministic epoch shuffle; disk cache with prefetch/backpressure; content-addressed versioning; npz/dtrs/jsonl/parquet/webdataset formats |
 | Crash recovery | Per-shard progress offset persisted to SQLite or PostgreSQL; workers resume on restart |
 | Distributed checkpointing | DCP-based model+optimizer state with world-size/strategy resharding; 2PC commit; corruption fallback; retention/GC; async save |
 | Coordinator HA | PostgreSQL advisory lock leader election; standby takeover in ~5 s |
@@ -206,6 +207,7 @@ cargo run -p runtime-bench -- logical-workers \
 
 - [Quickstart](docs/quickstart.md)
 - [torch.distributed execution](docs/torch-distributed.md)
+- [Data pipeline](docs/data-pipeline.md)
 - [Run lifecycle & failure semantics](docs/run-lifecycle.md)
 - [Distributed checkpointing](docs/checkpointing-distributed.md)
 - [Kubernetes operator](docs/kubernetes-operator.md)

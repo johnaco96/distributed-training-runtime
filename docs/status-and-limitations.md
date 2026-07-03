@@ -59,6 +59,11 @@ The following capabilities are implemented and locally validated:
   (`ReportCheckpointCorrupt`), plus `ListCheckpoints` for inspection.
 - Checkpoint retention/GC (`--checkpoint-keep-last`) removing old records and
   local artifacts via the reconcile task.
+- Streaming data pipeline (`dtruntime.data`): `DistributedShardDataset`
+  (`IterableDataset` for PyTorch `DataLoader`), deterministic per-epoch
+  shuffling, disk cache with prefetch/backpressure, content-addressed dataset
+  versioning, DataLoader-worker sharding, and npz/dtrs/jsonl/parquet/
+  webdataset formats (see `docs/data-pipeline.md`).
 
 ## Current limitations and non-goals
 
