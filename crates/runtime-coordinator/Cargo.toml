@@ -8,10 +8,6 @@ publish = false
 runtime-checkpoint = { path = "../runtime-checkpoint" }
 runtime-proto = { path = "../runtime-proto" }
 runtime-storage = { path = "../runtime-storage", features = ["s3"] }
-# OS advisory file lock for the SQLite metadata store: released by the kernel
-# on process death, so a hard-killed coordinator can restart without manual
-# lock cleanup.
-fs4 = { version = "0.13", features = ["sync"] }
 prost-types = "0.13"
 rusqlite = { version = "0.31", features = ["bundled"] }
 # sqlx: async PostgreSQL driver used by PostgresMetadataStore.

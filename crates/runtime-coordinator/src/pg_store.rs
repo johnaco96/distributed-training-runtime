@@ -31,6 +31,7 @@
 use sqlx::PgPool;
 use tracing::info;
 
+use crate::persistence::checkpoint_state_from_i32;
 use crate::persistence::{AuditEventEntry, MetadataStore, PersistResult, ShardProgressEntry};
 use crate::state::{
     CoordinatorCheckpointRecord, DatasetRecord, RunRecord, ShardRecord, WorkerRecord,
@@ -39,6 +40,7 @@ use runtime_checkpoint::{
     ArtifactRecord, CheckpointId as DomainCheckpointId, CheckpointRecord,
     CheckpointState as DomainCheckpointState, RunId as DomainRunId, WorkerId as DomainWorkerId,
 };
+use runtime_proto::runtime::v1::CheckpointId as ProtoCheckpointId;
 
 /// Production-grade, replicated metadata store backed by PostgreSQL.
 ///
@@ -91,6 +93,7 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS settle_timeout_ms INTEGER NOT NULL DEF
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS assignment_policy INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS storage_backend_kind INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS latest_checkpoint_id TEXT;
 
 CREATE TABLE IF NOT EXISTS workers (
   run_id               TEXT NOT NULL,
@@ -132,6 +135,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   created_at_millis        BIGINT NOT NULL,
   updated_at_millis        BIGINT NOT NULL,
   committed_at_millis      BIGINT,
+  expected_worker_ids_json TEXT NOT NULL DEFAULT '[]',
   idempotency_key          TEXT,
   PRIMARY KEY (run_id, checkpoint_id)
 );
@@ -169,6 +173,33 @@ CREATE TABLE IF NOT EXISTS shard_progress (
 );
 
 -- Gap 2: per-worker checkpoint commit votes (distributed 2PC)
+-- Full-hydration columns (idempotent for databases created before they
+-- existed; a real migration framework lands with the Phase 6 storage work).
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS host TEXT NOT NULL DEFAULT '';
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS sdk_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS protocol_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE workers ADD COLUMN IF NOT EXISTS registered_at_millis BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS dataset_uri TEXT NOT NULL DEFAULT '';
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS format TEXT NOT NULL DEFAULT '';
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS dataset_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS labels_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS registered_at_millis BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE shards ADD COLUMN IF NOT EXISTS byte_range_start BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE shards ADD COLUMN IF NOT EXISTS byte_range_end BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE shards ADD COLUMN IF NOT EXISTS checksum TEXT NOT NULL DEFAULT '';
+ALTER TABLE shards ADD COLUMN IF NOT EXISTS checksum_algorithm TEXT NOT NULL DEFAULT '';
+ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS expected_worker_ids_json TEXT NOT NULL DEFAULT '[]';
+
+-- Durable idempotency-key maps: one row per in-memory DashMap entry so
+-- retried RPCs stay idempotent across coordinator restarts.
+-- scope IN (run, worker, dataset, checkpoint, checkpoint_artifact).
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  scope TEXT NOT NULL,
+  key   TEXT NOT NULL,
+  value TEXT NOT NULL,
+  PRIMARY KEY (scope, key)
+);
+
 CREATE TABLE IF NOT EXISTS checkpoint_commits (
   run_id              TEXT NOT NULL,
   checkpoint_id       TEXT NOT NULL,
@@ -294,11 +325,13 @@ ON CONFLICT (run_id) DO UPDATE SET
                 i32,
                 i32,
                 String,
+                i32,
+                Option<String>,
             );
             let rows: Vec<Row> = sqlx::query_as(
                 "SELECT run_id, name, created_at_millis, idempotency_key, run_state, state_reason, \
                  world_size, min_world_size, max_world_size, settle_timeout_ms, assignment_policy, \
-                 storage_backend_kind, run_version FROM runs ORDER BY run_id",
+                 storage_backend_kind, run_version, status, latest_checkpoint_id FROM runs ORDER BY run_id",
             )
             .fetch_all(&self.pool)
             .await
@@ -321,6 +354,8 @@ ON CONFLICT (run_id) DO UPDATE SET
                         assignment_policy,
                         storage_backend_kind,
                         run_version,
+                        status,
+                        latest_checkpoint_id,
                     )| RunRecord {
                         run_id,
                         run_name,
@@ -336,8 +371,9 @@ ON CONFLICT (run_id) DO UPDATE SET
                         storage_backend_kind,
                         run_version,
                         active_worker_count: 0,
-                        latest_checkpoint_id: None,
-                        latest_checkpoint_state: 0,
+                        latest_checkpoint_state: status,
+                        latest_checkpoint_id: latest_checkpoint_id
+                            .map(|value| ProtoCheckpointId { value }),
                         state_updated_at: std::time::SystemTime::now(),
                     },
                 )
@@ -349,13 +385,18 @@ ON CONFLICT (run_id) DO UPDATE SET
         self.block(async {
             sqlx::query(
                 r#"
-INSERT INTO workers (run_id, worker_id, rank, world_size, status, last_heartbeat_millis, idempotency_key)
-VALUES ($1, $2, $3, $4, $5, $6, NULL)
+INSERT INTO workers (run_id, worker_id, rank, world_size, status, last_heartbeat_millis,
+                     idempotency_key, host, sdk_version, protocol_version, registered_at_millis)
+VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10)
 ON CONFLICT (run_id, worker_id) DO UPDATE SET
   rank = EXCLUDED.rank,
   world_size = EXCLUDED.world_size,
   status = EXCLUDED.status,
-  last_heartbeat_millis = EXCLUDED.last_heartbeat_millis
+  last_heartbeat_millis = EXCLUDED.last_heartbeat_millis,
+  host = EXCLUDED.host,
+  sdk_version = EXCLUDED.sdk_version,
+  protocol_version = EXCLUDED.protocol_version,
+  registered_at_millis = EXCLUDED.registered_at_millis
 "#,
             )
             .bind(&w.run_id)
@@ -364,6 +405,10 @@ ON CONFLICT (run_id, worker_id) DO UPDATE SET
             .bind(world_size as i32)
             .bind(w.state)
             .bind(to_millis(w.last_heartbeat_at))
+            .bind(&w.host)
+            .bind(&w.sdk_version)
+            .bind(&w.protocol_version)
+            .bind(to_millis(w.registered_at))
             .execute(&self.pool)
             .await
             .map(|_| ())
@@ -392,17 +437,28 @@ ON CONFLICT (run_id, worker_id) DO UPDATE SET
         self.block(async {
             sqlx::query(
                 r#"
-INSERT INTO datasets (run_id, dataset_id, name, num_shards, idempotency_key)
-VALUES ($1, $2, $3, $4, NULL)
+INSERT INTO datasets (run_id, dataset_id, name, num_shards, idempotency_key,
+                      dataset_uri, format, dataset_version, labels_json, registered_at_millis)
+VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)
 ON CONFLICT (run_id, dataset_id) DO UPDATE SET
   name = EXCLUDED.name,
-  num_shards = EXCLUDED.num_shards
+  num_shards = EXCLUDED.num_shards,
+  dataset_uri = EXCLUDED.dataset_uri,
+  format = EXCLUDED.format,
+  dataset_version = EXCLUDED.dataset_version,
+  labels_json = EXCLUDED.labels_json,
+  registered_at_millis = EXCLUDED.registered_at_millis
 "#,
             )
             .bind(&d.run_id)
             .bind(&d.dataset_id)
             .bind(&d.name)
             .bind(d.shard_count as i32)
+            .bind(&d.dataset_uri)
+            .bind(&d.format)
+            .bind(&d.dataset_version)
+            .bind(serde_json::to_string(&d.labels).unwrap_or_else(|_| "{}".to_string()))
+            .bind(to_millis(d.registered_at))
             .execute(&self.pool)
             .await
             .map(|_| ())
@@ -411,12 +467,17 @@ ON CONFLICT (run_id, dataset_id) DO UPDATE SET
             for (idx, s) in d.shards.iter().enumerate() {
                 sqlx::query(
                     r#"
-INSERT INTO shards (run_id, dataset_id, shard_id, shard_index, shard_uri, num_records, size_bytes)
-VALUES ($1, $2, $3, $4, $5, NULL, $6)
+INSERT INTO shards (run_id, dataset_id, shard_id, shard_index, shard_uri, num_records, size_bytes,
+                    byte_range_start, byte_range_end, checksum, checksum_algorithm)
+VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10)
 ON CONFLICT (run_id, dataset_id, shard_id) DO UPDATE SET
   shard_index = EXCLUDED.shard_index,
   shard_uri   = EXCLUDED.shard_uri,
-  size_bytes  = EXCLUDED.size_bytes
+  size_bytes  = EXCLUDED.size_bytes,
+  byte_range_start = EXCLUDED.byte_range_start,
+  byte_range_end   = EXCLUDED.byte_range_end,
+  checksum         = EXCLUDED.checksum,
+  checksum_algorithm = EXCLUDED.checksum_algorithm
 "#,
                 )
                 .bind(&d.run_id)
@@ -425,6 +486,10 @@ ON CONFLICT (run_id, dataset_id, shard_id) DO UPDATE SET
                 .bind(idx as i32)
                 .bind(&s.shard_uri)
                 .bind(s.size_bytes)
+                .bind(s.byte_range_start)
+                .bind(s.byte_range_end)
+                .bind(&s.checksum)
+                .bind(&s.checksum_algorithm)
                 .execute(&self.pool)
                 .await
                 .map(|_| ())
@@ -450,15 +515,17 @@ ON CONFLICT (run_id, dataset_id, shard_id) DO UPDATE SET
                 r#"
 INSERT INTO checkpoints
   (run_id, checkpoint_id, state, initiated_by_worker_id, step,
-   created_at_millis, updated_at_millis, committed_at_millis, idempotency_key)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+   created_at_millis, updated_at_millis, committed_at_millis, idempotency_key,
+   expected_worker_ids_json)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT (run_id, checkpoint_id) DO UPDATE SET
   state                  = EXCLUDED.state,
   initiated_by_worker_id = EXCLUDED.initiated_by_worker_id,
   step                   = EXCLUDED.step,
   updated_at_millis      = EXCLUDED.updated_at_millis,
   committed_at_millis    = EXCLUDED.committed_at_millis,
-  idempotency_key        = EXCLUDED.idempotency_key
+  idempotency_key        = EXCLUDED.idempotency_key,
+  expected_worker_ids_json = EXCLUDED.expected_worker_ids_json
 "#,
             )
             .bind(run_id)
@@ -470,6 +537,10 @@ ON CONFLICT (run_id, checkpoint_id) DO UPDATE SET
             .bind(rec.checkpoint.updated_at_millis as i64)
             .bind(rec.committed_at_millis.map(|v| v as i64))
             .bind(idem)
+            .bind(
+                serde_json::to_string(&rec.expected_worker_ids)
+                    .unwrap_or_else(|_| "[]".to_string()),
+            )
             .execute(&self.pool)
             .await
             .map(|_| ())
@@ -795,6 +866,208 @@ ON CONFLICT (run_id, checkpoint_id, worker_id) DO NOTHING
     }
 
     // ── Gap 5: durable audit log ─────────────────────────────────────────────
+
+    fn save_idempotency_key(&self, scope: &str, key: &str, value: &str) -> PersistResult<()> {
+        self.block(async {
+            sqlx::query(
+                "INSERT INTO idempotency_keys (scope, key, value) VALUES ($1, $2, $3) \
+                 ON CONFLICT (scope, key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(scope)
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+    fn load_all_idempotency_keys(&self) -> PersistResult<Vec<(String, String, String)>> {
+        self.block(async {
+            sqlx::query_as("SELECT scope, key, value FROM idempotency_keys")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+    fn load_all_workers(&self) -> PersistResult<Vec<WorkerRecord>> {
+        type WorkerRow = (
+            String,
+            String,
+            i32,
+            i32,
+            Option<i64>,
+            String,
+            String,
+            String,
+            i64,
+        );
+        self.block(async {
+            let rows: Vec<WorkerRow> = sqlx::query_as(
+                "SELECT run_id, worker_id, rank, status, last_heartbeat_millis, host, \
+                 sdk_version, protocol_version, registered_at_millis FROM workers",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(run_id, worker_id, rank, status, hb, host, sdk, proto, registered)| {
+                        let last_heartbeat = from_millis(hb.unwrap_or(0).max(0) as u64);
+                        WorkerRecord {
+                            run_id,
+                            worker_id,
+                            rank: rank as u32,
+                            state: status,
+                            last_heartbeat_at: last_heartbeat,
+                            host,
+                            sdk_version: sdk,
+                            protocol_version: proto,
+                            registered_at: from_millis(registered.max(0) as u64),
+                            next_heartbeat_deadline: last_heartbeat,
+                            failure_deadline: last_heartbeat,
+                        }
+                    },
+                )
+                .collect())
+        })
+    }
+    fn load_all_datasets(&self) -> PersistResult<Vec<DatasetRecord>> {
+        type DatasetRow = (
+            String,
+            String,
+            String,
+            i32,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        );
+        type ShardRow = (String, String, Option<i64>, i64, i64, String, String);
+        self.block(async {
+            let rows: Vec<DatasetRow> = sqlx::query_as(
+                "SELECT run_id, dataset_id, name, num_shards, dataset_uri, format, \
+                 dataset_version, labels_json, registered_at_millis FROM datasets",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let mut datasets = Vec::with_capacity(rows.len());
+            for (run_id, dataset_id, name, num_shards, uri, format, version, labels_json, reg) in
+                rows
+            {
+                let shard_rows: Vec<ShardRow> = sqlx::query_as(
+                    "SELECT shard_id, shard_uri, size_bytes, byte_range_start, byte_range_end, \
+                     checksum, checksum_algorithm FROM shards \
+                     WHERE run_id = $1 AND dataset_id = $2 ORDER BY shard_index",
+                )
+                .bind(&run_id)
+                .bind(&dataset_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let shards = shard_rows
+                    .into_iter()
+                    .map(|(sid, suri, size, start, end, sum, alg)| ShardRecord {
+                        shard_id: sid,
+                        dataset_id: dataset_id.clone(),
+                        shard_uri: suri,
+                        size_bytes: size.unwrap_or(0),
+                        byte_range_start: start,
+                        byte_range_end: end,
+                        checksum: sum,
+                        checksum_algorithm: alg,
+                    })
+                    .collect();
+                datasets.push(DatasetRecord {
+                    run_id,
+                    dataset_id,
+                    name,
+                    shard_count: num_shards as u32,
+                    dataset_uri: uri,
+                    format,
+                    dataset_version: version,
+                    labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                    registered_at: from_millis(reg.max(0) as u64),
+                    shards,
+                });
+            }
+            Ok(datasets)
+        })
+    }
+    fn load_all_checkpoints(&self) -> PersistResult<Vec<(String, CoordinatorCheckpointRecord)>> {
+        type CkptRow = (
+            String,
+            String,
+            i32,
+            String,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            String,
+        );
+        type ArtifactRow = (String, String, String, i64, String, String);
+        self.block(async {
+            let rows: Vec<CkptRow> = sqlx::query_as(
+                "SELECT run_id, checkpoint_id, state, initiated_by_worker_id, step, \
+                 created_at_millis, updated_at_millis, committed_at_millis, \
+                 expected_worker_ids_json FROM checkpoints",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let mut records = Vec::with_capacity(rows.len());
+            for (run_id, ckpt_id, state, initiator, step, created, updated, committed, expected) in
+                rows
+            {
+                let artifact_rows: Vec<ArtifactRow> = sqlx::query_as(
+                    "SELECT worker_id, artifact_name, artifact_uri, size_bytes, checksum, \
+                     checksum_algorithm FROM checkpoint_artifacts \
+                     WHERE run_id = $1 AND checkpoint_id = $2 ORDER BY worker_id, artifact_name",
+                )
+                .bind(&run_id)
+                .bind(&ckpt_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let artifacts = artifact_rows
+                    .into_iter()
+                    .map(|(wid, name, uri, size, sum, alg)| ArtifactRecord {
+                        worker_id: DomainWorkerId(wid),
+                        artifact_name: name,
+                        storage_key: uri,
+                        size_bytes: size as u64,
+                        checksum: sum,
+                        checksum_algorithm: alg,
+                    })
+                    .collect();
+                let expected_worker_ids: Vec<String> =
+                    serde_json::from_str(&expected).unwrap_or_default();
+                records.push((
+                    run_id.clone(),
+                    CoordinatorCheckpointRecord {
+                        checkpoint: CheckpointRecord {
+                            run_id: DomainRunId(run_id),
+                            checkpoint_id: DomainCheckpointId(ckpt_id),
+                            step: step as u64,
+                            state: checkpoint_state_from_i32(state),
+                            artifacts,
+                            created_at_millis: created as u64,
+                            updated_at_millis: updated as u64,
+                        },
+                        initiated_by_worker_id: initiator,
+                        committed_at_millis: committed.map(|v| v as u64),
+                        expected_artifact_count: expected_worker_ids.len() as u32,
+                        expected_worker_ids,
+                    },
+                ));
+            }
+            Ok(records)
+        })
+    }
 
     fn insert_audit_event(&self, event: &AuditEventEntry) -> PersistResult<()> {
         self.block(async {

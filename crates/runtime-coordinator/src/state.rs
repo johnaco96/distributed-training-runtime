@@ -425,54 +425,106 @@ impl CoordinatorState {
     /// so the coordinator can resume mid-shard reads and in-flight 2PC commits
     /// without requiring workers to re-send progress reports.
     fn hydrate_from_store(&mut self, store: &dyn MetadataStore) {
-        // Durable run lifecycle: restore the run registry (including terminal
-        // runs, which remain queryable until retention cleanup) and each
-        // run's worker roster.  Restored workers get fresh heartbeat
-        // deadlines — live workers re-assert themselves within one interval,
-        // dead ones age out through the normal stale→failed path.
+        // ── Full run state machine hydration ────────────────────────────────
+        // Runs (with durable lifecycle state), workers, datasets, checkpoints
+        // (including in-flight 2PC), and every idempotency map come back, so
+        // clients continue mid-run across a coordinator restart or HA
+        // failover without re-registering anything.  Terminal runs stay
+        // queryable until retention cleanup.
+
         if let Ok(runs) = store.load_all_runs() {
-            let now = SystemTime::now();
             for run in runs {
+                bump_counter_from_id(&self.next_run_id, &run.run_id, "run-");
+                // The runs table also carries the registration idempotency
+                // key (belt-and-braces with the idempotency_keys table below).
                 if !run.idempotency_key.is_empty() {
                     self.run_idempotency_keys
                         .insert(run.idempotency_key.clone(), run.run_id.clone());
                 }
-                if let Ok(workers) = store.load_workers_for_run(&run.run_id) {
-                    let map: HashMap<String, WorkerRecord> = workers
-                        .into_iter()
-                        .map(|(worker_id, rank, _world_size, state)| {
-                            (
-                                worker_id.clone(),
-                                WorkerRecord {
-                                    run_id: run.run_id.clone(),
-                                    worker_id,
-                                    rank,
-                                    host: String::new(),
-                                    sdk_version: String::new(),
-                                    protocol_version: String::new(),
-                                    state,
-                                    registered_at: now,
-                                    last_heartbeat_at: now,
-                                    next_heartbeat_deadline: now + HEARTBEAT_INTERVAL,
-                                    failure_deadline: now + WORKER_FAILURE_INTERVAL,
-                                },
-                            )
-                        })
-                        .collect();
-                    if !map.is_empty() {
-                        self.workers_by_run
-                            .insert(run.run_id.clone(), Arc::new(RwLock::new(map)));
-                    }
-                }
-                // Keep generated run ids collision-free with restored ones.
-                if let Some(numeric) = run
-                    .run_id
-                    .strip_prefix("run-")
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    self.next_run_id.fetch_max(numeric, Ordering::Relaxed);
-                }
                 self.runs.insert(run.run_id.clone(), run);
+            }
+        }
+
+        let now = SystemTime::now();
+        if let Ok(workers) = store.load_all_workers() {
+            for mut worker in workers {
+                bump_counter_from_id(&self.next_worker_id, &worker.worker_id, "worker-");
+                // Re-arm liveness: pre-crash deadlines cannot be trusted after
+                // a restart.  The worker keeps its persisted state but gets a
+                // fresh window to heartbeat before reconciliation marks it
+                // stale/failed.
+                worker.next_heartbeat_deadline = now + HEARTBEAT_INTERVAL;
+                worker.failure_deadline = now + WORKER_FAILURE_INTERVAL;
+                let workers_arc = self
+                    .workers_by_run
+                    .entry(worker.run_id.clone())
+                    .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+                    .clone();
+                workers_arc
+                    .write()
+                    .unwrap()
+                    .insert(worker.worker_id.clone(), worker);
+            }
+        }
+        // active_worker_count is derived state — recompute from hydrated workers.
+        let hydrated_run_ids: Vec<String> = self
+            .workers_by_run
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        for run_id in hydrated_run_ids {
+            refresh_active_worker_count(&self.runs, &self.workers_by_run, &run_id);
+        }
+
+        if let Ok(datasets) = store.load_all_datasets() {
+            for dataset in datasets {
+                bump_counter_from_id(&self.next_dataset_id, &dataset.dataset_id, "dataset-");
+                for shard in &dataset.shards {
+                    bump_counter_from_id(&self.next_shard_id, &shard.shard_id, "shard-");
+                }
+                let datasets_arc = self
+                    .datasets_by_run
+                    .entry(dataset.run_id.clone())
+                    .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+                    .clone();
+                datasets_arc
+                    .write()
+                    .unwrap()
+                    .insert(dataset.dataset_id.clone(), dataset);
+            }
+        }
+
+        if let Ok(checkpoints) = store.load_all_checkpoints() {
+            for (run_id, record) in checkpoints {
+                bump_counter_from_id(
+                    &self.next_checkpoint_id,
+                    &record.checkpoint.checkpoint_id.0,
+                    "checkpoint-",
+                );
+                let checkpoints_arc = self
+                    .checkpoints_by_run
+                    .entry(run_id)
+                    .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+                    .clone();
+                checkpoints_arc
+                    .write()
+                    .unwrap()
+                    .insert(record.checkpoint.checkpoint_id.0.clone(), record);
+            }
+        }
+
+        if let Ok(keys) = store.load_all_idempotency_keys() {
+            for (scope, key, value) in keys {
+                match scope.as_str() {
+                    "run" => self.run_idempotency_keys.insert(key, value),
+                    "worker" => self.worker_idempotency_keys.insert(key, value),
+                    "dataset" => self.dataset_idempotency_keys.insert(key, value),
+                    "checkpoint" => self.checkpoint_idempotency_keys.insert(key, value),
+                    "checkpoint_artifact" => {
+                        self.checkpoint_artifact_idempotency_keys.insert(key, value)
+                    }
+                    _ => None,
+                };
             }
         }
         // Gap 1: restore shard-progress offsets so workers get the correct
@@ -510,6 +562,19 @@ impl CoordinatorState {
                     .clone();
                 set_arc.lock().unwrap().insert(worker_id);
             }
+        }
+    }
+
+    /// Persist one idempotency-key mapping so retried RPCs stay idempotent
+    /// across coordinator restarts.
+    fn persist_idempotency_key(&self, scope: &str, key: &str, value: &str) {
+        if key.is_empty() {
+            return;
+        }
+        if let Some(store) = &self.metadata_store {
+            store
+                .save_idempotency_key(scope, key, value)
+                .expect("persist idempotency key");
         }
     }
 
@@ -679,6 +744,7 @@ impl CoordinatorState {
         drop(checkpoints);
 
         if !idempotency_key.is_empty() {
+            self.persist_idempotency_key("checkpoint", &scoped_key, &checkpoint_id);
             self.checkpoint_idempotency_keys
                 .insert(scoped_key, checkpoint_id);
         }
@@ -811,6 +877,11 @@ impl CoordinatorState {
         }
         self.persist_checkpoint(&run_id, "", &response);
         if !idempotency_key.is_empty() {
+            self.persist_idempotency_key(
+                "checkpoint_artifact",
+                &scoped_idempotency_key,
+                &checkpoint_id,
+            );
             self.checkpoint_artifact_idempotency_keys
                 .insert(scoped_idempotency_key, checkpoint_id);
         }
@@ -1101,6 +1172,7 @@ impl CoordinatorState {
 
         self.runs.insert(run_id.clone(), record.clone());
         if !request.idempotency_key.is_empty() {
+            self.persist_idempotency_key("run", &request.idempotency_key, &run_id);
             self.run_idempotency_keys
                 .insert(request.idempotency_key, run_id.clone());
         }
@@ -1643,6 +1715,7 @@ impl CoordinatorState {
             .insert(dataset_id.clone(), record.clone());
 
         if !request.idempotency_key.is_empty() {
+            self.persist_idempotency_key("dataset", &idempotency_key, &dataset_id);
             self.dataset_idempotency_keys
                 .insert(idempotency_key, dataset_id.clone());
         }
@@ -1980,6 +2053,7 @@ impl CoordinatorState {
         refresh_active_worker_count(&self.runs, &self.workers_by_run, &run_id);
 
         if !request.idempotency_key.is_empty() {
+            self.persist_idempotency_key("worker", &idempotency_key, &worker_id);
             self.worker_idempotency_keys
                 .insert(idempotency_key, worker_id.clone());
         }
@@ -2262,6 +2336,17 @@ fn map_commit_checkpoint_error(error: CheckpointError) -> CommitCheckpointError 
             CommitCheckpointError::InvalidState
         }
         _ => CommitCheckpointError::InvalidState,
+    }
+}
+
+/// Advance a generated-ID counter past a hydrated ID so post-restart
+/// generation never collides with persisted entities.
+///
+/// Only IDs matching the coordinator's own `<prefix><n>` format move the
+/// counter; client-supplied IDs are ignored.
+fn bump_counter_from_id(counter: &AtomicU64, id: &str, prefix: &str) {
+    if let Some(n) = id.strip_prefix(prefix).and_then(|s| s.parse::<u64>().ok()) {
+        counter.fetch_max(n, Ordering::Relaxed);
     }
 }
 
@@ -3634,6 +3719,97 @@ mod tests {
                 }
             )
             .is_none());
+    }
+
+    #[test]
+    fn full_run_state_survives_coordinator_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("coordinator.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+        let state = CoordinatorState::with_metadata_store(Arc::new(store));
+
+        // Register a run, two workers, a dataset, and an in-flight checkpoint
+        // with worker A's artifact + 2PC vote already recorded.
+        let (run_id, worker_a, worker_b) = setup_two_worker_checkpoint(&state, "ckpt-2pc");
+        state
+            .register_dataset(dataset_request(run_id.clone(), "dataset-key"))
+            .expect("dataset should register");
+        let first = state
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "ckpt-2pc".to_string(),
+                worker_a.value.clone(),
+                "c1".to_string(),
+            )
+            .unwrap();
+        assert!(!first.globally_committed);
+        drop(state);
+
+        // Restart the coordinator: everything must come back from the store
+        // WITHOUT clients re-registering anything.
+        let reopened = SqliteMetadataStore::open(&path).unwrap();
+        reopened.init_schema().unwrap();
+        let recreated = CoordinatorState::with_metadata_store(Arc::new(reopened));
+
+        // Run metadata survives.
+        let run = recreated.get_run(&run_id).expect("run should be hydrated");
+        assert_eq!(run.run_name, "test-run");
+        assert_eq!(run.world_size, 4);
+        assert_eq!(run.run_version, "v1");
+        assert_eq!(run.active_worker_count, 2);
+
+        // Idempotent re-registration returns the SAME run (durable key map).
+        let replayed = recreated.register_run(register_request("run-key"));
+        assert_eq!(replayed.run_id.value, run_id.value);
+
+        // Workers survive, still active, with re-armed liveness deadlines.
+        let hydrated_a = recreated
+            .get_worker_for_test(&run_id, &worker_a)
+            .expect("worker a should be hydrated");
+        assert_eq!(hydrated_a.state, WorkerState::Active as i32);
+        assert!(hydrated_a.next_heartbeat_deadline > SystemTime::now());
+        recreated.reconcile_worker_liveness();
+        assert_eq!(
+            recreated
+                .get_worker_for_test(&run_id, &worker_a)
+                .unwrap()
+                .state,
+            WorkerState::Active as i32,
+            "re-armed deadline must survive immediate reconciliation"
+        );
+
+        // Dataset + shards survive.
+        let dataset_id = DatasetId {
+            value: "dataset-test".to_string(),
+        };
+        let assignments = recreated
+            .get_shard_assignments(&run_id, &worker_a, &dataset_id, None)
+            .unwrap_or_else(|_| panic!("hydrated dataset should serve shard assignments"));
+        assert!(!assignments.assignments.is_empty());
+
+        // The in-flight checkpoint survives with its expected worker set, so
+        // worker B's vote alone completes the 2PC commit after the restart.
+        let ckpt = recreated
+            .get_checkpoint(&run_id, "ckpt-2pc")
+            .expect("in-flight checkpoint should be hydrated");
+        assert_eq!(ckpt.expected_artifact_count, 2);
+        assert_eq!(ckpt.checkpoint.artifacts.len(), 2);
+        let second = recreated
+            .commit_checkpoint(
+                run_id.value.clone(),
+                "ckpt-2pc".to_string(),
+                worker_b.value,
+                "c2".to_string(),
+            )
+            .expect("post-restart vote should commit");
+        assert!(second.globally_committed);
+
+        // ID counters are reseeded: a brand-new run must not collide with the
+        // hydrated one.
+        let fresh = recreated.register_run(register_request("another-run-key"));
+        assert_ne!(fresh.run_id.value, run_id.value);
+        assert_eq!(fresh.run_id.value, "run-2");
     }
 
     #[test]
