@@ -45,6 +45,10 @@ struct CoordinatorCliArgs {
     s3_secret_key: Option<String>,
     s3_region: String,
     max_s3_concurrent_ops: Option<usize>,
+    /// Server-side encryption for uploads: `AES256` (SSE-S3) or `aws:kms`.
+    s3_sse: Option<String>,
+    /// KMS key id/ARN for SSE-KMS.
+    s3_sse_kms_key_id: Option<String>,
     /// Re-read each streamed artifact from disk after write and verify its
     /// SHA-256 matches the inline checksum.  Defaults to `true`.  Disable
     /// with `--no-verify-checkpoint-artifacts` for maximum throughput when
@@ -173,6 +177,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             force_path_style: args.s3_endpoint.is_some(),
             key_prefix: None,
             max_concurrent_operations: args.max_s3_concurrent_ops,
+            server_side_encryption: args.s3_sse.clone(),
+            sse_kms_key_id: args.s3_sse_kms_key_id.clone(),
+            ..Default::default()
         };
         service = service
             .with_s3_backend(s3_cfg)
@@ -424,6 +431,8 @@ fn coordinator_args(
         s3_secret_key: std::env::var("DTRUNTIME_S3_SECRET_KEY").ok(),
         s3_region: std::env::var("DTRUNTIME_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
         max_s3_concurrent_ops: None,
+        s3_sse: std::env::var("DTRUNTIME_S3_SSE").ok(),
+        s3_sse_kms_key_id: std::env::var("DTRUNTIME_S3_SSE_KMS_KEY_ID").ok(),
         verify_checkpoint_artifacts: true,
         reconcile_interval_secs: 10,
         stuck_after_secs: 1800,
@@ -473,6 +482,14 @@ fn coordinator_args(
             parsed.s3_secret_key = Some(args.next().ok_or("--s3-secret-key requires a value")?);
         } else if arg == "--s3-region" {
             parsed.s3_region = args.next().ok_or("--s3-region requires a value")?;
+        } else if arg == "--s3-sse" {
+            parsed.s3_sse = Some(
+                args.next()
+                    .ok_or("--s3-sse requires a value (AES256|aws:kms)")?,
+            );
+        } else if arg == "--s3-sse-kms-key-id" {
+            parsed.s3_sse_kms_key_id =
+                Some(args.next().ok_or("--s3-sse-kms-key-id requires a value")?);
         } else if arg == "--reconcile-interval-secs" {
             parsed.reconcile_interval_secs = args
                 .next()
@@ -554,6 +571,8 @@ mod tests {
                 s3_region: std::env::var("DTRUNTIME_S3_REGION")
                     .unwrap_or_else(|_| "us-east-1".to_string()),
                 max_s3_concurrent_ops: None,
+                s3_sse: std::env::var("DTRUNTIME_S3_SSE").ok(),
+                s3_sse_kms_key_id: std::env::var("DTRUNTIME_S3_SSE_KMS_KEY_ID").ok(),
                 verify_checkpoint_artifacts: true,
                 reconcile_interval_secs: 10,
                 stuck_after_secs: 1800,

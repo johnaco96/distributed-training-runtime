@@ -84,7 +84,8 @@ See `python/examples/` for complete working examples including PyTorch integrati
 | Crash recovery | Per-shard progress offset persisted to SQLite or PostgreSQL; workers resume on restart |
 | Distributed checkpointing | DCP-based model+optimizer state with world-size/strategy resharding; 2PC commit; corruption fallback; retention/GC; async save |
 | Coordinator HA | PostgreSQL advisory lock leader election; standby takeover in ~5 s |
-| S3-compatible storage | Checkpoint artifacts to any S3-compatible store (MinIO, AWS S3); configurable concurrency |
+| S3-compatible storage | Any S3-compatible store (MinIO, AWS S3); multipart upload, retryable-vs-permanent error classification, full-jitter backoff, server-side encryption |
+| Schema migrations | Versioned, forward-only migration ledger; SQLite WAL durability; wire-compatibility enforced by a proto golden-snapshot test |
 | TLS / mTLS | cert-manager-compatible; ECDSA P-256 certs with automatic rotation |
 | Role-based auth | Admin vs. worker identity enforced on all RPCs |
 | Audit logging | Structured events written to PostgreSQL for security-relevant operations |
@@ -212,6 +213,9 @@ cargo run -p runtime-bench -- logical-workers \
 - [Distributed checkpointing](docs/checkpointing-distributed.md)
 - [Kubernetes operator](docs/kubernetes-operator.md)
 - [Scheduler integrations](docs/schedulers.md)
+- [Object-store hardening](docs/storage-hardening.md)
+- [Schema migrations](docs/schema-migrations.md)
+- [Protocol compatibility](docs/protocol-compatibility.md)
 - [Architecture](docs/architecture.md)
 - [Dataset sharding](docs/dataset-sharding.md)
 - [Checkpoint protocol](docs/checkpoint-protocol.md)

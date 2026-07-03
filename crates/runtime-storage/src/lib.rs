@@ -93,7 +93,7 @@ impl Display for StorageKey {
     }
 }
 
-/// Storage errors for MVP backends.
+/// Storage errors for backend operations.
 #[derive(Debug)]
 pub enum StorageError {
     Io(io::Error),
@@ -102,6 +102,17 @@ pub enum StorageError {
     Timeout {
         operation: &'static str,
         timeout: Duration,
+    },
+    /// A classified backend (e.g. S3) error.  `retryable` distinguishes
+    /// transient failures (throttling, 5xx, connection resets) that the retry
+    /// loop should re-attempt from permanent ones (auth, validation, missing
+    /// bucket) that will never succeed on retry.  `code` carries the
+    /// backend's error code (e.g. `AccessDenied`, `SlowDown`) when known.
+    Backend {
+        operation: &'static str,
+        retryable: bool,
+        code: Option<String>,
+        message: String,
     },
 }
 
@@ -117,6 +128,19 @@ impl Display for StorageError {
                     "storage operation '{operation}' timed out after {timeout:?}"
                 )
             }
+            StorageError::Backend {
+                operation,
+                retryable,
+                code,
+                message,
+            } => write!(
+                f,
+                "backend error in '{operation}' ({}{}): {message}",
+                if *retryable { "retryable" } else { "permanent" },
+                code.as_ref()
+                    .map(|c| format!(", code={c}"))
+                    .unwrap_or_default(),
+            ),
         }
     }
 }
@@ -127,7 +151,8 @@ impl Error for StorageError {
             StorageError::Io(err) => Some(err),
             StorageError::InvalidKey(_)
             | StorageError::NotFound(_)
-            | StorageError::Timeout { .. } => None,
+            | StorageError::Timeout { .. }
+            | StorageError::Backend { .. } => None,
         }
     }
 }
@@ -178,9 +203,17 @@ pub fn is_retryable_storage_error(err: &StorageError) -> bool {
     match err {
         StorageError::InvalidKey(_) | StorageError::NotFound(_) => false,
         StorageError::Io(_) | StorageError::Timeout { .. } => true,
+        // Honour the backend's classification: permanent errors (auth,
+        // validation, missing bucket) must NOT be retried, or every such
+        // failure pays the full retry budget in latency for nothing.
+        StorageError::Backend { retryable, .. } => *retryable,
     }
 }
 
+/// Exponential backoff for a retry attempt, capped at `retry_max_backoff`.
+///
+/// Deterministic; see [`retry_backoff_with_jitter`] for the production form
+/// that adds full jitter to avoid synchronised retries (thundering herd).
 pub fn retry_backoff_for_attempt(
     policy: &StorageOperationPolicy,
     retry_attempt_index: u32,
@@ -188,6 +221,24 @@ pub fn retry_backoff_for_attempt(
     let multiplier = 1_u32.checked_shl(retry_attempt_index.min(31)).unwrap_or(0);
     let backoff = policy.retry_initial_backoff.saturating_mul(multiplier);
     std::cmp::min(backoff, policy.retry_max_backoff)
+}
+
+/// Exponential backoff with **full jitter**: a uniformly random delay in
+/// `[0, exponential_backoff]`.
+///
+/// Full jitter (AWS's recommended form) de-correlates retries across many
+/// workers that failed at the same instant — critical when a throttling event
+/// or a coordinator blip makes hundreds of workers retry together.  `rand01`
+/// is a caller-supplied uniform sample in `[0, 1)` so this stays pure and
+/// unit-testable.
+pub fn retry_backoff_with_jitter(
+    policy: &StorageOperationPolicy,
+    retry_attempt_index: u32,
+    rand01: f64,
+) -> Duration {
+    let ceiling = retry_backoff_for_attempt(policy, retry_attempt_index);
+    let frac = rand01.clamp(0.0, 1.0);
+    ceiling.mul_f64(frac)
 }
 
 #[cfg(feature = "s3")]
@@ -216,12 +267,34 @@ where
                 if attempt >= policy.max_retries || !is_retryable_storage_error(&err) {
                     return Err(err);
                 }
-                let delay = retry_backoff_for_attempt(policy, attempt);
+                // Full jitter so a throttling event does not resynchronise all
+                // retrying workers.  A cheap time-seeded sample keeps the
+                // storage crate dependency-free; determinism is only needed in
+                // the pure unit-tested helper.
+                let rand01 = jitter_sample();
+                let delay = retry_backoff_with_jitter(policy, attempt, rand01);
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
         }
     }
+}
+
+/// Cheap, dependency-free uniform sample in `[0, 1)` for retry jitter, seeded
+/// from the wall clock and thread id.  Not cryptographic; only used to
+/// de-correlate retry timing across workers.
+#[cfg(feature = "s3")]
+fn jitter_sample() -> f64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    // Top 53 bits → uniform double in [0, 1).
+    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
 }
 
 pub trait StorageBackend {
@@ -743,5 +816,44 @@ mod tests {
         .expect_err("invalid policy");
         assert!(matches!(err, StorageError::InvalidKey(_)));
         fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn backend_errors_honour_the_retryable_flag() {
+        let permanent = StorageError::Backend {
+            operation: "s3-put",
+            retryable: false,
+            code: Some("AccessDenied".into()),
+            message: "denied".into(),
+        };
+        let transient = StorageError::Backend {
+            operation: "s3-put",
+            retryable: true,
+            code: Some("SlowDown".into()),
+            message: "slow".into(),
+        };
+        assert!(!is_retryable_storage_error(&permanent));
+        assert!(is_retryable_storage_error(&transient));
+    }
+
+    #[test]
+    fn jitter_backoff_stays_within_exponential_ceiling() {
+        let policy = StorageOperationPolicy::default();
+        for attempt in 0..5 {
+            let ceiling = retry_backoff_for_attempt(&policy, attempt);
+            // Full range of jitter fractions never exceeds the ceiling and
+            // reaches (nearly) zero at the low end.
+            assert_eq!(
+                retry_backoff_with_jitter(&policy, attempt, 0.0),
+                Duration::ZERO
+            );
+            assert_eq!(retry_backoff_with_jitter(&policy, attempt, 1.0), ceiling);
+            let mid = retry_backoff_with_jitter(&policy, attempt, 0.5);
+            assert!(mid <= ceiling && mid >= Duration::ZERO);
+        }
+        // Out-of-range fractions are clamped.
+        let ceiling = retry_backoff_for_attempt(&policy, 2);
+        assert_eq!(retry_backoff_with_jitter(&policy, 2, 5.0), ceiling);
+        assert_eq!(retry_backoff_with_jitter(&policy, 2, -1.0), Duration::ZERO);
     }
 }

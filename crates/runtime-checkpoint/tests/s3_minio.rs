@@ -48,6 +48,7 @@ mod tests {
             secret_access_key,
             force_path_style: true,
             key_prefix,
+            ..Default::default()
         })
         .ok()
     }
@@ -106,8 +107,10 @@ mod tests {
             .cleanup_checkpoints(
                 &run_id,
                 CheckpointCleanupPolicy {
-                    retain_last_n: 1,
-                    delete_obsolete_artifacts: true,
+                    keep_latest: true,
+                    keep_last_n_committed: 1,
+                    remove_pending: true,
+                    remove_orphan_artifacts: true,
                 },
             )
             .expect("cleanup");

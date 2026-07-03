@@ -166,13 +166,35 @@ pub struct SqliteMetadataStore {
 impl SqliteMetadataStore {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
+        // Production durability + concurrency pragmas:
+        // - WAL: readers never block the writer and vice versa; the write-ahead
+        //   log is crash-safe (a torn commit is rolled back on reopen).
+        // - synchronous=NORMAL: fsync at checkpoint boundaries — durable across
+        //   process crashes (only a full OS/power loss can lose the last WAL
+        //   frames, the standard WAL trade-off) with far less fsync overhead
+        //   than FULL.
+        // - busy_timeout: wait for a contended lock instead of failing fast, so
+        //   concurrent access retries transparently.
+        // - foreign_keys: enforce referential integrity where declared.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
+    /// Bring the database schema up to the current version via the tracked,
+    /// forward-only migration runner ([`run_sqlite_migrations`]).  Idempotent
+    /// and safe to call on every startup.
     pub fn init_schema(&self) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite lock poisoned");
+        run_sqlite_migrations(&conn)
+    }
+
+    /// Baseline schema (migration v1): every table as of the current version.
+    fn apply_baseline_schema(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(
             "
 CREATE TABLE IF NOT EXISTS runs (
@@ -309,18 +331,17 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 ",
         )?;
-        drop(conn);
-        self.migrate_schema()
+        Self::apply_column_migrations(conn)
     }
 
-    /// Add columns introduced after a table was first created (idempotent).
+    /// Retrofit columns introduced after a table was first created (idempotent).
     ///
     /// `CREATE TABLE IF NOT EXISTS` covers fresh databases only; databases
-    /// created by earlier builds need the new columns retrofitted.  Column
+    /// created by an earlier build need the newer columns added.  Column
     /// presence is checked via PRAGMA rather than swallowing ALTER errors.
-    /// (A full migration framework lands with the Phase 6 storage work.)
-    fn migrate_schema(&self) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().expect("sqlite lock poisoned");
+    /// This is folded into the baseline migration so a pre-migration-table
+    /// database upgrades cleanly to v1.
+    fn apply_column_migrations(conn: &Connection) -> rusqlite::Result<()> {
         let additions: &[(&str, &str, &str)] = &[
             ("runs", "run_state", "INTEGER NOT NULL DEFAULT 1"),
             ("runs", "state_reason", "TEXT NOT NULL DEFAULT ''"),
@@ -1195,6 +1216,78 @@ fn now_millis_i64() -> i64 {
         .as_millis() as i64
 }
 
+// ─── SQLite schema migrations (versioned, forward-only) ──────────────────────
+//
+// Every schema change is a numbered [`SqliteMigration`].  On startup the
+// runner creates the `schema_migrations` ledger, then applies each migration
+// whose version is not yet recorded — in order, each inside its own
+// transaction — and records it.  Rules:
+//
+//   1. Never edit or renumber a migration that has shipped; append a new one.
+//   2. Versions are contiguous and strictly increasing from 1.
+//   3. Each migration is transactional: a failure rolls back and leaves the
+//      ledger unchanged, so a re-run retries cleanly.
+//
+// See docs/schema-migrations.md.
+
+struct SqliteMigration {
+    version: i64,
+    name: &'static str,
+    apply: fn(&Connection) -> rusqlite::Result<()>,
+}
+
+const SQLITE_MIGRATIONS: &[SqliteMigration] = &[SqliteMigration {
+    version: 1,
+    name: "baseline_schema",
+    // Baseline includes the idempotent column retrofit so a database created
+    // before the migration ledger existed converges to v1 cleanly.
+    apply: |conn| {
+        SqliteMetadataStore::apply_baseline_schema(conn)?;
+        Ok(())
+    },
+}];
+
+fn run_sqlite_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+           version           INTEGER PRIMARY KEY,
+           name              TEXT NOT NULL,
+           applied_at_millis INTEGER NOT NULL
+         );",
+    )?;
+    for migration in SQLITE_MIGRATIONS {
+        let already_applied = conn
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                params![migration.version],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if already_applied {
+            continue;
+        }
+        let tx = conn.unchecked_transaction()?;
+        (migration.apply)(&tx)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_millis) VALUES (?1, ?2, ?3)",
+            params![migration.version, migration.name, now_millis_i64()],
+        )?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// The highest migration version this build knows about (for diagnostics and
+/// the Postgres store's parallel ledger).
+pub fn latest_sqlite_migration_version() -> i64 {
+    SQLITE_MIGRATIONS
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Round-trip a persisted `state as i32` back to the domain enum.
 pub(crate) fn checkpoint_state_from_i32(value: i32) -> DomainCheckpointState {
     use DomainCheckpointState as S;
@@ -1437,5 +1530,140 @@ mod tests {
         assert_eq!(workers[0].0, "worker-0");
         assert_eq!(workers[0].1, 2);
         assert_eq!(workers[0].2, 4);
+    }
+
+    // ── schema migrations ────────────────────────────────────────────────────
+
+    #[test]
+    fn migrations_are_recorded_and_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+        store.init_schema().unwrap(); // second call must be a no-op
+
+        let conn = store.conn.lock().unwrap();
+        let versions: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(versions, vec![1]);
+        assert_eq!(latest_sqlite_migration_version(), 1);
+    }
+
+    #[test]
+    fn migration_runner_upgrades_a_pre_ledger_database() {
+        // Simulate a database created by an older build: a bare `runs` table
+        // with none of the newer columns and no migration ledger.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let legacy = Connection::open(&path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE runs (
+                       run_id TEXT PRIMARY KEY,
+                       name TEXT NOT NULL,
+                       status INTEGER NOT NULL,
+                       created_at_millis INTEGER NOT NULL,
+                       idempotency_key TEXT
+                     );",
+                )
+                .unwrap();
+            legacy
+                .execute(
+                    "INSERT INTO runs(run_id,name,status,created_at_millis) VALUES('r0','legacy',0,1)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // The migration runner must add the missing columns and record v1
+        // without dropping the pre-existing row.
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        store.init_schema().unwrap();
+        let runs = store.load_all_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, "r0");
+        // A newer column that the legacy table lacked is now queryable.
+        let conn = store.conn.lock().unwrap();
+        let has_run_state: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name='run_state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_run_state, 1);
+    }
+
+    #[test]
+    fn wal_mode_is_enabled_for_durability() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.db");
+        let store = SqliteMetadataStore::open(&path).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    // ── durability / concurrency load ────────────────────────────────────────
+
+    #[test]
+    fn concurrent_writers_and_readers_stay_consistent() {
+        // Many threads hammer the shared store with interleaved writes and
+        // reads; the store's connection mutex + WAL + busy_timeout must keep
+        // every write durable with no corruption or lost updates.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("load.db");
+        let store = Arc::new(SqliteMetadataStore::open(&path).unwrap());
+        store.init_schema().unwrap();
+
+        let threads = 8;
+        let per_thread = 50;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_thread {
+                    let run = RunRecord {
+                        run_id: format!("run-{t}-{i}"),
+                        run_name: "load".to_string(),
+                        assignment_policy: 0,
+                        storage_backend_kind: 0,
+                        world_size: 1,
+                        run_version: "v1".to_string(),
+                        registered_at: std::time::SystemTime::now(),
+                        active_worker_count: 0,
+                        latest_checkpoint_id: None,
+                        latest_checkpoint_state: 0,
+                        min_world_size: 0,
+                        max_world_size: 0,
+                        rendezvous_settle_timeout_ms: 0,
+                        state: 1,
+                        state_reason: String::new(),
+                        idempotency_key: String::new(),
+                        state_updated_at: std::time::SystemTime::now(),
+                    };
+                    store.save_run(&run).unwrap();
+                    // Interleave a read so writers and readers contend.
+                    let _ = store.load_all_runs().unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every write is present and durable after reopening the database.
+        drop(store);
+        let reopened = SqliteMetadataStore::open(&path).unwrap();
+        let runs = reopened.load_all_runs().unwrap();
+        assert_eq!(runs.len(), threads * per_thread);
     }
 }

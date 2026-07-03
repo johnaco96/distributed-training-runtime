@@ -64,6 +64,16 @@ The following capabilities are implemented and locally validated:
   shuffling, disk cache with prefetch/backpressure, content-addressed dataset
   versioning, DataLoader-worker sharding, and npz/dtrs/jsonl/parquet/
   webdataset formats (see `docs/data-pipeline.md`).
+- Production S3 hardening: retryable-vs-permanent error classification,
+  multipart upload for large objects, full-jitter retry backoff, and
+  server-side encryption (`--s3-sse`); validated with load + integrity tests
+  against MinIO (see `docs/storage-hardening.md`).
+- Versioned, forward-only DB schema migrations with a `schema_migrations`
+  ledger, plus SQLite WAL durability; validated with concurrent
+  durability/load tests (SQLite always; PostgreSQL gated) — see
+  `docs/schema-migrations.md`.
+- Enforced protobuf wire compatibility: a golden-snapshot test fails any
+  breaking field change (see `docs/protocol-compatibility.md`).
 
 ## Current limitations and non-goals
 
@@ -81,7 +91,9 @@ This project currently does **not** claim:
 - Large-scale benchmark claims without measured evidence.
 - Dashboard/admin UI.
 - Full SIEM/durable audit pipeline.
-- Complete production S3 hardening.
+- S3 hardening validated against AWS S3 at scale (the hardening — multipart,
+  error classification, jitter, SSE — is implemented and load-tested against
+  MinIO, but not yet exercised against production AWS S3 under real load).
 - OIDC/SPIFFE/SPIRE identity integration.
 
 Important boundary: local simulated worker scaling is useful for smoke/perf exploration, but it is **not** proof of real cluster scale.

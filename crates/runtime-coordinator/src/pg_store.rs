@@ -227,6 +227,30 @@ CREATE TABLE IF NOT EXISTS audit_events (
         )
         .execute(&self.pool)
         .await?;
+
+        // Versioned migration ledger (parallels the SQLite store; see
+        // docs/schema-migrations.md).  The baseline DDL above is idempotent
+        // (CREATE ... IF NOT EXISTS / ADD COLUMN IF NOT EXISTS), so recording
+        // v1 after it converges both fresh and pre-ledger databases.
+        sqlx::raw_sql(
+            r#"
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version           INTEGER PRIMARY KEY,
+  name              TEXT NOT NULL,
+  applied_at_millis BIGINT NOT NULL
+);
+"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_migrations (version, name, applied_at_millis) \
+             VALUES (1, 'baseline_schema', $1) ON CONFLICT (version) DO NOTHING",
+        )
+        .bind(to_millis(std::time::SystemTime::now()))
+        .execute(&self.pool)
+        .await?;
+
         info!("postgres metadata store: schema initialised");
         Ok(())
     }

@@ -1,0 +1,1077 @@
+{
+  "enums": {
+    "AssignmentPolicy": {
+      "ASSIGNMENT_POLICY_REASSIGN_QUEUE": 2,
+      "ASSIGNMENT_POLICY_STATIC_RANK": 1,
+      "ASSIGNMENT_POLICY_UNSPECIFIED": 0
+    },
+    "CheckpointState": {
+      "CHECKPOINT_STATE_ABORTED": 6,
+      "CHECKPOINT_STATE_COMMITTED": 4,
+      "CHECKPOINT_STATE_FAILED": 5,
+      "CHECKPOINT_STATE_INITIATED": 1,
+      "CHECKPOINT_STATE_UNSPECIFIED": 0,
+      "CHECKPOINT_STATE_UPLOAD_IN_PROGRESS": 2,
+      "CHECKPOINT_STATE_VALIDATING": 3
+    },
+    "DeregisterReason": {
+      "DEREGISTER_REASON_COMPLETED": 1,
+      "DEREGISTER_REASON_ERROR": 3,
+      "DEREGISTER_REASON_PREEMPTED": 2,
+      "DEREGISTER_REASON_UNSPECIFIED": 0
+    },
+    "RendezvousRoundState": {
+      "RENDEZVOUS_ROUND_STATE_COMPLETE": 2,
+      "RENDEZVOUS_ROUND_STATE_UNSPECIFIED": 0,
+      "RENDEZVOUS_ROUND_STATE_WAITING": 1
+    },
+    "RunState": {
+      "RUN_STATE_CANCELLED": 6,
+      "RUN_STATE_COMPLETED": 4,
+      "RUN_STATE_FAILED": 5,
+      "RUN_STATE_PENDING": 1,
+      "RUN_STATE_RECOVERING": 3,
+      "RUN_STATE_RUNNING": 2,
+      "RUN_STATE_UNSPECIFIED": 0
+    },
+    "ShardLeaseState": {
+      "SHARD_LEASE_STATE_AVAILABLE": 1,
+      "SHARD_LEASE_STATE_COMPLETED": 4,
+      "SHARD_LEASE_STATE_EXPIRED": 3,
+      "SHARD_LEASE_STATE_LEASED": 2,
+      "SHARD_LEASE_STATE_REVOKED": 5,
+      "SHARD_LEASE_STATE_UNSPECIFIED": 0
+    },
+    "StorageBackendKind": {
+      "STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM": 1,
+      "STORAGE_BACKEND_KIND_S3_COMPATIBLE": 2,
+      "STORAGE_BACKEND_KIND_UNSPECIFIED": 0
+    },
+    "WorkerState": {
+      "WORKER_STATE_ACTIVE": 2,
+      "WORKER_STATE_COMPLETED": 7,
+      "WORKER_STATE_FAILED": 4,
+      "WORKER_STATE_RECOVERING": 5,
+      "WORKER_STATE_REGISTERING": 1,
+      "WORKER_STATE_REMOVED": 6,
+      "WORKER_STATE_STALE": 3,
+      "WORKER_STATE_UNSPECIFIED": 0
+    }
+  },
+  "messages": {
+    "ArtifactReport": {
+      "artifact_name": [
+        1,
+        "string"
+      ],
+      "artifact_uri": [
+        2,
+        "string"
+      ],
+      "checksum": [
+        4,
+        "string"
+      ],
+      "checksum_algorithm": [
+        5,
+        "string"
+      ],
+      "size_bytes": [
+        3,
+        "int64"
+      ],
+      "uploaded_at": [
+        6,
+        "google.protobuf.Timestamp"
+      ]
+    },
+    "ArtifactSpec": {
+      "artifact_name": [
+        1,
+        "string"
+      ],
+      "checksum_algorithm": [
+        6,
+        "string"
+      ],
+      "expected_checksum": [
+        5,
+        "string"
+      ],
+      "expected_size_bytes": [
+        4,
+        "int64"
+      ],
+      "owner_worker_id": [
+        2,
+        "WorkerId"
+      ],
+      "upload_uri": [
+        3,
+        "string"
+      ]
+    },
+    "BeginCheckpointRequest": {
+      "checkpoint_id": [
+        3,
+        "CheckpointId"
+      ],
+      "idempotency_key": [
+        5,
+        "string"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "step": [
+        4,
+        "uint64"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "BeginCheckpointResponse": {
+      "artifact_specs": [
+        4,
+        "ArtifactSpec"
+      ],
+      "checkpoint_id": [
+        1,
+        "CheckpointId"
+      ],
+      "created_at": [
+        3,
+        "google.protobuf.Timestamp"
+      ],
+      "state": [
+        2,
+        "CheckpointState"
+      ]
+    },
+    "CancelRunRequest": {
+      "idempotency_key": [
+        3,
+        "string"
+      ],
+      "reason": [
+        2,
+        "string"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ]
+    },
+    "CancelRunResponse": {
+      "server_time": [
+        2,
+        "google.protobuf.Timestamp"
+      ],
+      "state": [
+        1,
+        "RunState"
+      ]
+    },
+    "CheckpointId": {},
+    "CheckpointManifest": {
+      "artifacts": [
+        6,
+        "ArtifactReport"
+      ],
+      "checkpoint_id": [
+        2,
+        "CheckpointId"
+      ],
+      "committed_at": [
+        8,
+        "google.protobuf.Timestamp"
+      ],
+      "created_at": [
+        7,
+        "google.protobuf.Timestamp"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "state": [
+        4,
+        "CheckpointState"
+      ],
+      "step": [
+        3,
+        "uint64"
+      ],
+      "storage_backend_kind": [
+        5,
+        "StorageBackendKind"
+      ]
+    },
+    "CommitCheckpointRequest": {
+      "checkpoint_id": [
+        2,
+        "CheckpointId"
+      ],
+      "idempotency_key": [
+        3,
+        "string"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "worker_id": [
+        4,
+        "WorkerId"
+      ]
+    },
+    "CommitCheckpointResponse": {
+      "committed_at": [
+        2,
+        "google.protobuf.Timestamp"
+      ],
+      "globally_committed": [
+        3,
+        "bool"
+      ],
+      "state": [
+        1,
+        "CheckpointState"
+      ]
+    },
+    "DatasetId": {},
+    "DatasetMetadata": {
+      "dataset_id": [
+        1,
+        "DatasetId"
+      ],
+      "dataset_uri": [
+        3,
+        "string"
+      ],
+      "dataset_version": [
+        6,
+        "string"
+      ],
+      "format": [
+        4,
+        "string"
+      ],
+      "labels": [
+        7,
+        "map<string, string>"
+      ],
+      "name": [
+        2,
+        "string"
+      ],
+      "registered_at": [
+        8,
+        "google.protobuf.Timestamp"
+      ],
+      "shard_count": [
+        5,
+        "uint32"
+      ]
+    },
+    "DeregisterWorkerRequest": {
+      "idempotency_key": [
+        4,
+        "string"
+      ],
+      "reason": [
+        3,
+        "DeregisterReason"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "DeregisterWorkerResponse": {
+      "run_state": [
+        2,
+        "RunState"
+      ],
+      "server_time": [
+        3,
+        "google.protobuf.Timestamp"
+      ],
+      "state": [
+        1,
+        "WorkerState"
+      ]
+    },
+    "FetchCheckpointArtifactChunk": {
+      "checksum": [
+        5,
+        "string"
+      ],
+      "checksum_algorithm": [
+        6,
+        "string"
+      ],
+      "data": [
+        1,
+        "bytes"
+      ],
+      "last": [
+        3,
+        "bool"
+      ],
+      "sequence": [
+        2,
+        "uint64"
+      ],
+      "total_size_bytes": [
+        4,
+        "int64"
+      ]
+    },
+    "FetchCheckpointArtifactRequest": {
+      "artifact_name": [
+        4,
+        "string"
+      ],
+      "checkpoint_id": [
+        3,
+        "CheckpointId"
+      ],
+      "owner_worker_id": [
+        5,
+        "WorkerId"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "GetLatestCheckpointRequest": {
+      "run_id": [
+        1,
+        "RunId"
+      ]
+    },
+    "GetLatestCheckpointResponse": {
+      "manifest": [
+        1,
+        "CheckpointManifest"
+      ]
+    },
+    "GetRendezvousStateRequest": {
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "GetRendezvousStateResponse": {
+      "info": [
+        1,
+        "RendezvousInfo"
+      ]
+    },
+    "GetRunStatusRequest": {
+      "run_id": [
+        1,
+        "RunId"
+      ]
+    },
+    "GetRunStatusResponse": {
+      "active_worker_count": [
+        7,
+        "uint32"
+      ],
+      "assignment_policy": [
+        3,
+        "AssignmentPolicy"
+      ],
+      "latest_checkpoint_id": [
+        5,
+        "CheckpointId"
+      ],
+      "latest_checkpoint_state": [
+        6,
+        "CheckpointState"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "run_version": [
+        2,
+        "string"
+      ],
+      "server_time": [
+        8,
+        "google.protobuf.Timestamp"
+      ],
+      "state": [
+        9,
+        "RunState"
+      ],
+      "state_reason": [
+        10,
+        "string"
+      ],
+      "storage_backend_kind": [
+        4,
+        "StorageBackendKind"
+      ]
+    },
+    "GetRuntimeInfoRequest": {},
+    "GetRuntimeInfoResponse": {
+      "capabilities": [
+        2,
+        "RuntimeCapabilities"
+      ],
+      "protocol_version": [
+        1,
+        "ProtocolVersion"
+      ]
+    },
+    "GetShardAssignmentRequest": {
+      "dataset_id": [
+        3,
+        "DatasetId"
+      ],
+      "idempotency_key": [
+        4,
+        "string"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "GetShardAssignmentResponse": {
+      "assignment_policy": [
+        2,
+        "AssignmentPolicy"
+      ],
+      "assignments": [
+        1,
+        "ShardAssignment"
+      ],
+      "server_time": [
+        3,
+        "google.protobuf.Timestamp"
+      ]
+    },
+    "HeartbeatRequest": {
+      "active_shard_ids": [
+        5,
+        "ShardId"
+      ],
+      "client_time": [
+        4,
+        "google.protobuf.Timestamp"
+      ],
+      "idempotency_key": [
+        3,
+        "string"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "HeartbeatResponse": {
+      "next_heartbeat_deadline": [
+        2,
+        "google.protobuf.Timestamp"
+      ],
+      "rendezvous_round": [
+        4,
+        "uint64"
+      ],
+      "run_state": [
+        5,
+        "RunState"
+      ],
+      "server_time": [
+        3,
+        "google.protobuf.Timestamp"
+      ],
+      "state": [
+        1,
+        "WorkerState"
+      ]
+    },
+    "JoinRendezvousRequest": {
+      "host": [
+        3,
+        "string"
+      ],
+      "idempotency_key": [
+        6,
+        "string"
+      ],
+      "previous_round": [
+        5,
+        "uint64"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "store_port": [
+        4,
+        "uint32"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "JoinRendezvousResponse": {
+      "info": [
+        1,
+        "RendezvousInfo"
+      ]
+    },
+    "ListCheckpointsRequest": {
+      "committed_only": [
+        2,
+        "bool"
+      ],
+      "limit": [
+        3,
+        "uint32"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ]
+    },
+    "ListCheckpointsResponse": {
+      "checkpoints": [
+        1,
+        "CheckpointManifest"
+      ]
+    },
+    "ProtocolVersion": {
+      "major": [
+        1,
+        "uint32"
+      ],
+      "minor": [
+        2,
+        "uint32"
+      ],
+      "patch": [
+        3,
+        "uint32"
+      ]
+    },
+    "RegisterDatasetRequest": {
+      "dataset": [
+        3,
+        "DatasetMetadata"
+      ],
+      "idempotency_key": [
+        1,
+        "string"
+      ],
+      "run_id": [
+        2,
+        "RunId"
+      ],
+      "shards": [
+        4,
+        "ShardMetadata"
+      ]
+    },
+    "RegisterDatasetResponse": {
+      "accepted_shard_count": [
+        2,
+        "uint32"
+      ],
+      "dataset_id": [
+        1,
+        "DatasetId"
+      ],
+      "registered_at": [
+        3,
+        "google.protobuf.Timestamp"
+      ]
+    },
+    "RegisterRunRequest": {
+      "assignment_policy": [
+        3,
+        "AssignmentPolicy"
+      ],
+      "idempotency_key": [
+        1,
+        "string"
+      ],
+      "max_world_size": [
+        8,
+        "uint32"
+      ],
+      "min_world_size": [
+        7,
+        "uint32"
+      ],
+      "rendezvous_settle_timeout_ms": [
+        9,
+        "uint32"
+      ],
+      "run_name": [
+        2,
+        "string"
+      ],
+      "run_version": [
+        6,
+        "string"
+      ],
+      "storage_backend_kind": [
+        4,
+        "StorageBackendKind"
+      ],
+      "world_size": [
+        5,
+        "uint32"
+      ]
+    },
+    "RegisterRunResponse": {
+      "coordinator_version": [
+        2,
+        "string"
+      ],
+      "registered_at": [
+        3,
+        "google.protobuf.Timestamp"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ]
+    },
+    "RegisterWorkerRequest": {
+      "host": [
+        5,
+        "string"
+      ],
+      "idempotency_key": [
+        1,
+        "string"
+      ],
+      "protocol_version": [
+        7,
+        "string"
+      ],
+      "rank": [
+        4,
+        "uint32"
+      ],
+      "run_id": [
+        2,
+        "RunId"
+      ],
+      "sdk_version": [
+        6,
+        "string"
+      ],
+      "worker_id": [
+        3,
+        "WorkerId"
+      ]
+    },
+    "RegisterWorkerResponse": {
+      "lease_renewal_deadline": [
+        3,
+        "google.protobuf.Timestamp"
+      ],
+      "server_time": [
+        4,
+        "google.protobuf.Timestamp"
+      ],
+      "state": [
+        2,
+        "WorkerState"
+      ],
+      "worker_id": [
+        1,
+        "WorkerId"
+      ]
+    },
+    "RendezvousInfo": {
+      "has_rank": [
+        5,
+        "bool"
+      ],
+      "rank": [
+        4,
+        "uint32"
+      ],
+      "round": [
+        1,
+        "uint64"
+      ],
+      "server_time": [
+        8,
+        "google.protobuf.Timestamp"
+      ],
+      "state": [
+        2,
+        "RendezvousRoundState"
+      ],
+      "store_addr": [
+        6,
+        "string"
+      ],
+      "store_port": [
+        7,
+        "uint32"
+      ],
+      "world_size": [
+        3,
+        "uint32"
+      ]
+    },
+    "RenewShardLeaseRequest": {
+      "idempotency_key": [
+        5,
+        "string"
+      ],
+      "lease_epoch": [
+        4,
+        "uint64"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "shard_id": [
+        3,
+        "ShardId"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "RenewShardLeaseResponse": {
+      "accepted": [
+        1,
+        "bool"
+      ],
+      "lease_expires_at": [
+        3,
+        "google.protobuf.Timestamp"
+      ],
+      "lease_state": [
+        2,
+        "ShardLeaseState"
+      ],
+      "server_time": [
+        4,
+        "google.protobuf.Timestamp"
+      ]
+    },
+    "ReportCheckpointArtifactRequest": {
+      "artifact_report": [
+        4,
+        "ArtifactReport"
+      ],
+      "checkpoint_id": [
+        3,
+        "CheckpointId"
+      ],
+      "idempotency_key": [
+        5,
+        "string"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "ReportCheckpointArtifactResponse": {
+      "accepted": [
+        1,
+        "bool"
+      ],
+      "checkpoint_state": [
+        2,
+        "CheckpointState"
+      ]
+    },
+    "ReportCheckpointCorruptRequest": {
+      "checkpoint_id": [
+        3,
+        "CheckpointId"
+      ],
+      "idempotency_key": [
+        5,
+        "string"
+      ],
+      "reason": [
+        4,
+        "string"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "ReportCheckpointCorruptResponse": {
+      "fallback_checkpoint_id": [
+        2,
+        "CheckpointId"
+      ],
+      "has_fallback": [
+        3,
+        "bool"
+      ],
+      "state": [
+        1,
+        "CheckpointState"
+      ]
+    },
+    "ReportShardProgressRequest": {
+      "dataset_id": [
+        3,
+        "DatasetId"
+      ],
+      "idempotency_key": [
+        8,
+        "string"
+      ],
+      "is_complete": [
+        7,
+        "bool"
+      ],
+      "lease_epoch": [
+        5,
+        "uint64"
+      ],
+      "progress_offset": [
+        6,
+        "int64"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "shard_id": [
+        4,
+        "ShardId"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "ReportShardProgressResponse": {
+      "accepted": [
+        1,
+        "bool"
+      ],
+      "lease_state": [
+        3,
+        "ShardLeaseState"
+      ],
+      "stored_progress_offset": [
+        2,
+        "int64"
+      ]
+    },
+    "RunId": {},
+    "RuntimeCapabilities": {
+      "features": [
+        2,
+        "string"
+      ],
+      "protocol_version": [
+        1,
+        "ProtocolVersion"
+      ]
+    },
+    "ShardAssignment": {
+      "checksum": [
+        10,
+        "string"
+      ],
+      "checksum_algorithm": [
+        11,
+        "string"
+      ],
+      "dataset_id": [
+        2,
+        "DatasetId"
+      ],
+      "lease_epoch": [
+        5,
+        "uint64"
+      ],
+      "lease_expires_at": [
+        7,
+        "google.protobuf.Timestamp"
+      ],
+      "lease_state": [
+        6,
+        "ShardLeaseState"
+      ],
+      "progress_offset": [
+        8,
+        "int64"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "shard_id": [
+        3,
+        "ShardId"
+      ],
+      "shard_uri": [
+        9,
+        "string"
+      ],
+      "size_bytes": [
+        12,
+        "int64"
+      ],
+      "worker_id": [
+        4,
+        "WorkerId"
+      ]
+    },
+    "ShardId": {},
+    "ShardMetadata": {
+      "byte_range_end": [
+        5,
+        "int64"
+      ],
+      "byte_range_start": [
+        4,
+        "int64"
+      ],
+      "checksum": [
+        7,
+        "string"
+      ],
+      "checksum_algorithm": [
+        8,
+        "string"
+      ],
+      "dataset_id": [
+        2,
+        "DatasetId"
+      ],
+      "shard_id": [
+        1,
+        "ShardId"
+      ],
+      "shard_uri": [
+        3,
+        "string"
+      ],
+      "size_bytes": [
+        6,
+        "int64"
+      ]
+    },
+    "StreamCheckpointArtifactChunk": {
+      "data": [
+        1,
+        "bytes"
+      ],
+      "sequence": [
+        2,
+        "uint64"
+      ]
+    },
+    "StreamCheckpointArtifactMeta": {
+      "artifact_name": [
+        4,
+        "string"
+      ],
+      "checkpoint_id": [
+        3,
+        "CheckpointId"
+      ],
+      "idempotency_key": [
+        6,
+        "string"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "total_size_bytes": [
+        5,
+        "int64"
+      ],
+      "worker_id": [
+        2,
+        "WorkerId"
+      ]
+    },
+    "StreamCheckpointArtifactRequest": {
+      "chunk": [
+        2,
+        "StreamCheckpointArtifactChunk"
+      ],
+      "meta": [
+        1,
+        "StreamCheckpointArtifactMeta"
+      ]
+    },
+    "StreamCheckpointArtifactResponse": {
+      "artifact_uri": [
+        2,
+        "string"
+      ],
+      "bytes_received": [
+        3,
+        "int64"
+      ],
+      "checkpoint_id": [
+        1,
+        "CheckpointId"
+      ],
+      "checksum": [
+        4,
+        "string"
+      ],
+      "checksum_algorithm": [
+        5,
+        "string"
+      ]
+    },
+    "WorkerId": {}
+  }
+}
