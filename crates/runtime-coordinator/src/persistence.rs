@@ -399,8 +399,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
         conn.execute(
             "INSERT OR REPLACE INTO runs(run_id,name,status,created_at_millis,idempotency_key,\
              run_state,state_reason,world_size,min_world_size,max_world_size,settle_timeout_ms,\
-             assignment_policy,storage_backend_kind,run_version,latest_checkpoint_id) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+             assignment_policy,storage_backend_kind,run_version,latest_checkpoint_id,retry_count) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 run.run_id,
                 run.run_name,
@@ -421,6 +421,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
                 run.storage_backend_kind,
                 run.run_version,
                 run.latest_checkpoint_id.as_ref().map(|c| c.value.clone()),
+                run.retry_count,
             ],
         )?;
         Ok(())
@@ -431,7 +432,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
         let mut stmt = conn.prepare(
             "SELECT run_id,name,created_at_millis,idempotency_key,run_state,state_reason,\
              world_size,min_world_size,max_world_size,settle_timeout_ms,assignment_policy,\
-             storage_backend_kind,run_version,status,latest_checkpoint_id FROM runs \
+             storage_backend_kind,run_version,status,latest_checkpoint_id,retry_count FROM runs \
              ORDER BY run_id",
         )?;
         let runs = stmt
@@ -456,6 +457,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
                         .get::<_, Option<String>>(14)?
                         .map(|value| ProtoCheckpointId { value }),
                     state_updated_at: std::time::SystemTime::now(),
+                    retry_count: r.get(15)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1236,16 +1238,39 @@ struct SqliteMigration {
     apply: fn(&Connection) -> rusqlite::Result<()>,
 }
 
-const SQLITE_MIGRATIONS: &[SqliteMigration] = &[SqliteMigration {
-    version: 1,
-    name: "baseline_schema",
-    // Baseline includes the idempotent column retrofit so a database created
-    // before the migration ledger existed converges to v1 cleanly.
-    apply: |conn| {
-        SqliteMetadataStore::apply_baseline_schema(conn)?;
-        Ok(())
+const SQLITE_MIGRATIONS: &[SqliteMigration] = &[
+    SqliteMigration {
+        version: 1,
+        name: "baseline_schema",
+        // Baseline includes the idempotent column retrofit so a database
+        // created before the migration ledger existed converges to v1 cleanly.
+        apply: |conn| {
+            SqliteMetadataStore::apply_baseline_schema(conn)?;
+            Ok(())
+        },
     },
-}];
+    SqliteMigration {
+        version: 2,
+        name: "runs_add_retry_count",
+        // Admin retry counter (Phase 7).  PRAGMA-guarded so re-running against
+        // a database that already has the column (e.g. one that adopted it via
+        // the baseline retrofit on a newer build) is a no-op.
+        apply: |conn| {
+            let has_column: bool = conn
+                .prepare("PRAGMA table_info(runs)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .any(|name| name == "retry_count");
+            if !has_column {
+                conn.execute_batch(
+                    "ALTER TABLE runs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;",
+                )?;
+            }
+            Ok(())
+        },
+    },
+];
 
 fn run_sqlite_migrations(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -1550,8 +1575,8 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(versions, vec![1]);
-        assert_eq!(latest_sqlite_migration_version(), 1);
+        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(latest_sqlite_migration_version(), 2);
     }
 
     #[test]
@@ -1649,6 +1674,7 @@ mod tests {
                         state_reason: String::new(),
                         idempotency_key: String::new(),
                         state_updated_at: std::time::SystemTime::now(),
+                        retry_count: 0,
                     };
                     store.save_run(&run).unwrap();
                     // Interleave a read so writers and readers contend.

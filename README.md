@@ -169,9 +169,23 @@ pip install -e python/
 
 Key entry points:
 
-- **`RuntimeClient`** (`dtruntime.client`) — gRPC client with TLS, mTLS, and auth header support. Reads credentials from constructor args or `DTRUNTIME_TLS_*` / `DTRUNTIME_AUTH_*` env vars.
+- **`RuntimeClient`** (`dtruntime.client`) — gRPC client with TLS, mTLS, and auth header support. Reads credentials from constructor args or `DTRUNTIME_TLS_*` / `DTRUNTIME_AUTH_*` env vars. Includes admin operations (`pause_run`/`resume_run`/`retry_run`/`drain_run`/`cancel_run`) and inspection (`list_runs`/`list_workers`/`list_shard_progress`/`list_checkpoints`).
 - **`ShardLoader`** (`dtruntime.shard_loader`) — request shard assignment, read bytes from `file://` or `s3://` URIs, report progress, all in one call.
 - **`build_and_write_shards`** (`dtruntime.shard_loader`) — split a numpy dataset into `.npz` shard files and return the metadata list ready to pass to `register_dataset`.
+
+## Operator CLI
+
+```bash
+dtruntime-admin runs list --state running        # active jobs
+dtruntime-admin doctor RUN_ID                     # diagnose stuck workers / bad checkpoints
+dtruntime-admin run pause|resume|retry|drain|cancel RUN_ID
+```
+
+`dtruntime-admin` (installed with the Python package) inspects and manages runs
+against a live coordinator: list runs/workers/shards/checkpoints, drive
+lifecycle actions, verify checkpoints, and diagnose stuck runs. Supports `--json`
+output and structured, remediation-oriented errors. See
+[docs/admin-cli.md](docs/admin-cli.md).
 
 ## Building from source
 
@@ -210,6 +224,7 @@ cargo run -p runtime-bench -- logical-workers \
 - [torch.distributed execution](docs/torch-distributed.md)
 - [Data pipeline](docs/data-pipeline.md)
 - [Run lifecycle & failure semantics](docs/run-lifecycle.md)
+- [Admin & operator CLI](docs/admin-cli.md)
 - [Distributed checkpointing](docs/checkpointing-distributed.md)
 - [Kubernetes operator](docs/kubernetes-operator.md)
 - [Scheduler integrations](docs/schedulers.md)

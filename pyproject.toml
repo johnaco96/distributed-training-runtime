@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 dtruntime-launch = "dtruntime.launch:main"
+dtruntime-admin = "dtruntime.admin.cli:main"
 
 [project.optional-dependencies]
 dev = [

@@ -17,7 +17,7 @@ use crate::auth::{AuthorizationError, Authorizer};
 use crate::state::{
     BeginCheckpointError, CommitCheckpointError, CoordinatorState, GetLatestCheckpointError,
     GetShardAssignmentsError, RenewShardLeaseError, ReportCheckpointArtifactError,
-    ReportShardProgressError,
+    ReportShardProgressError, RunActionError,
 };
 use crate::{RuntimeMetrics, RuntimeMetricsSnapshot};
 
@@ -315,6 +315,25 @@ fn failed_precondition(message: impl Into<String>) -> Status {
 
 fn already_exists(message: impl Into<String>) -> Status {
     Status::already_exists(message.into())
+}
+
+/// Map an admin run-action failure onto a gRPC status: a missing run is
+/// `NOT_FOUND`, an action invalid from the current lifecycle state is
+/// `FAILED_PRECONDITION` (retrying won't help until the run changes state).
+fn run_action_status(err: RunActionError, run_id: &str) -> Status {
+    match err {
+        RunActionError::RunNotFound => not_found(format!("run {run_id} was not found")),
+        RunActionError::InvalidState { current, action } => {
+            let state = RunState::try_from(current).unwrap_or(RunState::Unspecified);
+            // Friendly label: RUN_STATE_RUNNING -> "running".
+            let label = state
+                .as_str_name()
+                .strip_prefix("RUN_STATE_")
+                .unwrap_or(state.as_str_name())
+                .to_ascii_lowercase();
+            failed_precondition(format!("cannot {action} run {run_id} while it is {label}"))
+        }
+    }
 }
 
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
@@ -1543,6 +1562,246 @@ impl CoordinatorService for CoordinatorServiceImpl {
         }))
     }
 
+    async fn pause_run(
+        &self,
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("pause_run", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let (state, state_reason) = self
+            .state
+            .pause_run(&run_id.value, &request.reason)
+            .map_err(|e| run_action_status(e, &run_id.value))?;
+        info!(run_id = %run_id.value, reason = %request.reason, "run paused");
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunPaused),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            reason: (!request.reason.is_empty()).then(|| request.reason.clone()),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(RunActionResponse {
+            state,
+            state_reason,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn resume_run(
+        &self,
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("resume_run", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let (state, state_reason) = self
+            .state
+            .resume_run(&run_id.value)
+            .map_err(|e| run_action_status(e, &run_id.value))?;
+        info!(run_id = %run_id.value, "run resumed");
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunResumed),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            reason: (!request.reason.is_empty()).then(|| request.reason.clone()),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(RunActionResponse {
+            state,
+            state_reason,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn retry_run(
+        &self,
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("retry_run", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let (state, state_reason, retry_count) = self
+            .state
+            .retry_run(&run_id.value)
+            .map_err(|e| run_action_status(e, &run_id.value))?;
+        info!(run_id = %run_id.value, retry_count, "run retried");
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunRetried),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            reason: Some(format!("retry #{retry_count}")),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(RunActionResponse {
+            state,
+            state_reason,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn drain_run(
+        &self,
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("drain_run", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let (state, state_reason) = self
+            .state
+            .drain_run(&run_id.value, &request.reason)
+            .map_err(|e| run_action_status(e, &run_id.value))?;
+        info!(run_id = %run_id.value, reason = %request.reason, "run draining");
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunDrained),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            reason: (!request.reason.is_empty()).then(|| request.reason.clone()),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(RunActionResponse {
+            state,
+            state_reason,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn list_runs(
+        &self,
+        request: Request<ListRunsRequest>,
+    ) -> Result<Response<ListRunsResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        self.state.reconcile_worker_liveness();
+
+        // RUN_STATE_UNSPECIFIED (0) means "all states"; any other value filters.
+        let filter =
+            (request.state_filter != RunState::Unspecified as i32).then_some(request.state_filter);
+
+        let runs = self
+            .state
+            .list_runs(filter)
+            .into_iter()
+            .map(|r| RunSummary {
+                run_id: Some(RunId { value: r.run_id }),
+                run_name: r.run_name,
+                state: r.state,
+                state_reason: r.state_reason,
+                world_size: r.world_size,
+                active_worker_count: r.active_worker_count,
+                latest_checkpoint_id: r.latest_checkpoint_id,
+                latest_checkpoint_state: r.latest_checkpoint_state,
+                retry_count: r.retry_count,
+                registered_at: Some(r.registered_at.into()),
+            })
+            .collect();
+
+        Ok(Response::new(ListRunsResponse {
+            runs,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn list_workers(
+        &self,
+        request: Request<ListWorkersRequest>,
+    ) -> Result<Response<ListWorkersResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        self.state.reconcile_worker_liveness();
+
+        // WORKER_STATE_UNSPECIFIED (0) means "all states".
+        let filter = (request.state_filter != WorkerState::Unspecified as i32)
+            .then_some(request.state_filter);
+
+        let workers = self
+            .state
+            .list_workers(&run_id.value, filter)
+            .ok_or_else(|| not_found(format!("run {} was not found", run_id.value)))?
+            .into_iter()
+            .map(|w| WorkerInfo {
+                worker_id: Some(WorkerId { value: w.worker_id }),
+                rank: w.rank,
+                host: w.host,
+                state: w.state,
+                sdk_version: w.sdk_version,
+                last_heartbeat_at: Some(w.last_heartbeat_at.into()),
+                next_heartbeat_deadline: Some(w.next_heartbeat_deadline.into()),
+                failure_deadline: Some(w.failure_deadline.into()),
+            })
+            .collect();
+
+        Ok(Response::new(ListWorkersResponse {
+            workers,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn list_shard_progress(
+        &self,
+        request: Request<ListShardProgressRequest>,
+    ) -> Result<Response<ListShardProgressResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let dataset_filter = request
+            .dataset_id
+            .map(|d| d.value)
+            .filter(|d| !d.is_empty());
+
+        let shards = self
+            .state
+            .list_shard_progress(&run_id.value, dataset_filter.as_deref())
+            .into_iter()
+            .map(|s| ShardProgressInfo {
+                shard_id: Some(ShardId { value: s.shard_id }),
+                dataset_id: Some(DatasetId {
+                    value: s.dataset_id,
+                }),
+                worker_id: Some(WorkerId { value: s.worker_id }),
+                lease_epoch: s.lease_epoch,
+                progress_offset: s.progress_offset,
+                is_complete: s.is_complete,
+                updated_at: Some(s.updated_at.into()),
+            })
+            .collect();
+
+        Ok(Response::new(ListShardProgressResponse {
+            shards,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
     async fn join_rendezvous(
         &self,
         request: Request<JoinRendezvousRequest>,
@@ -2316,6 +2575,119 @@ mod tests {
         );
         assert_eq!(status.active_worker_count, 0);
         assert!(status.server_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_runs_returns_registered_run_and_filters_by_state() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        // Unfiltered: the newly registered run is visible and PENDING.
+        let all = service
+            .list_runs(Request::new(ListRunsRequest { state_filter: 0 }))
+            .await
+            .expect("list_runs should succeed")
+            .into_inner();
+        assert_eq!(all.runs.len(), 1);
+        assert_eq!(all.runs[0].run_id.as_ref(), Some(&run_id));
+        assert_eq!(all.runs[0].state, RunState::Pending as i32);
+        assert_eq!(all.runs[0].retry_count, 0);
+
+        // Filtering to a state the run is not in returns nothing.
+        let failed = service
+            .list_runs(Request::new(ListRunsRequest {
+                state_filter: RunState::Failed as i32,
+            }))
+            .await
+            .expect("list_runs should succeed")
+            .into_inner();
+        assert!(failed.runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pause_resume_cycle_reports_states() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let paused = service
+            .pause_run(Request::new(RunActionRequest {
+                run_id: Some(run_id.clone()),
+                reason: "maintenance".to_string(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect("pause_run should succeed")
+            .into_inner();
+        assert_eq!(paused.state, RunState::Paused as i32);
+        assert!(paused.state_reason.contains("maintenance"));
+
+        let resumed = service
+            .resume_run(Request::new(RunActionRequest {
+                run_id: Some(run_id.clone()),
+                reason: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect("resume_run should succeed")
+            .into_inner();
+        // No active workers -> back to PENDING for a fresh launch.
+        assert_eq!(resumed.state, RunState::Pending as i32);
+    }
+
+    #[tokio::test]
+    async fn pause_invalid_state_maps_to_failed_precondition() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        // Cancel first so the run is terminal and not pausable.
+        service
+            .cancel_run(Request::new(CancelRunRequest {
+                run_id: Some(run_id.clone()),
+                reason: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect("cancel_run should succeed");
+
+        let status = service
+            .pause_run(Request::new(RunActionRequest {
+                run_id: Some(run_id.clone()),
+                reason: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect_err("pause of a cancelled run should fail");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn admin_action_on_unknown_run_is_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let status = service
+            .drain_run(Request::new(RunActionRequest {
+                run_id: Some(RunId {
+                    value: "ghost".to_string(),
+                }),
+                reason: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect_err("drain of an unknown run should fail");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn list_workers_unknown_run_is_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let status = service
+            .list_workers(Request::new(ListWorkersRequest {
+                run_id: Some(RunId {
+                    value: "ghost".to_string(),
+                }),
+                state_filter: 0,
+            }))
+            .await
+            .expect_err("list_workers for an unknown run should fail");
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

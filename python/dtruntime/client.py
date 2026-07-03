@@ -401,6 +401,20 @@ class RuntimeClient:
         )
         return self._stub.GetLatestCheckpoint(request, metadata=self.rpc_metadata())
 
+    def get_runtime_info(
+        self, timeout: float | None = None
+    ) -> "runtime_pb2.GetRuntimeInfoResponse":
+        """Fetch the coordinator's protocol version and advertised capabilities.
+
+        Used as a lightweight liveness/handshake probe (``dtruntime-admin
+        doctor``): a successful response confirms the coordinator is reachable
+        and negotiates protocol compatibility.
+        """
+        request = self._runtime_pb2.GetRuntimeInfoRequest()
+        return self._stub.GetRuntimeInfo(
+            request, metadata=self.rpc_metadata(), timeout=timeout
+        )
+
     def list_checkpoints(
         self,
         run_id: str,
@@ -555,6 +569,101 @@ class RuntimeClient:
             run_id=self._runtime_pb2.RunId(value=run_id),
         )
         return self._stub.GetRunStatus(
+            request, metadata=self.rpc_metadata(), timeout=timeout
+        )
+
+    def _run_action(
+        self, rpc, run_id: str, reason: str, idempotency_key: str, timeout: float | None
+    ) -> "runtime_pb2.RunActionResponse":
+        request = self._runtime_pb2.RunActionRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+        return rpc(request, metadata=self.rpc_metadata(), timeout=timeout)
+
+    def pause_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        idempotency_key: str = "",
+        timeout: float | None = None,
+    ) -> "runtime_pb2.RunActionResponse":
+        """Pause a PENDING/RUNNING/RECOVERING run (admin).
+
+        The run stops making progress but is not terminal; resume returns it to
+        service.  Fails with FAILED_PRECONDITION if the run is not in a pausable
+        state.
+        """
+        return self._run_action(self._stub.PauseRun, run_id, reason, idempotency_key, timeout)
+
+    def resume_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        idempotency_key: str = "",
+        timeout: float | None = None,
+    ) -> "runtime_pb2.RunActionResponse":
+        """Resume a PAUSED run (admin).  Returns to RUNNING when workers are
+        still connected, otherwise PENDING so a fresh launch can form the
+        process group."""
+        return self._run_action(self._stub.ResumeRun, run_id, reason, idempotency_key, timeout)
+
+    def retry_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        idempotency_key: str = "",
+        timeout: float | None = None,
+    ) -> "runtime_pb2.RunActionResponse":
+        """Retry a FAILED run (admin): reset to PENDING, bump the retry counter,
+        and clear the stale worker roster so a fresh launch resumes from the
+        latest committed checkpoint."""
+        return self._run_action(self._stub.RetryRun, run_id, reason, idempotency_key, timeout)
+
+    def drain_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        idempotency_key: str = "",
+        timeout: float | None = None,
+    ) -> "runtime_pb2.RunActionResponse":
+        """Drain a run (admin): move it to DRAINING so workers finish current
+        work, checkpoint, and exit gracefully; the run completes when the roster
+        empties."""
+        return self._run_action(self._stub.DrainRun, run_id, reason, idempotency_key, timeout)
+
+    def list_runs(
+        self, state_filter: int = 0, timeout: float | None = None
+    ) -> "runtime_pb2.ListRunsResponse":
+        """List runs (admin), optionally filtered to one lifecycle state.
+
+        ``state_filter=0`` (RUN_STATE_UNSPECIFIED) returns all runs.
+        """
+        request = self._runtime_pb2.ListRunsRequest(state_filter=state_filter)
+        return self._stub.ListRuns(request, metadata=self.rpc_metadata(), timeout=timeout)
+
+    def list_workers(
+        self, run_id: str, state_filter: int = 0, timeout: float | None = None
+    ) -> "runtime_pb2.ListWorkersResponse":
+        """List a run's workers (admin), optionally filtered to one worker
+        state (``state_filter=0`` returns all)."""
+        request = self._runtime_pb2.ListWorkersRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            state_filter=state_filter,
+        )
+        return self._stub.ListWorkers(request, metadata=self.rpc_metadata(), timeout=timeout)
+
+    def list_shard_progress(
+        self, run_id: str, dataset_id: str = "", timeout: float | None = None
+    ) -> "runtime_pb2.ListShardProgressResponse":
+        """List shard-progress / lease records for a run (admin), optionally
+        restricted to one dataset (empty ``dataset_id`` = all datasets)."""
+        request = self._runtime_pb2.ListShardProgressRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            dataset_id=self._runtime_pb2.DatasetId(value=dataset_id) if dataset_id else None,
+        )
+        return self._stub.ListShardProgress(
             request, metadata=self.rpc_metadata(), timeout=timeout
         )
 

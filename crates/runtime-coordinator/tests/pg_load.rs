@@ -46,6 +46,7 @@ fn run_record(run_id: String) -> RunRecord {
         state_reason: String::new(),
         idempotency_key: String::new(),
         state_updated_at: SystemTime::now(),
+        retry_count: 0,
     }
 }
 

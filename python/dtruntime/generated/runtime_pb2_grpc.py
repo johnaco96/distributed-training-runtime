@@ -142,6 +142,41 @@ class CoordinatorServiceStub:
                 request_serializer=runtime__pb2.CancelRunRequest.SerializeToString,
                 response_deserializer=runtime__pb2.CancelRunResponse.FromString,
                 _registered_method=True)
+        self.PauseRun = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/PauseRun',
+                request_serializer=runtime__pb2.RunActionRequest.SerializeToString,
+                response_deserializer=runtime__pb2.RunActionResponse.FromString,
+                _registered_method=True)
+        self.ResumeRun = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ResumeRun',
+                request_serializer=runtime__pb2.RunActionRequest.SerializeToString,
+                response_deserializer=runtime__pb2.RunActionResponse.FromString,
+                _registered_method=True)
+        self.RetryRun = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/RetryRun',
+                request_serializer=runtime__pb2.RunActionRequest.SerializeToString,
+                response_deserializer=runtime__pb2.RunActionResponse.FromString,
+                _registered_method=True)
+        self.DrainRun = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/DrainRun',
+                request_serializer=runtime__pb2.RunActionRequest.SerializeToString,
+                response_deserializer=runtime__pb2.RunActionResponse.FromString,
+                _registered_method=True)
+        self.ListRuns = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ListRuns',
+                request_serializer=runtime__pb2.ListRunsRequest.SerializeToString,
+                response_deserializer=runtime__pb2.ListRunsResponse.FromString,
+                _registered_method=True)
+        self.ListWorkers = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ListWorkers',
+                request_serializer=runtime__pb2.ListWorkersRequest.SerializeToString,
+                response_deserializer=runtime__pb2.ListWorkersResponse.FromString,
+                _registered_method=True)
+        self.ListShardProgress = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ListShardProgress',
+                request_serializer=runtime__pb2.ListShardProgressRequest.SerializeToString,
+                response_deserializer=runtime__pb2.ListShardProgressResponse.FromString,
+                _registered_method=True)
 
 
 class CoordinatorServiceServicer:
@@ -295,6 +330,57 @@ class CoordinatorServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PauseRun(self, request, context):
+        """── admin run lifecycle ────────────────────────────────────────────────
+        Pause a run: workers keep heartbeating but observe RUN_STATE_PAUSED and
+        stop advancing training at the next step boundary.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ResumeRun(self, request, context):
+        """Resume a paused run back to running.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RetryRun(self, request, context):
+        """Retry a failed run: reset it to PENDING so workers re-register and resume
+        from the latest committed checkpoint.  Increments the retry counter.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DrainRun(self, request, context):
+        """Drain a run: workers finish their current work, checkpoint, and exit
+        gracefully; the run completes when the roster empties.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListRuns(self, request, context):
+        """── admin inspection ───────────────────────────────────────────────────
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListWorkers(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListShardProgress(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_CoordinatorServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -402,6 +488,41 @@ def add_CoordinatorServiceServicer_to_server(servicer, server):
                     servicer.CancelRun,
                     request_deserializer=runtime__pb2.CancelRunRequest.FromString,
                     response_serializer=runtime__pb2.CancelRunResponse.SerializeToString,
+            ),
+            'PauseRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.PauseRun,
+                    request_deserializer=runtime__pb2.RunActionRequest.FromString,
+                    response_serializer=runtime__pb2.RunActionResponse.SerializeToString,
+            ),
+            'ResumeRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResumeRun,
+                    request_deserializer=runtime__pb2.RunActionRequest.FromString,
+                    response_serializer=runtime__pb2.RunActionResponse.SerializeToString,
+            ),
+            'RetryRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.RetryRun,
+                    request_deserializer=runtime__pb2.RunActionRequest.FromString,
+                    response_serializer=runtime__pb2.RunActionResponse.SerializeToString,
+            ),
+            'DrainRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.DrainRun,
+                    request_deserializer=runtime__pb2.RunActionRequest.FromString,
+                    response_serializer=runtime__pb2.RunActionResponse.SerializeToString,
+            ),
+            'ListRuns': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListRuns,
+                    request_deserializer=runtime__pb2.ListRunsRequest.FromString,
+                    response_serializer=runtime__pb2.ListRunsResponse.SerializeToString,
+            ),
+            'ListWorkers': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListWorkers,
+                    request_deserializer=runtime__pb2.ListWorkersRequest.FromString,
+                    response_serializer=runtime__pb2.ListWorkersResponse.SerializeToString,
+            ),
+            'ListShardProgress': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListShardProgress,
+                    request_deserializer=runtime__pb2.ListShardProgressRequest.FromString,
+                    response_serializer=runtime__pb2.ListShardProgressResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -974,6 +1095,195 @@ class CoordinatorService:
             '/runtime.v1.CoordinatorService/CancelRun',
             runtime__pb2.CancelRunRequest.SerializeToString,
             runtime__pb2.CancelRunResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PauseRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/PauseRun',
+            runtime__pb2.RunActionRequest.SerializeToString,
+            runtime__pb2.RunActionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ResumeRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ResumeRun',
+            runtime__pb2.RunActionRequest.SerializeToString,
+            runtime__pb2.RunActionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RetryRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/RetryRun',
+            runtime__pb2.RunActionRequest.SerializeToString,
+            runtime__pb2.RunActionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DrainRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/DrainRun',
+            runtime__pb2.RunActionRequest.SerializeToString,
+            runtime__pb2.RunActionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListRuns(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ListRuns',
+            runtime__pb2.ListRunsRequest.SerializeToString,
+            runtime__pb2.ListRunsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListWorkers(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ListWorkers',
+            runtime__pb2.ListWorkersRequest.SerializeToString,
+            runtime__pb2.ListWorkersResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListShardProgress(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ListShardProgress',
+            runtime__pb2.ListShardProgressRequest.SerializeToString,
+            runtime__pb2.ListShardProgressResponse.FromString,
             options,
             channel_credentials,
             insecure,

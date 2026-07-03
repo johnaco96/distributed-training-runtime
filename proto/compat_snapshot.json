@@ -28,7 +28,9 @@
     "RunState": {
       "RUN_STATE_CANCELLED": 6,
       "RUN_STATE_COMPLETED": 4,
+      "RUN_STATE_DRAINING": 8,
       "RUN_STATE_FAILED": 5,
+      "RUN_STATE_PAUSED": 7,
       "RUN_STATE_PENDING": 1,
       "RUN_STATE_RECOVERING": 3,
       "RUN_STATE_RUNNING": 2,
@@ -572,6 +574,62 @@
         "CheckpointManifest"
       ]
     },
+    "ListRunsRequest": {
+      "state_filter": [
+        1,
+        "RunState"
+      ]
+    },
+    "ListRunsResponse": {
+      "runs": [
+        1,
+        "RunSummary"
+      ],
+      "server_time": [
+        2,
+        "google.protobuf.Timestamp"
+      ]
+    },
+    "ListShardProgressRequest": {
+      "dataset_id": [
+        2,
+        "DatasetId"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ]
+    },
+    "ListShardProgressResponse": {
+      "server_time": [
+        2,
+        "google.protobuf.Timestamp"
+      ],
+      "shards": [
+        1,
+        "ShardProgressInfo"
+      ]
+    },
+    "ListWorkersRequest": {
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "state_filter": [
+        2,
+        "WorkerState"
+      ]
+    },
+    "ListWorkersResponse": {
+      "server_time": [
+        2,
+        "google.protobuf.Timestamp"
+      ],
+      "workers": [
+        1,
+        "WorkerInfo"
+      ]
+    },
     "ProtocolVersion": {
       "major": [
         1,
@@ -908,7 +966,77 @@
         "int64"
       ]
     },
+    "RunActionRequest": {
+      "idempotency_key": [
+        3,
+        "string"
+      ],
+      "reason": [
+        2,
+        "string"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ]
+    },
+    "RunActionResponse": {
+      "server_time": [
+        3,
+        "google.protobuf.Timestamp"
+      ],
+      "state": [
+        1,
+        "RunState"
+      ],
+      "state_reason": [
+        2,
+        "string"
+      ]
+    },
     "RunId": {},
+    "RunSummary": {
+      "active_worker_count": [
+        6,
+        "uint32"
+      ],
+      "latest_checkpoint_id": [
+        7,
+        "CheckpointId"
+      ],
+      "latest_checkpoint_state": [
+        8,
+        "CheckpointState"
+      ],
+      "registered_at": [
+        10,
+        "google.protobuf.Timestamp"
+      ],
+      "retry_count": [
+        9,
+        "uint32"
+      ],
+      "run_id": [
+        1,
+        "RunId"
+      ],
+      "run_name": [
+        2,
+        "string"
+      ],
+      "state": [
+        3,
+        "RunState"
+      ],
+      "state_reason": [
+        4,
+        "string"
+      ],
+      "world_size": [
+        5,
+        "uint32"
+      ]
+    },
     "RuntimeCapabilities": {
       "features": [
         2,
@@ -1004,6 +1132,36 @@
         "int64"
       ]
     },
+    "ShardProgressInfo": {
+      "dataset_id": [
+        2,
+        "DatasetId"
+      ],
+      "is_complete": [
+        6,
+        "bool"
+      ],
+      "lease_epoch": [
+        4,
+        "uint64"
+      ],
+      "progress_offset": [
+        5,
+        "int64"
+      ],
+      "shard_id": [
+        1,
+        "ShardId"
+      ],
+      "updated_at": [
+        7,
+        "google.protobuf.Timestamp"
+      ],
+      "worker_id": [
+        3,
+        "WorkerId"
+      ]
+    },
     "StreamCheckpointArtifactChunk": {
       "data": [
         1,
@@ -1072,6 +1230,40 @@
         "string"
       ]
     },
-    "WorkerId": {}
+    "WorkerId": {},
+    "WorkerInfo": {
+      "failure_deadline": [
+        8,
+        "google.protobuf.Timestamp"
+      ],
+      "host": [
+        3,
+        "string"
+      ],
+      "last_heartbeat_at": [
+        6,
+        "google.protobuf.Timestamp"
+      ],
+      "next_heartbeat_deadline": [
+        7,
+        "google.protobuf.Timestamp"
+      ],
+      "rank": [
+        2,
+        "uint32"
+      ],
+      "sdk_version": [
+        5,
+        "string"
+      ],
+      "state": [
+        4,
+        "WorkerState"
+      ],
+      "worker_id": [
+        1,
+        "WorkerId"
+      ]
+    }
   }
 }

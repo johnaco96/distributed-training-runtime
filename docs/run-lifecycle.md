@@ -13,21 +13,47 @@ Every run carries a durable state, persisted to the metadata store (SQLite or
 PostgreSQL) and rehydrated on coordinator restart:
 
 ```
-PENDING ──► RUNNING ◄──► RECOVERING
+        ┌──────────── PAUSED ◄──── (admin pause)
+        ▼               ▲
+PENDING ──► RUNNING ◄──►│──► RECOVERING
+               │        └─(admin resume)  │
+               ├─► COMPLETED  ├─► FAILED ──► (admin retry) ──► PENDING
                │              │
-               ├─► COMPLETED  ├─► FAILED
-               │              │
+               ├───► DRAINING ─┘  (admin drain; graceful stop)
                └────► CANCELLED ◄──── (admin, from any live state)
 ```
 
 | State | Meaning | Entered when |
 |---|---|---|
-| `PENDING` | Registered; no rendezvous round has completed | `RegisterRun` |
-| `RUNNING` | Workers hold ranks in a completed round | Rendezvous round completes |
+| `PENDING` | Registered; no rendezvous round has completed | `RegisterRun`, or admin `RetryRun`/`ResumeRun` (no workers) |
+| `RUNNING` | Workers hold ranks in a completed round | Rendezvous round completes, or admin `ResumeRun` (workers present) |
 | `RECOVERING` | A completed round was invalidated; survivors are re-forming the group | Worker fails or leaves non-gracefully |
+| `PAUSED` | Administratively paused; not making progress, not terminal | `PauseRun` (from PENDING/RUNNING/RECOVERING) |
+| `DRAINING` | Workers finish current work, checkpoint, and exit gracefully | `DrainRun` (from PENDING/RUNNING/RECOVERING/PAUSED) |
 | `COMPLETED` | All workers deregistered as completed | Last `DeregisterWorker(COMPLETED)` |
 | `FAILED` | Stuck, or no live workers remain after errors | Stuck detection / roster exhaustion |
 | `CANCELLED` | Administratively stopped | `CancelRun` |
+
+## Admin lifecycle operations
+
+Operators drive these transitions with the `dtruntime-admin run <action>`
+commands (see [admin-cli.md](admin-cli.md)) or the corresponding
+`RuntimeClient`/gRPC calls. `PAUSED` and `DRAINING` are **non-terminal** — a
+paused run is resumable and a draining run still completes normally.
+
+| RPC / CLI | Allowed from | Effect |
+|---|---|---|
+| `PauseRun` / `run pause` | PENDING, RUNNING, RECOVERING | → PAUSED |
+| `ResumeRun` / `run resume` | PAUSED | → RUNNING if active workers remain, else PENDING |
+| `RetryRun` / `run retry` | FAILED | → PENDING; clears the stale worker roster + rendezvous and increments the durable `retry_count`, so a fresh launch re-rendezvouses and resumes from the latest committed checkpoint |
+| `DrainRun` / `run drain` | PENDING, RUNNING, RECOVERING, PAUSED | → DRAINING |
+| `CancelRun` / `run cancel` | any live state | → CANCELLED (terminal) |
+
+An action attempted from a disallowed state returns `FAILED_PRECONDITION`
+(never a silent no-op). Every action is recorded in the audit log with its
+optional operator-supplied reason. The per-run `retry_count` is persisted
+(schema migration v2) and survives coordinator restarts; it surfaces in
+`ListRuns` / `runs list`.
 
 `COMPLETED`, `FAILED`, and `CANCELLED` are **terminal and final** — later
 transition attempts (including cancellation racing completion) are ignored,

@@ -74,6 +74,17 @@ The following capabilities are implemented and locally validated:
   `docs/schema-migrations.md`.
 - Enforced protobuf wire compatibility: a golden-snapshot test fails any
   breaking field change (see `docs/protocol-compatibility.md`).
+- Admin lifecycle operations: pause/resume/retry/drain runs (plus existing
+  cancel) via `PauseRun`/`ResumeRun`/`RetryRun`/`DrainRun`, with a persisted
+  per-run retry counter (added as schema migration v2). See
+  `docs/run-lifecycle.md`.
+- Admin inspection RPCs: `ListRuns` (all/active-jobs/failures by state),
+  `ListWorkers`, and `ListShardProgress` (shard leases + offsets).
+- Operator CLI `dtruntime-admin`: inspect runs/workers/shards/checkpoints, drive
+  lifecycle actions, `doctor` (coordinator probe + stuck-worker/bad-checkpoint
+  diagnosis), and `checkpoint verify` (download + checksum artifacts), with
+  `--json` output and structured, remediation-oriented error reporting (see
+  `docs/admin-cli.md`).
 
 ## Current limitations and non-goals
 

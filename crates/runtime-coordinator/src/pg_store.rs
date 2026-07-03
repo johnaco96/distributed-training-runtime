@@ -94,6 +94,7 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS assignment_policy INTEGER NOT NULL DEF
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS storage_backend_kind INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_version TEXT NOT NULL DEFAULT '';
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS latest_checkpoint_id TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS workers (
   run_id               TEXT NOT NULL,
@@ -290,8 +291,9 @@ impl MetadataStore for PostgresMetadataStore {
                 r#"
 INSERT INTO runs (run_id, name, status, created_at_millis, idempotency_key,
                   run_state, state_reason, world_size, min_world_size, max_world_size,
-                  settle_timeout_ms, assignment_policy, storage_backend_kind, run_version)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                  settle_timeout_ms, assignment_policy, storage_backend_kind, run_version,
+                  latest_checkpoint_id, retry_count)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 ON CONFLICT (run_id) DO UPDATE SET
   name = EXCLUDED.name,
   status = EXCLUDED.status,
@@ -305,7 +307,9 @@ ON CONFLICT (run_id) DO UPDATE SET
   settle_timeout_ms = EXCLUDED.settle_timeout_ms,
   assignment_policy = EXCLUDED.assignment_policy,
   storage_backend_kind = EXCLUDED.storage_backend_kind,
-  run_version = EXCLUDED.run_version
+  run_version = EXCLUDED.run_version,
+  latest_checkpoint_id = EXCLUDED.latest_checkpoint_id,
+  retry_count = EXCLUDED.retry_count
 "#,
             )
             .bind(&run.run_id)
@@ -326,6 +330,8 @@ ON CONFLICT (run_id) DO UPDATE SET
             .bind(run.assignment_policy)
             .bind(run.storage_backend_kind)
             .bind(&run.run_version)
+            .bind(run.latest_checkpoint_id.as_ref().map(|c| c.value.clone()))
+            .bind(run.retry_count as i32)
             .execute(&self.pool)
             .await
             .map(|_| ())
@@ -351,11 +357,12 @@ ON CONFLICT (run_id) DO UPDATE SET
                 String,
                 i32,
                 Option<String>,
+                i32,
             );
             let rows: Vec<Row> = sqlx::query_as(
                 "SELECT run_id, name, created_at_millis, idempotency_key, run_state, state_reason, \
                  world_size, min_world_size, max_world_size, settle_timeout_ms, assignment_policy, \
-                 storage_backend_kind, run_version, status, latest_checkpoint_id FROM runs ORDER BY run_id",
+                 storage_backend_kind, run_version, status, latest_checkpoint_id, retry_count FROM runs ORDER BY run_id",
             )
             .fetch_all(&self.pool)
             .await
@@ -380,6 +387,7 @@ ON CONFLICT (run_id) DO UPDATE SET
                         run_version,
                         status,
                         latest_checkpoint_id,
+                        retry_count,
                     )| RunRecord {
                         run_id,
                         run_name,
@@ -399,6 +407,7 @@ ON CONFLICT (run_id) DO UPDATE SET
                         latest_checkpoint_id: latest_checkpoint_id
                             .map(|value| ProtoCheckpointId { value }),
                         state_updated_at: std::time::SystemTime::now(),
+                        retry_count: retry_count.max(0) as u32,
                     },
                 )
                 .collect())
