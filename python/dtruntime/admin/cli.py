@@ -546,6 +546,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeout", type=float, default=None, help="per-RPC timeout in seconds"
     )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="OIDC/JWT bearer token for authentication (env DTRUNTIME_AUTH_TOKEN)",
+    )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
 
     sub = parser.add_subparsers(dest="group", required=True)
@@ -637,10 +642,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_client(address: str) -> Any:
+def _build_client(address: str, token: Optional[str] = None) -> Any:
     from dtruntime.client import RuntimeClient
 
-    return RuntimeClient(address)
+    return RuntimeClient(address, auth_token=token)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -658,7 +663,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _emit_error(err, args)
 
     try:
-        client = _build_client(args.address)
+        client = _build_client(args.address, token=args.token)
     except Exception as exc:  # noqa: BLE001
         return _emit_error(errors.from_rpc_error(exc), args)
 

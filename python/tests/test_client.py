@@ -602,6 +602,25 @@ def test_auth_metadata_from_env(monkeypatch):
     assert stub.GetLatestCheckpoint.call_args.kwargs["metadata"] == [("x-dtruntime-subject", "admin"), ("x-dtruntime-role", "admin")]
 
 
+def test_bearer_token_metadata_from_arg(monkeypatch):
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    client = RuntimeClient("127.0.0.1:50051", auth_token="header.payload.sig")
+    client.restore_latest("r")
+    assert stub.GetLatestCheckpoint.call_args.kwargs["metadata"] == [
+        ("authorization", "Bearer header.payload.sig"),
+    ]
+
+
+def test_bearer_token_strips_existing_scheme_and_reads_env(monkeypatch):
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    monkeypatch.setenv("DTRUNTIME_AUTH_TOKEN", "Bearer abc.def.ghi")
+    client = RuntimeClient("127.0.0.1:50051")
+    client.restore_latest("r")
+    assert stub.GetLatestCheckpoint.call_args.kwargs["metadata"] == [
+        ("authorization", "Bearer abc.def.ghi"),
+    ]
+
+
 
 
 def test_for_worker_builds_worker_identity_metadata(monkeypatch):

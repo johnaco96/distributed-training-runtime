@@ -7,12 +7,28 @@ The project provides a local/dev Kubernetes deployment path, but that path is in
 Current state:
 - Local/dev Kubernetes manifests and runbook are available.
 - mTLS is implemented via optional `--tls-cert`/`--tls-key`/`--tls-client-ca` flags on the coordinator.
-- Role-based authorization is implemented via metadata-based identity (`--auth-mode metadata`).
-- Structured audit logging is implemented via the `DbAuditSink` and `audit_events` table.
-- Dashboard/admin UI is not implemented.
-- HA coordinator replication/failover is not implemented.
-- Production S3 hardening is not implemented.
+- **Layered authentication** is implemented: OIDC/JWT bearer tokens, SPIFFE
+  X.509-SVID from the mTLS peer certificate, and a dev-only metadata-header
+  identity (disabled with `--auth-disable-header-identity`). See
+  [security-auth.md](security-auth.md).
+- **Role/permission RBAC** (admin/operator/viewer/worker) is implemented,
+  replacing the original two-role scheme.
+- **JWT verification keys hot-rotate** from a JWKS/secret file without a
+  restart. See [secret-rotation.md](secret-rotation.md).
+- Structured audit logging is implemented via `DbAuditSink` and the
+  `audit_events` table, **plus an optional NDJSON/SIEM sink**
+  (`--audit-log-file`) and auth allow/deny counters. See
+  [audit-logging.md](audit-logging.md).
+- **Supply-chain scanning** is enforced in CI: `cargo-deny` (RUSTSEC
+  advisories, bans, sources) and `pip-audit`, with Dependabot updates.
+- HA coordinator replication/failover is implemented (PostgreSQL advisory lock).
+- Production S3 hardening is implemented (Phase 6).
+- Dashboard/admin UI is not implemented (the `dtruntime-admin` CLI is the
+  operator surface).
 - Checkpoint integrity checks and idempotency protections are useful controls, but they are not a complete security boundary.
+- Not yet validated against a live SPIRE server or a production OIDC provider /
+  SIEM (the implementations follow the standard SVID / JWKS / NDJSON contracts
+  and are validated locally with minted tokens and generated certs).
 
 ## 2) Target security architecture
 

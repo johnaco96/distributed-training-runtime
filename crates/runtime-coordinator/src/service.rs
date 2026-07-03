@@ -123,23 +123,26 @@ impl CoordinatorServiceImpl {
         request: &Request<T>,
         request_name: &'static str,
     ) -> Result<Option<crate::auth::AuthContext>, Status> {
-        match self.authorizer.context(request.metadata()) {
+        // The verified mTLS leaf certificate, when present, feeds SPIFFE auth.
+        let peer_leaf: Option<Vec<u8>> = request
+            .peer_certs()
+            .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
+        match self
+            .authorizer
+            .authenticate(request.metadata(), peer_leaf.as_deref())
+        {
             Ok(ctx) => {
                 if let Some(c) = &ctx {
-                    let role = match c.role {
-                        crate::auth::AuthRole::Admin => "admin",
-                        crate::auth::AuthRole::Worker => "worker",
-                    };
                     self.audit.emit(AuditEvent {
                         kind: Some(AuditEventKind::AuthMetadataAccepted),
                         outcome: Some(AuditOutcome::Success),
                         subject: Some(c.subject.clone()),
-                        role: Some(role.to_string()),
+                        role: Some(c.role_label().to_string()),
                         worker_id: c.worker_id.clone(),
                         run_id: None,
                         dataset_id: None,
                         checkpoint_id: None,
-                        reason: None,
+                        reason: Some(format!("source={}", c.source.as_str())),
                         request_name: Some(request_name.to_string()),
                     });
                 }
@@ -158,34 +161,81 @@ impl CoordinatorServiceImpl {
                     reason: Some(e.as_str().to_string()),
                     request_name: Some(request_name.to_string()),
                 });
+                self.metrics.inc_auth_denied_total();
                 Err(e.to_status())
             }
         }
     }
 
+    /// Deny with an audited `AuthorizationDenied` event and a denied-metric bump.
+    fn deny(
+        &self,
+        ctx: &crate::auth::AuthContext,
+        reason: &str,
+        request_name: &'static str,
+    ) -> Status {
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::AuthorizationDenied),
+            outcome: Some(AuditOutcome::Rejected),
+            subject: Some(ctx.subject.clone()),
+            role: Some(ctx.role_label().to_string()),
+            worker_id: ctx.worker_id.clone(),
+            run_id: None,
+            dataset_id: None,
+            checkpoint_id: None,
+            reason: Some(reason.to_string()),
+            request_name: Some(request_name.to_string()),
+        });
+        self.metrics.inc_auth_denied_total();
+        AuthorizationError::PermissionDenied.to_status()
+    }
+
+    fn allow(&self) {
+        self.audit.emit(AuditEvent::new(
+            AuditEventKind::AuthorizationAllowed,
+            AuditOutcome::Success,
+        ));
+        self.metrics.inc_auth_allowed_total();
+    }
+
+    /// Require a specific [`Permission`]; used for management/read RPCs.
+    fn require_permission<T>(
+        &self,
+        request: &Request<T>,
+        permission: crate::auth::Permission,
+        request_name: &'static str,
+    ) -> Result<(), Status> {
+        let ctx = self.auth_context(request, request_name)?;
+        if let Some(c) = ctx {
+            if !c.has_permission(permission) {
+                return Err(self.deny(&c, "permission_denied", request_name));
+            }
+            self.allow();
+        }
+        Ok(())
+    }
+
+    /// Management operations (lifecycle, registration, dataset, commit): admin
+    /// or operator roles.
     fn require_admin<T>(
         &self,
         request: &Request<T>,
         request_name: &'static str,
     ) -> Result<(), Status> {
-        let ctx = self.auth_context(request, request_name)?;
-        if let Some(c) = ctx {
-            if c.role != crate::auth::AuthRole::Admin {
-                self.audit.emit(AuditEvent::new(
-                    AuditEventKind::AuthorizationDenied,
-                    AuditOutcome::Rejected,
-                ));
-                return Err(AuthorizationError::PermissionDenied.to_status());
-            }
-            self.audit.emit(AuditEvent::new(
-                AuditEventKind::AuthorizationAllowed,
-                AuditOutcome::Success,
-            ));
-            self.metrics.inc_auth_allowed_total();
-        }
-        Ok(())
+        self.require_permission(request, crate::auth::Permission::Manage, request_name)
     }
 
+    /// Read-only inspection RPCs: admin, operator, or viewer roles.
+    fn require_read<T>(
+        &self,
+        request: &Request<T>,
+        request_name: &'static str,
+    ) -> Result<(), Status> {
+        self.require_permission(request, crate::auth::Permission::Read, request_name)
+    }
+
+    /// Worker-plane self operations require the `worker` role explicitly (an
+    /// admin does not masquerade as a worker for registration/heartbeat).
     fn require_worker_capability<T>(
         &self,
         request: &Request<T>,
@@ -193,30 +243,16 @@ impl CoordinatorServiceImpl {
     ) -> Result<(), Status> {
         let ctx = self.auth_context(request, request_name)?;
         if let Some(c) = ctx {
-            if c.role != crate::auth::AuthRole::Worker {
-                self.audit.emit(AuditEvent {
-                    kind: Some(AuditEventKind::AuthorizationDenied),
-                    outcome: Some(AuditOutcome::Rejected),
-                    subject: Some(c.subject),
-                    role: Some("admin".to_string()),
-                    worker_id: c.worker_id,
-                    run_id: None,
-                    dataset_id: None,
-                    checkpoint_id: None,
-                    reason: Some("permission_denied".to_string()),
-                    request_name: Some(request_name.to_string()),
-                });
-                return Err(AuthorizationError::PermissionDenied.to_status());
+            if !c.is_worker() {
+                return Err(self.deny(&c, "permission_denied", request_name));
             }
-            self.audit.emit(AuditEvent::new(
-                AuditEventKind::AuthorizationAllowed,
-                AuditOutcome::Success,
-            ));
-            self.metrics.inc_auth_allowed_total();
+            self.allow();
         }
         Ok(())
     }
 
+    /// Allow a management-capable caller (admin/operator), or a worker acting on
+    /// its own `worker_id`.
     fn allow_admin_or_worker_self<T>(
         &self,
         request: &Request<T>,
@@ -225,44 +261,37 @@ impl CoordinatorServiceImpl {
     ) -> Result<(), Status> {
         let ctx = self.auth_context(request, request_name)?;
         if let Some(c) = ctx {
-            match c.role {
-                crate::auth::AuthRole::Admin => {
-                    self.audit.emit(AuditEvent::new(
-                        AuditEventKind::AuthorizationAllowed,
-                        AuditOutcome::Success,
-                    ));
-                    Ok(())
-                }
-                crate::auth::AuthRole::Worker => {
-                    let provided = match c.worker_id.clone() {
-                        Some(worker_id) => worker_id,
-                        None => {
-                            self.audit.emit(AuditEvent {
-                                kind: Some(AuditEventKind::AuthorizationDenied),
-                                outcome: Some(AuditOutcome::Rejected),
-                                subject: Some(c.subject),
-                                role: Some("worker".to_string()),
-                                worker_id: None,
-                                run_id: None,
-                                dataset_id: None,
-                                checkpoint_id: None,
-                                reason: Some("missing_identity".to_string()),
-                                request_name: Some(request_name.to_string()),
-                            });
-                            return Err(AuthorizationError::MissingIdentity.to_status());
-                        }
-                    };
-                    if provided == worker_id {
-                        self.audit.emit(AuditEvent::new(
-                            AuditEventKind::AuthorizationAllowed,
-                            AuditOutcome::Success,
-                        ));
-                        Ok(())
-                    } else {
+            if c.has_permission(crate::auth::Permission::Manage) {
+                self.allow();
+                return Ok(());
+            }
+            if c.is_worker() {
+                match c.worker_id.clone() {
+                    None => {
                         self.audit.emit(AuditEvent {
                             kind: Some(AuditEventKind::AuthorizationDenied),
                             outcome: Some(AuditOutcome::Rejected),
-                            subject: Some(c.subject),
+                            subject: Some(c.subject.clone()),
+                            role: Some("worker".to_string()),
+                            worker_id: None,
+                            run_id: None,
+                            dataset_id: None,
+                            checkpoint_id: None,
+                            reason: Some("missing_identity".to_string()),
+                            request_name: Some(request_name.to_string()),
+                        });
+                        self.metrics.inc_auth_denied_total();
+                        return Err(AuthorizationError::MissingIdentity.to_status());
+                    }
+                    Some(provided) if provided == worker_id => {
+                        self.allow();
+                        return Ok(());
+                    }
+                    Some(provided) => {
+                        self.audit.emit(AuditEvent {
+                            kind: Some(AuditEventKind::AuthorizationDenied),
+                            outcome: Some(AuditOutcome::Rejected),
+                            subject: Some(c.subject.clone()),
                             role: Some("worker".to_string()),
                             worker_id: Some(provided),
                             run_id: None,
@@ -271,10 +300,12 @@ impl CoordinatorServiceImpl {
                             reason: Some("worker_identity_mismatch".to_string()),
                             request_name: Some(request_name.to_string()),
                         });
-                        Err(AuthorizationError::WorkerIdentityMismatch.to_status())
+                        self.metrics.inc_auth_denied_total();
+                        return Err(AuthorizationError::WorkerIdentityMismatch.to_status());
                     }
                 }
             }
+            Err(self.deny(&c, "permission_denied", request_name))
         } else {
             Ok(())
         }
@@ -365,7 +396,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetRuntimeInfoRequest>,
     ) -> Result<Response<GetRuntimeInfoResponse>, Status> {
-        self.require_admin(&request, "admin_request")?;
+        self.require_read(&request, "read_request")?;
         let version = protocol_version();
         let capabilities = RuntimeCapabilities {
             protocol_version: Some(version),
@@ -1436,7 +1467,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetRunStatusRequest>,
     ) -> Result<Response<GetRunStatusResponse>, Status> {
-        self.require_admin(&request, "admin_request")?;
+        self.require_read(&request, "read_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -1694,7 +1725,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<ListRunsRequest>,
     ) -> Result<Response<ListRunsResponse>, Status> {
-        self.require_admin(&request, "admin_request")?;
+        self.require_read(&request, "read_request")?;
         let request = request.into_inner();
         self.state.reconcile_worker_liveness();
 
@@ -1730,7 +1761,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<ListWorkersRequest>,
     ) -> Result<Response<ListWorkersResponse>, Status> {
-        self.require_admin(&request, "admin_request")?;
+        self.require_read(&request, "read_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -1769,7 +1800,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<ListShardProgressRequest>,
     ) -> Result<Response<ListShardProgressResponse>, Status> {
-        self.require_admin(&request, "admin_request")?;
+        self.require_read(&request, "read_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -2092,6 +2123,199 @@ mod tests {
         )
     }
 
+    const JWT_TEST_SECRET: &[u8] = b"service-integration-jwt-secret";
+
+    /// A service whose authenticator validates JWT bearer tokens (HS256) and
+    /// has the dev metadata-header fallback disabled — production posture.
+    fn build_service_with_jwt() -> (CoordinatorServiceImpl, tempfile::TempDir) {
+        use crate::security::jwt::{JwtConfig, JwtValidator};
+        use crate::security::keyset::{KeySource, ReloadableKeySet};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jwt-secret");
+        std::fs::write(&path, JWT_TEST_SECRET).unwrap();
+        let keys = Arc::new(
+            ReloadableKeySet::load(KeySource::HmacSecret {
+                path,
+                algorithm: jsonwebtoken::Algorithm::HS256,
+            })
+            .unwrap(),
+        );
+        let validator = Arc::new(JwtValidator::new(JwtConfig::default(), keys));
+        let authenticator = Authorizer::new(crate::auth::AuthMode::Metadata)
+            .with_jwt(validator)
+            .with_metadata_fallback(false);
+        let service = CoordinatorServiceImpl::with_metrics_authorizer_and_audit(
+            Arc::new(CoordinatorState::default()),
+            Arc::new(RuntimeMetrics::default()),
+            authenticator,
+            AuditLogger::new(Arc::new(crate::audit::InMemoryAuditSink::default())),
+        );
+        (service, dir)
+    }
+
+    fn mint_jwt(roles: serde_json::Value, exp_offset_secs: i64) -> String {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "svc-account",
+                "exp": now + exp_offset_secs,
+                "roles": roles,
+            }),
+            &EncodingKey::from_secret(JWT_TEST_SECRET),
+        )
+        .unwrap()
+    }
+
+    fn request_with_bearer<T>(token: &str, inner: T) -> Request<T> {
+        let mut request = Request::new(inner);
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+    }
+
+    fn request_as_role<T>(role: &str, inner: T) -> Request<T> {
+        let mut request = Request::new(inner);
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-subject", "rbac-subject".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-role", role.parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn viewer_can_read_but_not_manage() {
+        let service = build_service_with_metadata_auth();
+        // Viewer may list runs (read) ...
+        service
+            .list_runs(request_as_role(
+                "viewer",
+                ListRunsRequest { state_filter: 0 },
+            ))
+            .await
+            .expect("viewer should read");
+        // ... but not register (manage/register) ...
+        let register_err = service
+            .register_run(request_as_role("viewer", register_request("v-key")))
+            .await
+            .expect_err("viewer must not register runs");
+        assert_permission_denied(register_err);
+        // ... nor cancel (manage).
+        let cancel_err = service
+            .cancel_run(request_as_role(
+                "viewer",
+                CancelRunRequest {
+                    run_id: Some(RunId {
+                        value: "any".to_string(),
+                    }),
+                    reason: String::new(),
+                    idempotency_key: String::new(),
+                },
+            ))
+            .await
+            .expect_err("viewer must not cancel");
+        assert_permission_denied(cancel_err);
+    }
+
+    #[tokio::test]
+    async fn operator_can_manage_runs() {
+        let service = build_service_with_metadata_auth();
+        let run_id = service
+            .register_run(request_as_role("operator", register_request("op-key")))
+            .await
+            .expect("operator should register")
+            .into_inner()
+            .run_id
+            .unwrap();
+        service
+            .pause_run(request_as_role(
+                "operator",
+                RunActionRequest {
+                    run_id: Some(run_id.clone()),
+                    reason: "op maintenance".to_string(),
+                    idempotency_key: String::new(),
+                },
+            ))
+            .await
+            .expect("operator should pause");
+    }
+
+    #[tokio::test]
+    async fn jwt_admin_token_authorizes_management() {
+        let (service, _dir) = build_service_with_jwt();
+        let token = mint_jwt(serde_json::json!(["admin"]), 300);
+        service
+            .register_run(request_with_bearer(&token, register_request("jwt-key")))
+            .await
+            .expect("valid admin JWT should authorize register_run");
+    }
+
+    #[tokio::test]
+    async fn jwt_viewer_token_cannot_manage() {
+        let (service, _dir) = build_service_with_jwt();
+        let token = mint_jwt(serde_json::json!(["viewer"]), 300);
+        // Read is allowed.
+        service
+            .list_runs(request_with_bearer(
+                &token,
+                ListRunsRequest { state_filter: 0 },
+            ))
+            .await
+            .expect("viewer JWT should read");
+        // Management is denied.
+        let err = service
+            .register_run(request_with_bearer(&token, register_request("v2-key")))
+            .await
+            .expect_err("viewer JWT must not register");
+        assert_permission_denied(err);
+    }
+
+    // ── threat-model validation ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn threat_expired_token_is_rejected() {
+        let (service, _dir) = build_service_with_jwt();
+        let token = mint_jwt(serde_json::json!(["admin"]), -300);
+        let err = service
+            .register_run(request_with_bearer(&token, register_request("exp-key")))
+            .await
+            .expect_err("expired token must be rejected");
+        assert_unauthenticated(err);
+    }
+
+    #[tokio::test]
+    async fn threat_forged_token_signature_is_rejected() {
+        let (service, _dir) = build_service_with_jwt();
+        let mut token = mint_jwt(serde_json::json!(["admin"]), 300);
+        // Corrupt the signature segment.
+        let last = token.pop().unwrap();
+        token.push(if last == 'A' { 'B' } else { 'A' });
+        let err = service
+            .register_run(request_with_bearer(&token, register_request("forge-key")))
+            .await
+            .expect_err("forged signature must be rejected");
+        assert_unauthenticated(err);
+    }
+
+    #[tokio::test]
+    async fn threat_header_identity_ignored_when_fallback_disabled() {
+        // With JWT auth and header fallback disabled, a caller cannot escalate
+        // by asserting `x-dtruntime-role: admin` — no bearer, no access.
+        let (service, _dir) = build_service_with_jwt();
+        let err = service
+            .register_run(request_as_role("admin", register_request("spoof-key")))
+            .await
+            .expect_err("spoofed header identity must not authorize");
+        assert_unauthenticated(err);
+    }
+
     fn request_as_admin<T>(inner: T) -> Request<T> {
         let mut request = Request::new(inner);
         request
@@ -2126,9 +2350,10 @@ mod tests {
         request
             .metadata_mut()
             .insert("x-dtruntime-subject", "bad-role-subject".parse().unwrap());
+        // An unrecognized role token — rejected as Unauthenticated (InvalidRole).
         request
             .metadata_mut()
-            .insert("x-dtruntime-role", "viewer".parse().unwrap());
+            .insert("x-dtruntime-role", "superuser".parse().unwrap());
         request
     }
 

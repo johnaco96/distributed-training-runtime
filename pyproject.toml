@@ -27,6 +27,8 @@ dev = [
     # gencode version compatible with the protobuf runtime floor above.
     "grpcio-tools~=1.81",
     "pytest",
+    # Vulnerability scanning for the SDK's dependency tree (also run in CI).
+    "pip-audit",
 ]
 minio = [
     "boto3",

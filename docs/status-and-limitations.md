@@ -18,8 +18,16 @@ The following capabilities are implemented and locally validated:
 - PyTorch simulated distributed-style example.
 - Coordinator-driven PyTorch orchestration example.
 - Optional mTLS via `--tls-cert`/`--tls-key`/`--tls-client-ca` with cert-manager PKI.
-- Role-based authorization via `--auth-mode metadata`.
-- Structured audit logging via `DbAuditSink` and `audit_events` table.
+- Layered authentication: OIDC/JWT bearer tokens (rotatable JWKS/HMAC/PEM keys),
+  SPIFFE X.509-SVID from the mTLS peer cert, and a dev metadata-header identity
+  (disable-able via `--auth-disable-header-identity`) — see `docs/security-auth.md`.
+- Role/permission RBAC (admin/operator/viewer/worker) enforced per-RPC.
+- JWT verification-key hot rotation from a file without restart — see
+  `docs/secret-rotation.md`.
+- Structured audit logging via `DbAuditSink` and `audit_events` table, plus an
+  optional NDJSON/SIEM sink (`--audit-log-file`) and auth allow/deny counters.
+- Supply-chain scanning in CI: `cargo-deny` (advisories/bans/sources) and
+  `pip-audit`, with Dependabot update PRs; `SECURITY.md` policy.
 - PostgreSQL HA via advisory lock (2-replica coordinator support).
 - SQLite and PostgreSQL metadata persistence backends.
 - Local Kubernetes manifests (`k8s/local/`) and secure local Kubernetes path (`k8s/local-secure/`).
@@ -101,11 +109,14 @@ This project currently does **not** claim:
 - Proven production fault tolerance at scale.
 - Large-scale benchmark claims without measured evidence.
 - Dashboard/admin UI.
-- Full SIEM/durable audit pipeline.
+- A live SIEM deployment (the NDJSON `--audit-log-file` sink is SIEM-ingestable
+  and validated locally, but not exercised against a running SIEM/log pipeline).
 - S3 hardening validated against AWS S3 at scale (the hardening — multipart,
   error classification, jitter, SSE — is implemented and load-tested against
   MinIO, but not yet exercised against production AWS S3 under real load).
-- OIDC/SPIFFE/SPIRE identity integration.
+- OIDC/SPIFFE/SPIRE integration validated against a *live* provider/SPIRE
+  server (the token/SVID validation is implemented and tested locally with
+  minted tokens and generated certs, following the standard JWKS/SVID contracts).
 
 Important boundary: local simulated worker scaling is useful for smoke/perf exploration, but it is **not** proof of real cluster scale.
 

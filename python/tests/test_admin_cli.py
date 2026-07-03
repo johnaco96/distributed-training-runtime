@@ -100,7 +100,7 @@ def run_cli(monkeypatch):
     """Return a helper that runs the CLI against a supplied FakeClient."""
 
     def _run(argv, client):
-        monkeypatch.setattr(cli, "_build_client", lambda address: client)
+        monkeypatch.setattr(cli, "_build_client", lambda address, token=None: client)
         return cli.main(argv)
 
     return _run

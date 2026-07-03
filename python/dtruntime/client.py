@@ -19,7 +19,7 @@ class RuntimeClient:
     available for low-level use.
     """
 
-    def __init__(self, address: str, tls_ca_cert: str | Path | None = None, tls_client_cert: str | Path | None = None, tls_client_key: str | Path | None = None, auth_subject: str | None = None, auth_role: str | None = None, auth_worker_id: str | None = None) -> None:
+    def __init__(self, address: str, tls_ca_cert: str | Path | None = None, tls_client_cert: str | Path | None = None, tls_client_key: str | Path | None = None, auth_subject: str | None = None, auth_role: str | None = None, auth_worker_id: str | None = None, auth_token: str | None = None) -> None:
         """Create a client connected to a coordinator gRPC address."""
         try:
             import grpc
@@ -44,7 +44,17 @@ class RuntimeClient:
         auth_subject = auth_subject or os.getenv("DTRUNTIME_AUTH_SUBJECT")
         auth_role = auth_role or os.getenv("DTRUNTIME_AUTH_ROLE")
         auth_worker_id = auth_worker_id or os.getenv("DTRUNTIME_AUTH_WORKER_ID")
+        auth_token = auth_token or os.getenv("DTRUNTIME_AUTH_TOKEN")
         self._auth_metadata: list[tuple[str, str]] = []
+        # A bearer token (OIDC/JWT) is the strongest credential; when present it
+        # is validated server-side and the dev metadata-identity headers are
+        # ignored, so we only attach the ones the caller actually set.
+        if auth_token:
+            token = auth_token.strip()
+            # Accept either a bare token or a full "Bearer <token>" value.
+            if token.lower().startswith("bearer "):
+                token = token[len("bearer "):].strip()
+            self._auth_metadata.append(("authorization", f"Bearer {token}"))
         if auth_subject:
             self._auth_metadata.append(("x-dtruntime-subject", auth_subject))
         if auth_role:

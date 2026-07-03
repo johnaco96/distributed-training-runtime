@@ -1,0 +1,31 @@
+version: 2
+updates:
+  # Rust workspace crates.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      # Batch low-risk patch/minor bumps into a single PR to reduce churn.
+      rust-minor-and-patch:
+        update-types: ["minor", "patch"]
+    labels: ["dependencies", "rust"]
+
+  # Python SDK dependencies.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      python-minor-and-patch:
+        update-types: ["minor", "patch"]
+    labels: ["dependencies", "python"]
+
+  # GitHub Actions used in CI.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels: ["dependencies", "ci"]

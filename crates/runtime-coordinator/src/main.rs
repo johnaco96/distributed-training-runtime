@@ -10,16 +10,21 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use runtime_coordinator::audit::{
-    AuditEvent, AuditEventKind, AuditLogger, AuditOutcome, DbAuditSink,
+    AuditEvent, AuditEventKind, AuditLogger, AuditOutcome, AuditSink, DbAuditSink, FanoutAuditSink,
+    JsonLinesAuditSink, TracingAuditSink,
 };
-use runtime_coordinator::auth::{AuthMode, Authorizer};
+use runtime_coordinator::auth::{AuthMode, Authenticator};
 use runtime_coordinator::ha_lock::CoordinatorLockGuard;
 use runtime_coordinator::init_tracing_from_env;
 use runtime_coordinator::persistence::{MetadataStore, SqliteMetadataStore};
 use runtime_coordinator::pg_store::PostgresMetadataStore;
+use runtime_coordinator::security::jwt::{JwtConfig, JwtValidator};
+use runtime_coordinator::security::keyset::{KeySource, ReloadableKeySet};
+use runtime_coordinator::security::spiffe::SpiffePolicy;
 use runtime_coordinator::service::CoordinatorServiceImpl;
 use runtime_coordinator::state::CoordinatorState;
 use runtime_coordinator::telemetry::render_prometheus_metrics;
+use runtime_coordinator::RuntimeMetrics;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorServiceServer;
 use runtime_storage::S3StorageConfig;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -37,6 +42,30 @@ struct CoordinatorCliArgs {
     tls_key: Option<PathBuf>,
     tls_client_ca: Option<PathBuf>,
     auth_mode: AuthMode,
+    // ── OIDC / JWT bearer-token validation ──
+    /// Required token issuer (`iss`); recommended for production.
+    oidc_issuer: Option<String>,
+    /// Accepted token audiences (`aud`); repeatable.
+    oidc_audiences: Vec<String>,
+    /// JWKS document to validate RS/ES/EdDSA (or oct) signatures against.
+    oidc_jwks_file: Option<PathBuf>,
+    /// Raw HMAC shared-secret file (HS256) — dev/simple deployments.
+    oidc_hmac_secret_file: Option<PathBuf>,
+    /// PEM public key file for a single asymmetric key.
+    oidc_public_key_file: Option<PathBuf>,
+    /// Algorithm for `--oidc-hmac-secret-file`/`--oidc-public-key-file`.
+    oidc_algorithm: Option<String>,
+    /// Claim carrying roles/groups (default `roles`).
+    oidc_role_claim: Option<String>,
+    // ── SPIFFE / SPIRE workload identity (via mTLS SVID) ──
+    /// Required SPIFFE trust domain; enables SPIFFE auth when set.
+    spiffe_trust_domain: Option<String>,
+    /// File mapping SPIFFE paths to roles (`pattern = role[,role]`).
+    spiffe_role_map_file: Option<PathBuf>,
+    /// Reject dev metadata-header identities (production hardening).
+    disable_header_identity: bool,
+    /// Append structured JSON (NDJSON/SIEM) audit records to this file.
+    audit_log_file: Option<PathBuf>,
     status_addr: Option<String>,
     metrics_addr: Option<String>,
     s3_endpoint: Option<String>,
@@ -79,10 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Gap 5: build the audit logger; upgraded to DbAuditSink once the metadata
-    // store is initialised below.  Start with tracing-only so startup events
-    // are always captured even if the DB initialisation fails.
-    let mut audit = AuditLogger::tracing();
+    // Collect audit sinks; the durable DB sink is appended once the metadata
+    // store is initialised below, and the JSON/SIEM sink when --audit-log-file
+    // is set. The composed logger is built after state init (before any RPCs).
+    let mut audit_sinks: Vec<Arc<dyn AuditSink>> = Vec::new();
 
     let addr: SocketAddr = args.addr.parse()?;
     info!(%addr, "runtime-coordinator configured listen address");
@@ -133,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let store: Arc<dyn MetadataStore> = Arc::new(store);
         // Gap 5: wire the durable DB audit sink now that the store is ready.
-        audit = AuditLogger::new(Arc::new(DbAuditSink::new(Arc::clone(&store))));
+        audit_sinks.push(Arc::new(DbAuditSink::new(Arc::clone(&store))));
         Arc::new(CoordinatorState::with_metadata_store(store))
     } else if let Some(ref path) = args.metadata_db {
         // SQLite: single-node, local dev / small deployments.
@@ -142,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.init_schema()?;
         let store: Arc<dyn MetadataStore> = Arc::new(store);
         // Gap 5: wire the durable DB audit sink.
-        audit = AuditLogger::new(Arc::new(DbAuditSink::new(Arc::clone(&store))));
+        audit_sinks.push(Arc::new(DbAuditSink::new(Arc::clone(&store))));
         Arc::new(CoordinatorState::with_metadata_store(store))
     } else {
         Arc::new(CoordinatorState::default())
@@ -151,9 +180,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tls_enabled = args.tls_cert.is_some();
     let mtls_enabled = args.tls_client_ca.is_some();
     let auth_mode = args.auth_mode;
-    let mut service =
-        CoordinatorServiceImpl::with_authorizer(state.clone(), Authorizer::new(args.auth_mode))
-            .with_artifact_verification(args.verify_checkpoint_artifacts);
+
+    // Compose the audit pipeline: durable DB sink (if a store is configured) +
+    // optional JSON/NDJSON SIEM file sink, always with a tracing fallback.
+    if let Some(ref path) = args.audit_log_file {
+        match JsonLinesAuditSink::to_file(path) {
+            Ok(sink) => {
+                info!(path = %path.display(), "structured JSON audit log (SIEM) enabled");
+                audit_sinks.push(Arc::new(sink));
+            }
+            Err(e) => {
+                return Err(
+                    format!("failed to open --audit-log-file {}: {e}", path.display()).into(),
+                )
+            }
+        }
+    }
+    if audit_sinks.is_empty() {
+        audit_sinks.push(Arc::new(TracingAuditSink));
+    }
+    let audit = AuditLogger::new(Arc::new(FanoutAuditSink::new(audit_sinks)));
+
+    // Build the layered authenticator (JWT / SPIFFE / dev metadata headers).
+    let authenticator = build_authenticator(&args, &audit)?;
+    let metrics = Arc::new(RuntimeMetrics::default());
+    let mut service = CoordinatorServiceImpl::with_metrics_authorizer_and_audit(
+        state.clone(),
+        metrics,
+        authenticator,
+        audit.clone(),
+    )
+    .with_artifact_verification(args.verify_checkpoint_artifacts);
     if args.verify_checkpoint_artifacts {
         info!("runtime-coordinator checkpoint artifact post-write verification enabled");
     } else {
@@ -371,8 +428,99 @@ fn load_tls_config(
     }
 }
 
+/// Resolve the JWT verification key source from the OIDC flags, if any.
+fn jwt_key_source(
+    args: &CoordinatorCliArgs,
+) -> Result<Option<KeySource>, Box<dyn std::error::Error>> {
+    let algorithm = |default: jsonwebtoken::Algorithm| -> Result<jsonwebtoken::Algorithm, Box<dyn std::error::Error>> {
+        match &args.oidc_algorithm {
+            Some(a) => a
+                .parse()
+                .map_err(|_| format!("invalid --oidc-algorithm: {a}").into()),
+            None => Ok(default),
+        }
+    };
+    if let Some(path) = &args.oidc_jwks_file {
+        return Ok(Some(KeySource::Jwks { path: path.clone() }));
+    }
+    if let Some(path) = &args.oidc_hmac_secret_file {
+        return Ok(Some(KeySource::HmacSecret {
+            path: path.clone(),
+            algorithm: algorithm(jsonwebtoken::Algorithm::HS256)?,
+        }));
+    }
+    if let Some(path) = &args.oidc_public_key_file {
+        return Ok(Some(KeySource::PublicKeyPem {
+            path: path.clone(),
+            algorithm: algorithm(jsonwebtoken::Algorithm::RS256)?,
+        }));
+    }
+    if args.oidc_issuer.is_some() || !args.oidc_audiences.is_empty() {
+        return Err("OIDC issuer/audience configured but no signing key source \
+             (--oidc-jwks-file / --oidc-hmac-secret-file / --oidc-public-key-file)"
+            .into());
+    }
+    Ok(None)
+}
+
+/// Build the layered authenticator from the auth/OIDC/SPIFFE flags.
+fn build_authenticator(
+    args: &CoordinatorCliArgs,
+    audit: &AuditLogger,
+) -> Result<Authenticator, Box<dyn std::error::Error>> {
+    let mut auth = Authenticator::new(args.auth_mode);
+
+    if let Some(source) = jwt_key_source(args)? {
+        let keys = Arc::new(
+            ReloadableKeySet::load(source).map_err(|e| format!("OIDC key load failed: {e}"))?,
+        );
+        let mut cfg = JwtConfig {
+            issuer: args.oidc_issuer.clone(),
+            audiences: args.oidc_audiences.clone(),
+            ..Default::default()
+        };
+        if let Some(rc) = &args.oidc_role_claim {
+            cfg.role_claim = rc.clone();
+        }
+        auth = auth.with_jwt(Arc::new(JwtValidator::new(cfg, keys)));
+        info!("OIDC/JWT bearer-token authentication enabled");
+        audit.emit(AuditEvent::new(
+            AuditEventKind::AuthModeConfigured,
+            AuditOutcome::Success,
+        ));
+    }
+
+    if let Some(td) = &args.spiffe_trust_domain {
+        let path = args
+            .spiffe_role_map_file
+            .as_ref()
+            .ok_or("--spiffe-trust-domain requires --spiffe-role-map-file")?;
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "failed to read --spiffe-role-map-file {}: {e}",
+                path.display()
+            )
+        })?;
+        let rules = SpiffePolicy::parse_role_rules(&text)
+            .map_err(|e| format!("invalid SPIFFE role map: {e}"))?;
+        auth = auth.with_spiffe(Arc::new(SpiffePolicy::new(td.clone(), rules)));
+        info!(trust_domain = %td, "SPIFFE/SPIRE mTLS workload identity enabled");
+        audit.emit(AuditEvent::new(
+            AuditEventKind::AuthModeConfigured,
+            AuditOutcome::Success,
+        ));
+    }
+
+    if args.disable_header_identity {
+        auth = auth.with_metadata_fallback(false);
+        info!("dev metadata-header identity fallback DISABLED (production hardening)");
+    }
+
+    Ok(auth)
+}
+
 fn print_usage() {
-    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--metadata-db-url <URL>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--max-s3-concurrent-ops <N>] [--reconcile-interval-secs <N>] [--stuck-after-secs <N>] [--terminal-run-retention-secs <N>] [--help|-h]");
+    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--metadata-db-url <URL>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--oidc-issuer <ISS> --oidc-audience <AUD> --oidc-jwks-file <PATH>] [--spiffe-trust-domain <DOMAIN> --spiffe-role-map-file <PATH>] [--auth-disable-header-identity] [--audit-log-file <PATH>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--max-s3-concurrent-ops <N>] [--reconcile-interval-secs <N>] [--stuck-after-secs <N>] [--terminal-run-retention-secs <N>] [--help|-h]");
     println!("\nOptions:");
     println!("  --addr <ADDR>              Coordinator listen address (default: {DEFAULT_ADDR})");
     println!(
@@ -384,6 +532,23 @@ fn print_usage() {
         "  --storage-root <PATH>      Local staging area for StreamCheckpointArtifact (required)"
     );
     println!("  --auth-mode <MODE>         Authorization mode: disabled|metadata (env: DTRUNTIME_AUTH_MODE)");
+    println!("  --oidc-issuer <ISS>        Required JWT issuer (env: DTRUNTIME_OIDC_ISSUER)");
+    println!("  --oidc-audience <AUD>      Accepted JWT audience; repeatable (env: DTRUNTIME_OIDC_AUDIENCE)");
+    println!(
+        "  --oidc-jwks-file <PATH>    JWKS document for RS/ES/EdDSA/oct signature verification"
+    );
+    println!("  --oidc-hmac-secret-file P  HMAC (HS256) shared-secret file for JWT validation");
+    println!("  --oidc-public-key-file P   PEM public key for a single asymmetric JWT key");
+    println!("  --oidc-algorithm <ALG>     Algorithm for the HMAC/PEM key (default HS256/RS256)");
+    println!("  --oidc-role-claim <CLAIM>  JWT claim carrying roles/groups (default: roles)");
+    println!("  --spiffe-trust-domain <D>  Enable SPIFFE mTLS identity for this trust domain");
+    println!("  --spiffe-role-map-file P   SPIFFE path->role map (requires --spiffe-trust-domain)");
+    println!(
+        "  --auth-disable-header-identity  Reject dev metadata-header identities (prod hardening)"
+    );
+    println!(
+        "  --audit-log-file <PATH>    Append structured JSON/NDJSON (SIEM) audit records to PATH"
+    );
     println!("  --tls-cert <PATH>          Enable TLS with certificate chain PEM at PATH (requires --tls-key)");
     println!(
         "  --tls-key <PATH>           Enable TLS with private key PEM at PATH (requires --tls-cert)"
@@ -423,6 +588,37 @@ fn coordinator_args(
             .unwrap_or("disabled")
             .parse()
             .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
+        oidc_issuer: std::env::var("DTRUNTIME_OIDC_ISSUER").ok(),
+        oidc_audiences: std::env::var("DTRUNTIME_OIDC_AUDIENCE")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        oidc_jwks_file: std::env::var("DTRUNTIME_OIDC_JWKS_FILE")
+            .ok()
+            .map(PathBuf::from),
+        oidc_hmac_secret_file: std::env::var("DTRUNTIME_OIDC_HMAC_SECRET_FILE")
+            .ok()
+            .map(PathBuf::from),
+        oidc_public_key_file: std::env::var("DTRUNTIME_OIDC_PUBLIC_KEY_FILE")
+            .ok()
+            .map(PathBuf::from),
+        oidc_algorithm: std::env::var("DTRUNTIME_OIDC_ALGORITHM").ok(),
+        oidc_role_claim: std::env::var("DTRUNTIME_OIDC_ROLE_CLAIM").ok(),
+        spiffe_trust_domain: std::env::var("DTRUNTIME_SPIFFE_TRUST_DOMAIN").ok(),
+        spiffe_role_map_file: std::env::var("DTRUNTIME_SPIFFE_ROLE_MAP_FILE")
+            .ok()
+            .map(PathBuf::from),
+        disable_header_identity: std::env::var("DTRUNTIME_AUTH_DISABLE_HEADER_IDENTITY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        audit_log_file: std::env::var("DTRUNTIME_AUDIT_LOG_FILE")
+            .ok()
+            .map(PathBuf::from),
         status_addr: None,
         metrics_addr: None,
         s3_endpoint: std::env::var("DTRUNTIME_S3_ENDPOINT").ok(),
@@ -456,6 +652,46 @@ fn coordinator_args(
                 .ok_or("--auth-mode requires a value")?
                 .parse()
                 .map_err(|e: String| format!("invalid --auth-mode value: {e}"))?;
+        } else if arg == "--oidc-issuer" {
+            parsed.oidc_issuer = Some(args.next().ok_or("--oidc-issuer requires a value")?);
+        } else if arg == "--oidc-audience" {
+            parsed
+                .oidc_audiences
+                .push(args.next().ok_or("--oidc-audience requires a value")?);
+        } else if arg == "--oidc-jwks-file" {
+            parsed.oidc_jwks_file = Some(PathBuf::from(
+                args.next().ok_or("--oidc-jwks-file requires a path")?,
+            ));
+        } else if arg == "--oidc-hmac-secret-file" {
+            parsed.oidc_hmac_secret_file = Some(PathBuf::from(
+                args.next()
+                    .ok_or("--oidc-hmac-secret-file requires a path")?,
+            ));
+        } else if arg == "--oidc-public-key-file" {
+            parsed.oidc_public_key_file = Some(PathBuf::from(
+                args.next()
+                    .ok_or("--oidc-public-key-file requires a path")?,
+            ));
+        } else if arg == "--oidc-algorithm" {
+            parsed.oidc_algorithm = Some(args.next().ok_or("--oidc-algorithm requires a value")?);
+        } else if arg == "--oidc-role-claim" {
+            parsed.oidc_role_claim = Some(args.next().ok_or("--oidc-role-claim requires a value")?);
+        } else if arg == "--spiffe-trust-domain" {
+            parsed.spiffe_trust_domain = Some(
+                args.next()
+                    .ok_or("--spiffe-trust-domain requires a value")?,
+            );
+        } else if arg == "--spiffe-role-map-file" {
+            parsed.spiffe_role_map_file = Some(PathBuf::from(
+                args.next()
+                    .ok_or("--spiffe-role-map-file requires a path")?,
+            ));
+        } else if arg == "--auth-disable-header-identity" {
+            parsed.disable_header_identity = true;
+        } else if arg == "--audit-log-file" {
+            parsed.audit_log_file = Some(PathBuf::from(
+                args.next().ok_or("--audit-log-file requires a path")?,
+            ));
         } else if arg == "--tls-cert" {
             parsed.tls_cert = Some(PathBuf::from(
                 args.next().ok_or("--tls-cert requires a path")?,
@@ -561,6 +797,37 @@ mod tests {
                     .unwrap_or("disabled")
                     .parse()
                     .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
+                oidc_issuer: std::env::var("DTRUNTIME_OIDC_ISSUER").ok(),
+                oidc_audiences: std::env::var("DTRUNTIME_OIDC_AUDIENCE")
+                    .ok()
+                    .map(|v| {
+                        v.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                oidc_jwks_file: std::env::var("DTRUNTIME_OIDC_JWKS_FILE")
+                    .ok()
+                    .map(PathBuf::from),
+                oidc_hmac_secret_file: std::env::var("DTRUNTIME_OIDC_HMAC_SECRET_FILE")
+                    .ok()
+                    .map(PathBuf::from),
+                oidc_public_key_file: std::env::var("DTRUNTIME_OIDC_PUBLIC_KEY_FILE")
+                    .ok()
+                    .map(PathBuf::from),
+                oidc_algorithm: std::env::var("DTRUNTIME_OIDC_ALGORITHM").ok(),
+                oidc_role_claim: std::env::var("DTRUNTIME_OIDC_ROLE_CLAIM").ok(),
+                spiffe_trust_domain: std::env::var("DTRUNTIME_SPIFFE_TRUST_DOMAIN").ok(),
+                spiffe_role_map_file: std::env::var("DTRUNTIME_SPIFFE_ROLE_MAP_FILE")
+                    .ok()
+                    .map(PathBuf::from),
+                disable_header_identity: std::env::var("DTRUNTIME_AUTH_DISABLE_HEADER_IDENTITY")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+                audit_log_file: std::env::var("DTRUNTIME_AUDIT_LOG_FILE")
+                    .ok()
+                    .map(PathBuf::from),
                 status_addr: None,
                 metrics_addr: None,
                 storage_root: None,

@@ -1,0 +1,49 @@
+# cargo-deny configuration — supply-chain and vulnerability gating for the
+# Rust workspace. Run locally with `cargo deny check`; CI runs
+# `cargo deny check advisories bans sources` on every PR (see
+# .github/workflows/security-scan.yml).
+
+[advisories]
+# Fail on any crate with a known RUSTSEC advisory or that has been yanked.
+version = 2
+yanked = "deny"
+# Add specific advisory ids here only with a documented justification and a
+# tracking issue to remove them.
+ignore = []
+
+[bans]
+# Flag pulling in the same crate at many major versions (bloat / risk surface).
+multiple-versions = "warn"
+# Wildcard ("*") version requirements are forbidden — pin real ranges.
+wildcards = "deny"
+allow = []
+deny = []
+
+[sources]
+# Only crates.io and explicitly allowed git sources are permitted; anything
+# else (a random registry or git URL) fails the build.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[licenses]
+# License policy. Enforced locally; CI gates advisories/bans/sources (the
+# security-critical checks) so a new-but-acceptable license does not block a
+# security PR. Extend `allow` as new permissive licenses are pulled in.
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
