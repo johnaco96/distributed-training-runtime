@@ -1,0 +1,1 @@
+{"checkpoint_id":null,"dataset_id":null,"kind":"AuthMetadataAccepted","occurred_at_millis":1783140200873,"outcome":"Success","reason":"source=spiffe","request":"read_request","role":"admin","run_id":null,"schema":"dtruntime.audit.v1","subject":"spiffe://dtruntime.example.org/ns/dtruntime/sa/admin","worker_id":null}

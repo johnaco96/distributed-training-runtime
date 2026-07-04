@@ -1,0 +1,22 @@
+# SIEM ingestion harness: the coordinator writes NDJSON audit records to
+# ./audit/audit.ndjson; Vector tails them, parses the JSON, and ships them to
+# Loki. Query Loki to prove end-to-end ingestion.
+#
+#   docker compose up -d
+#   (run the coordinator with --audit-log-file tools/evidence/siem/audit/audit.ndjson)
+#   curl -sG http://localhost:3100/loki/api/v1/query_range --data-urlencode 'query={job="dtruntime-audit"}'
+services:
+  loki:
+    image: grafana/loki:3.0.0
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+
+  vector:
+    image: timberio/vector:0.39.0-debian
+    depends_on:
+      - loki
+    command: ["--config", "/etc/vector/vector.toml"]
+    volumes:
+      - ./vector.toml:/etc/vector/vector.toml:ro
+      - ./audit:/audit:ro

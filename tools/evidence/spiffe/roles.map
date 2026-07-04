@@ -1,0 +1,4 @@
+# SPIFFE path -> coordinator role (see docs/security-auth.md)
+/ns/dtruntime/sa/admin    = admin
+/ns/dtruntime/sa/operator = operator
+/workload/worker/*        = worker
