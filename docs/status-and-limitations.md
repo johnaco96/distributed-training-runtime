@@ -47,6 +47,12 @@ The following capabilities are implemented and locally validated:
   sdist/wheel (locally built), multi-arch container images (cosign keyless
   signing + SLSA provenance + SBOM), and a packaged Helm chart; `docs/RELEASING.md`,
   `CHANGELOG.md`. Cross-platform CI matrix (Linux/macOS/Windows + container build).
+- Documentation set with a categorized index (`docs/README.md`): a PyTorch
+  integration guide (`docs/pytorch-integration.md`), production deployment
+  (`docs/production-deployment.md`), failure recovery & operator actions
+  (`docs/failure-recovery-operations.md`), and a consolidated support matrix
+  (`docs/support-matrix.md`) covering frameworks, storage backends, schedulers,
+  platforms, and limits.
 - PostgreSQL HA via advisory lock (2-replica coordinator support).
 - SQLite and PostgreSQL metadata persistence backends.
 - Local Kubernetes manifests (`k8s/local/`) and secure local Kubernetes path (`k8s/local-secure/`).

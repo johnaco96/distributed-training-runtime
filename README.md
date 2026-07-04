@@ -234,6 +234,15 @@ cargo run -p runtime-bench -- logical-workers \
 
 ## Documentation
 
+**[📖 Documentation index](docs/README.md)** — start here. Highlights:
+
+- [Integrate an existing PyTorch script](docs/pytorch-integration.md)
+- [Production deployment](docs/production-deployment.md)
+- [Failure recovery & operator actions](docs/failure-recovery-operations.md)
+- [**Support matrix**](docs/support-matrix.md) (frameworks, storage, schedulers, platforms, limits)
+
+Full list:
+
 - [Quickstart](docs/quickstart.md)
 - [torch.distributed execution](docs/torch-distributed.md)
 - [Data pipeline](docs/data-pipeline.md)
