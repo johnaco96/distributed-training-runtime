@@ -44,8 +44,8 @@ See [metadata-persistence.md](metadata-persistence.md), [schema-migrations.md](s
 | System | Status | Integration |
 |---|---|---|
 | Kubernetes Jobs (`kubernetes`) | Validated on kind | Default operator backend (Indexed Jobs). |
-| Volcano (`volcano`) | Documented | Gang scheduling; rendered to Volcano's contract; not run against a live Volcano install. |
-| Kueue (`kueue`) | Documented | Queue admission; rendered to Kueue's contract; not run against a live Kueue install. |
+| Volcano (`volcano`) | Documented | Gang scheduling; rendered to Volcano's contract. Meaningful gang proof needs a multi-node cluster (see `tools/evidence/multinode`). |
+| Kueue (`kueue`) | **Validated vs live Kueue** | Queue admission proven against Kueue v0.8.1: the operator-rendered Jobs are quota-admitted/gated (`evidence/schedulers/`). |
 | Slurm | Documented (submitter) | `srun python -m dtruntime.launch …`. |
 | Ray | Documented (submitter) | Actors call the launcher / `torch_dist.init()`. |
 | SageMaker | Documented (submitter) | Container entrypoint execs the launcher. |
@@ -88,9 +88,9 @@ production container images target Linux. See
 |---|---|
 | TLS / mTLS | Validated |
 | OIDC / JWT bearer auth | Validated (local, minted tokens) |
-| SPIFFE X.509-SVID | Validated (local, generated certs) — not run vs a live SPIRE server |
+| SPIFFE X.509-SVID | **Validated vs real SPIRE** — a SPIRE-minted SVID authenticates over mTLS; unmapped SVID rejected (`evidence/spiffe/`) |
 | RBAC (admin/operator/viewer/worker) | Validated |
-| Audit → DB + NDJSON/SIEM | Validated (local) — not run vs a live SIEM |
+| Audit → DB + NDJSON/SIEM | **Validated end-to-end** — ingested into Loki via Vector (`evidence/siem/`) |
 | Secret/key hot rotation | Validated |
 
 See [security-auth.md](security-auth.md), [threat-model.md](threat-model.md).
@@ -102,8 +102,8 @@ See [security-auth.md](security-auth.md), [threat-model.md](threat-model.md).
   [benchmarks.md](benchmarks.md)). Local simulated scaling is **not** proof of
   cluster scale.
 - **Not validated on a managed cloud cluster at scale**, nor against live
-  Volcano/Kueue/SPIRE/SIEM/AWS-S3 deployments (contracts are followed; see the
-  status doc).
+  Volcano / AWS-S3 at scale. (SPIRE, Kueue, and SIEM ingestion **are** now proven
+  against the real software locally — see `evidence/`.)
 - **No web dashboard/UI** — the `dtruntime-admin` CLI is the operator surface.
 - **NCCL multi-node GPU** uses the same rendezvous protocol but is not yet
   cluster-proven.

@@ -1,0 +1,29 @@
+# A small quota so admission is observable: 1 CPU / 2Gi total.
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: default-flavor
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: dtruntime-cq
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: cpu
+              nominalQuota: "1"
+            - name: memory
+              nominalQuota: "2Gi"
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: dtruntime-lq
+  namespace: sched-demo
+spec:
+  clusterQueue: dtruntime-cq

@@ -1,0 +1,47 @@
+# Two Jobs mirroring exactly what the operator's Kueue backend renders:
+# label kueue.x-k8s.io/queue-name + suspend: true + resource requests. Each asks
+# for the full 1-CPU quota, so only one can be admitted at a time — proving real
+# Kueue quota admission.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dtruntime-job-a
+  namespace: sched-demo
+  labels:
+    kueue.x-k8s.io/queue-name: dtruntime-lq
+spec:
+  suspend: true
+  parallelism: 1
+  completions: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: "1"
+              memory: "512Mi"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dtruntime-job-b
+  namespace: sched-demo
+  labels:
+    kueue.x-k8s.io/queue-name: dtruntime-lq
+spec:
+  suspend: true
+  parallelism: 1
+  completions: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: "1"
+              memory: "512Mi"
