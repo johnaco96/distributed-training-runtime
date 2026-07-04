@@ -37,4 +37,8 @@ jobs:
           pip install -e ".[dev]"
           pip install pip-audit
       - name: Audit resolved dependencies
-        run: pip-audit --strict --progress-spinner off
+        # --skip-editable: the local editable dtruntime package is not on PyPI
+        # and is not a third-party dependency to audit. (--strict is omitted
+        # because it would fail merely because that editable package was
+        # skipped; a real vulnerable dependency still fails the run.)
+        run: pip-audit --skip-editable --progress-spinner off

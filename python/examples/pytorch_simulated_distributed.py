@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -183,7 +183,7 @@ def write_checkpoint(
         "checkpoint_path": ckpt_path.name,
         "epoch": epoch,
         "global_step": global_step,
-        "created_at": datetime.now(UTC).isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     (checkpoints_dir / "latest.json").write_text(json.dumps(latest, indent=2), encoding="utf-8")
     return ckpt_path
