@@ -1,0 +1,75 @@
+# Example production overrides:
+#   helm install dtruntime deploy/helm/dtruntime \
+#     -n dtruntime --create-namespace \
+#     -f deploy/helm/dtruntime/values-production.yaml \
+#     --set image.tag=0.1.0
+#
+# Prerequisites (create out of band):
+#   - Secret "postgres-credentials" with key DATABASE_URL
+#   - cert-manager installed (or provide tls.secretName yourself)
+#   - Prometheus Operator CRDs (for monitoring.*.enabled)
+
+image:
+  repository: ghcr.io/johnaco96/distributed-training-runtime
+  pullPolicy: IfNotPresent
+
+coordinator:
+  replicas: 2
+  maxS3ConcurrentOps: 128
+  persistence:
+    enabled: true
+    size: 50Gi
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+
+metadataStore:
+  backend: postgres
+  postgres:
+    existingSecret: postgres-credentials
+    dsnKey: DATABASE_URL
+
+auth:
+  mode: metadata
+  disableHeaderIdentity: true
+  oidc:
+    enabled: true
+    issuer: "https://issuer.example.com"
+    audiences: ["dtruntime"]
+    roleClaim: roles
+    jwksSecret: dtruntime-oidc-jwks   # Secret with key jwks.json
+  audit:
+    logFile: /var/lib/dtruntime/artifacts/audit.ndjson
+
+tls:
+  enabled: true
+  secretName: dtruntime-coordinator-tls
+  # For mTLS, also set clientCASecret to a Secret containing ca.crt.
+
+certManager:
+  enabled: true
+  issuerRef:
+    name: dtruntime-ca-issuer
+    kind: ClusterIssuer
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+    labels:
+      release: prometheus
+
+operator:
+  enabled: false

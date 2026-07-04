@@ -1,0 +1,26 @@
+dtruntime {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Coordinator service (gRPC):
+  {{ include "dtruntime.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.coordinator.grpcPort }}
+
+Metadata store: {{ .Values.metadataStore.backend }}
+{{- if eq .Values.metadataStore.backend "postgres" }}
+  HA enabled: {{ .Values.coordinator.replicas }} replicas (leader + standby via PostgreSQL advisory lock).
+  Ensure Secret "{{ .Values.metadataStore.postgres.existingSecret }}" (key "{{ .Values.metadataStore.postgres.dsnKey }}") exists.
+{{- else }}
+  WARNING: sqlite backend is single-replica and non-HA. Use postgres for production.
+{{- end }}
+
+Auth mode: {{ .Values.auth.mode }}
+{{- if .Values.auth.oidc.enabled }}  OIDC/JWT: enabled (issuer {{ .Values.auth.oidc.issuer }}){{- end }}
+{{- if .Values.auth.spiffe.enabled }}  SPIFFE: enabled (trust domain {{ .Values.auth.spiffe.trustDomain }}){{- end }}
+
+TLS: {{ if .Values.tls.enabled }}enabled (secret {{ .Values.tls.secretName }}){{ else }}DISABLED (not recommended for production){{ end }}
+
+Verify readiness:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "dtruntime.fullname" . }}
+
+Inspect from the Python SDK / CLI:
+  dtruntime-admin -a {{ include "dtruntime.fullname" . }}.{{ .Release.Namespace }}:{{ .Values.coordinator.grpcPort }} runs list
+
+Full deployment guide: docs/production-deployment.md

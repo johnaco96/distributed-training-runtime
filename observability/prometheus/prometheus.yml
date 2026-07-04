@@ -1,5 +1,18 @@
 global:
   scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Recording rules (SLIs) and alerting rules. See docs/slos.md and
+# docs/runbooks-oncall.md.
+rule_files:
+  - recording.rules.yml
+  - alerts.rules.yml
+
+# Wire Alertmanager here in production (left unset for the local demo).
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
 
 scrape_configs:
   - job_name: dtruntime-coordinator

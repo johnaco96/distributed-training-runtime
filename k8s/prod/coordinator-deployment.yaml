@@ -36,19 +36,48 @@ spec:
     metadata:
       labels:
         app: runtime-coordinator
+        app.kubernetes.io/component: coordinator
     spec:
+      serviceAccountName: runtime-coordinator
+      # Spread the leader + standby across nodes so one node failure cannot
+      # take out both replicas.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: runtime-coordinator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: coordinator
           image: distributed-training-runtime:prod
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args:
             - "--addr"
             - "0.0.0.0:50051"
             - "--storage-root"
-            - "/tmp/dtr-artifacts"
+            - "/var/lib/dtruntime/artifacts"
+            - "--metrics-addr"
+            - "0.0.0.0:9090"
             # PostgreSQL DSN — enables HA advisory lock + durable metadata
             - "--metadata-db-url"
             - "$(DTRUNTIME_METADATA_DB_URL)"
+            # Enforce authorization; reject caller-asserted header identity.
+            - "--auth-mode"
+            - "metadata"
+            - "--auth-disable-header-identity"
             # Gap 4: TLS certificate provisioned by cert-manager
             - "--tls-cert"
             - "/tls/tls.crt"
@@ -66,7 +95,11 @@ spec:
           ports:
             - containerPort: 50051
               name: grpc
+            - containerPort: 9090
+              name: metrics
           volumeMounts:
+            - name: artifacts
+              mountPath: /var/lib/dtruntime/artifacts
             # Gap 4: TLS certificate secret mounted from cert-manager
             - name: tls
               mountPath: /tls
@@ -94,6 +127,10 @@ spec:
               cpu: "500m"
               memory: "512Mi"
       volumes:
+        # Writable staging area for checkpoint artifacts (root fs is read-only).
+        # Swap for a PVC to persist artifacts across restarts.
+        - name: artifacts
+          emptyDir: {}
         - name: tls
           secret:
             secretName: dtruntime-coordinator-tls

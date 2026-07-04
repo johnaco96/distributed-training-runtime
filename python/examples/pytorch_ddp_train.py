@@ -44,10 +44,27 @@ def build_model() -> nn.Module:
     return nn.Sequential(nn.Linear(32, 64), nn.ReLU(), nn.Linear(64, 4))
 
 
-def train(ctx: torch_dist.TrainingContext, steps: int, report: dict) -> None:
+def train(ctx: torch_dist.TrainingContext, steps: int, report: dict, args) -> None:
     model = ctx.wrap_model(build_model(), strategy="ddp")
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     loss_fn = nn.CrossEntropyLoss()
+
+    checkpointer = None
+    restored_step = -1
+    if args.checkpoint or args.restore:
+        from dtruntime.checkpointing import DistributedCheckpointer
+
+        checkpointer = DistributedCheckpointer(ctx)
+    if args.restore and checkpointer is not None:
+        restored = checkpointer.restore(model, optimizer)
+        if restored is not None:
+            restored_step = restored.step
+            report["restored_step"] = restored.step
+            report["restored_checkpoint_id"] = restored.checkpoint_id
+            print(
+                f"[rank {ctx.rank}] restored {restored.checkpoint_id} (step {restored.step})",
+                flush=True,
+            )
 
     fail_rank = int(os.environ.get("DTRUNTIME_TEST_FAIL_RANK", "-1"))
     fail_step = int(os.environ.get("DTRUNTIME_TEST_FAIL_STEP", "-1"))
@@ -56,7 +73,8 @@ def train(ctx: torch_dist.TrainingContext, steps: int, report: dict) -> None:
     generator = torch.Generator().manual_seed(1234 + ctx.rank)
     step_delay = float(os.environ.get("DTRUNTIME_TEST_STEP_DELAY", "0"))
     loss_value = float("nan")
-    for step in range(steps):
+    last_saved_step = -1
+    for step in range(restored_step + 1, steps):
         ctx.raise_if_membership_changed()
         if step_delay:
             time.sleep(step_delay)
@@ -76,6 +94,23 @@ def train(ctx: torch_dist.TrainingContext, steps: int, report: dict) -> None:
         optimizer.step()
         loss_value = float(loss.detach())
 
+        if (
+            checkpointer is not None
+            and args.checkpoint
+            and args.checkpoint_every > 0
+            and step > restored_step
+            and (step + 1) % args.checkpoint_every == 0
+        ):
+            if args.checkpoint_async:
+                # All ranks stage at the same step; upload/commit overlaps the
+                # next training steps.
+                pending = checkpointer.save_async(model, optimizer, step=step)
+                pending.result(timeout=600)
+            else:
+                checkpointer.save(model, optimizer, step=step)
+            report.setdefault("saved_steps", []).append(step)
+            last_saved_step = step
+
     # Prove the replicas stayed synchronised: after identical updates the
     # parameter sum must agree across ranks (gather to compare on rank 0).
     param_sum = torch.tensor([sum(p.sum().item() for p in model.parameters())])
@@ -90,6 +125,7 @@ def train(ctx: torch_dist.TrainingContext, steps: int, report: dict) -> None:
             "round": ctx.rendezvous_round,
             "steps": steps,
             "final_loss": loss_value,
+            "param_sum": float(param_sum.item()),
             "param_sum_spread": max_spread,
         }
     )
@@ -99,18 +135,45 @@ def train(ctx: torch_dist.TrainingContext, steps: int, report: dict) -> None:
         flush=True,
     )
 
+    if checkpointer is not None and args.checkpoint:
+        if last_saved_step != steps - 1:
+            checkpointer.save(model, optimizer, step=steps - 1)
+            report.setdefault("saved_steps", []).append(steps - 1)
+        if os.environ.get("DTRUNTIME_TEST_EXIT_AFTER_SAVE") == "1":
+            # Test hook: die without deregistering so the run stays live and a
+            # later launch can resume it from the committed checkpoint.
+            print(f"[rank {ctx.rank}] exiting after save (test hook)", flush=True)
+            if test_dir:
+                out = Path(test_dir) / f"report-{os.environ.get('DTRUNTIME_WORKER_ID', 'w')}.json"
+                out.write_text(json.dumps(report), encoding="utf-8")
+            os._exit(0)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--max-rejoin", type=int, default=10)
+    parser.add_argument(
+        "--checkpoint", action="store_true", help="save distributed checkpoints"
+    )
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=0, help="also save every N steps"
+    )
+    parser.add_argument(
+        "--checkpoint-async",
+        action="store_true",
+        help="use async staging for periodic saves",
+    )
+    parser.add_argument(
+        "--restore", action="store_true", help="restore the latest committed checkpoint"
+    )
     args = parser.parse_args()
 
     report: dict = {}
     ctx = torch_dist.init()
     try:
         ctx.run_elastic(
-            lambda c: train(c, args.steps, report),
+            lambda c: train(c, args.steps, report, args),
             max_rejoin=args.max_rejoin,
             collective_error_grace=float(os.environ.get("DTRUNTIME_TEST_GRACE", "150")),
         )

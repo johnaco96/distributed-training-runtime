@@ -1,0 +1,40 @@
+name: Security scan
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  schedule:
+    # Weekly, so newly-published advisories are caught even without a PR.
+    - cron: "0 6 * * 1"
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # Security-critical checks. `licenses` is enforced locally via
+          # deny.toml but not gated in CI to avoid blocking a security PR on a
+          # newly-introduced but acceptable license.
+          command: check advisories bans sources
+
+  pip-audit:
+    name: pip-audit (Python dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package and pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install pip-audit
+      - name: Audit resolved dependencies
+        run: pip-audit --strict --progress-spinner off

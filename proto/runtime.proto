@@ -38,9 +38,43 @@ service CoordinatorService {
   // failure deadline) and feeds the run lifecycle state machine.
   rpc DeregisterWorker(DeregisterWorkerRequest) returns (DeregisterWorkerResponse);
 
+  // Download a checkpoint artifact through the coordinator's storage backend.
+  // This is the restore data plane for multi-machine training: workers on any
+  // node can read artifacts regardless of whether the coordinator stores them
+  // on its local filesystem or in S3.
+  rpc FetchCheckpointArtifact(FetchCheckpointArtifactRequest) returns (stream FetchCheckpointArtifactChunk);
+
+  // List checkpoints for a run (newest step first), including their states.
+  // Used for corrupt-checkpoint fallback and admin inspection.
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+
+  // Report a committed checkpoint as corrupt (checksum mismatch or unreadable
+  // artifacts observed during restore).  The checkpoint is marked FAILED and
+  // the latest-checkpoint pointer falls back to the newest remaining
+  // committed checkpoint.
+  rpc ReportCheckpointCorrupt(ReportCheckpointCorruptRequest) returns (ReportCheckpointCorruptResponse);
+
   // Cancel a run (admin).  Terminal: workers observe RUN_STATE_CANCELLED on
   // their next heartbeat and exit; launchers stop restarting workers.
   rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+
+  // ── admin run lifecycle ────────────────────────────────────────────────
+  // Pause a run: workers keep heartbeating but observe RUN_STATE_PAUSED and
+  // stop advancing training at the next step boundary.
+  rpc PauseRun(RunActionRequest) returns (RunActionResponse);
+  // Resume a paused run back to running.
+  rpc ResumeRun(RunActionRequest) returns (RunActionResponse);
+  // Retry a failed run: reset it to PENDING so workers re-register and resume
+  // from the latest committed checkpoint.  Increments the retry counter.
+  rpc RetryRun(RunActionRequest) returns (RunActionResponse);
+  // Drain a run: workers finish their current work, checkpoint, and exit
+  // gracefully; the run completes when the roster empties.
+  rpc DrainRun(RunActionRequest) returns (RunActionResponse);
+
+  // ── admin inspection ───────────────────────────────────────────────────
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+  rpc ListShardProgress(ListShardProgressRequest) returns (ListShardProgressResponse);
 }
 
 // Durable run lifecycle.  Persisted to the metadata store and rehydrated on
@@ -65,6 +99,12 @@ enum RunState {
   RUN_STATE_COMPLETED = 4;
   RUN_STATE_FAILED = 5;
   RUN_STATE_CANCELLED = 6;
+  // Administratively paused; workers keep heartbeating but do not advance
+  // training.  Resumes to RUNNING.  Not terminal.
+  RUN_STATE_PAUSED = 7;
+  // Draining: workers finish current work, checkpoint, and exit; the run
+  // completes when the roster empties.  Not terminal.
+  RUN_STATE_DRAINING = 8;
 }
 
 message ProtocolVersion {
@@ -250,6 +290,11 @@ message ShardAssignment {
   google.protobuf.Timestamp lease_expires_at = 7;
   int64 progress_offset = 8;
   string shard_uri = 9;
+  // Integrity metadata carried from registration so the data pipeline can
+  // verify shard bytes on download without a second RPC.
+  string checksum = 10;
+  string checksum_algorithm = 11;
+  int64 size_bytes = 12;
 }
 
 message GetShardAssignmentResponse {
@@ -448,6 +493,56 @@ message DeregisterWorkerResponse {
   google.protobuf.Timestamp server_time = 3;
 }
 
+message FetchCheckpointArtifactRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  string artifact_name = 4;
+  // Owner of the artifact (artifacts are stored per uploading worker).
+  WorkerId owner_worker_id = 5;
+}
+
+message FetchCheckpointArtifactChunk {
+  bytes data = 1;
+  uint64 sequence = 2;
+  // Set on the final chunk: total bytes and the artifact checksum for
+  // client-side integrity verification.
+  bool last = 3;
+  int64 total_size_bytes = 4;
+  string checksum = 5;
+  string checksum_algorithm = 6;
+}
+
+message ListCheckpointsRequest {
+  RunId run_id = 1;
+  // Only return checkpoints in COMMITTED state.
+  bool committed_only = 2;
+  // 0 = no limit.
+  uint32 limit = 3;
+}
+
+message ListCheckpointsResponse {
+  // Newest step first.
+  repeated CheckpointManifest checkpoints = 1;
+}
+
+message ReportCheckpointCorruptRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  // What was observed (checksum mismatch, missing artifact, ...).
+  string reason = 4;
+  string idempotency_key = 5;
+}
+
+message ReportCheckpointCorruptResponse {
+  // State of the reported checkpoint after the report (FAILED).
+  CheckpointState state = 1;
+  // The new latest committed checkpoint for the run, if any remains.
+  CheckpointId fallback_checkpoint_id = 2;
+  bool has_fallback = 3;
+}
+
 message CancelRunRequest {
   RunId run_id = 1;
   string reason = 2;
@@ -456,6 +551,89 @@ message CancelRunRequest {
 
 message CancelRunResponse {
   RunState state = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+// ─── admin lifecycle + inspection ────────────────────────────────────────────
+
+// Shared request/response for pause/resume/retry/drain.
+message RunActionRequest {
+  RunId run_id = 1;
+  string reason = 2;
+  string idempotency_key = 3;
+}
+
+message RunActionResponse {
+  RunState state = 1;
+  string state_reason = 2;
+  google.protobuf.Timestamp server_time = 3;
+}
+
+message RunSummary {
+  RunId run_id = 1;
+  string run_name = 2;
+  RunState state = 3;
+  string state_reason = 4;
+  uint32 world_size = 5;
+  uint32 active_worker_count = 6;
+  CheckpointId latest_checkpoint_id = 7;
+  CheckpointState latest_checkpoint_state = 8;
+  uint32 retry_count = 9;
+  google.protobuf.Timestamp registered_at = 10;
+}
+
+message ListRunsRequest {
+  // Only return runs in this state (RUN_STATE_UNSPECIFIED = all).  Filtering
+  // to RUN_STATE_RUNNING lists active jobs; RUN_STATE_FAILED lists failures.
+  RunState state_filter = 1;
+}
+
+message ListRunsResponse {
+  repeated RunSummary runs = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+message WorkerInfo {
+  WorkerId worker_id = 1;
+  uint32 rank = 2;
+  string host = 3;
+  WorkerState state = 4;
+  string sdk_version = 5;
+  google.protobuf.Timestamp last_heartbeat_at = 6;
+  google.protobuf.Timestamp next_heartbeat_deadline = 7;
+  google.protobuf.Timestamp failure_deadline = 8;
+}
+
+message ListWorkersRequest {
+  RunId run_id = 1;
+  // Only return workers in this state (WORKER_STATE_UNSPECIFIED = all).
+  // Filtering to WORKER_STATE_FAILED lists failed workers.
+  WorkerState state_filter = 2;
+}
+
+message ListWorkersResponse {
+  repeated WorkerInfo workers = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+message ShardProgressInfo {
+  ShardId shard_id = 1;
+  DatasetId dataset_id = 2;
+  WorkerId worker_id = 3;
+  uint64 lease_epoch = 4;
+  int64 progress_offset = 5;
+  bool is_complete = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message ListShardProgressRequest {
+  RunId run_id = 1;
+  // Optional: restrict to one dataset (empty = all datasets for the run).
+  DatasetId dataset_id = 2;
+}
+
+message ListShardProgressResponse {
+  repeated ShardProgressInfo shards = 1;
   google.protobuf.Timestamp server_time = 2;
 }
 

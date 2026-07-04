@@ -121,6 +121,9 @@ pub struct RunRecord {
     /// When `state` last changed (in-memory only; used for retention cleanup
     /// of terminal runs — the clock restarts after a coordinator restart).
     pub state_updated_at: SystemTime,
+    /// Number of times this run has been administratively retried after a
+    /// failure (persisted).
+    pub retry_count: u32,
 }
 
 impl RunRecord {
@@ -235,6 +238,9 @@ pub struct ShardAssignmentRecord {
     pub lease_expires_at: SystemTime,
     pub progress_offset: i64,
     pub shard_uri: String,
+    pub checksum: String,
+    pub checksum_algorithm: String,
+    pub size_bytes: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -358,8 +364,31 @@ pub enum DeregisterWorkerError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListCheckpointsError {
+    RunNotFound,
+    PersistenceUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportCorruptError {
+    RunNotFound,
+    CheckpointNotFound,
+    PersistenceUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CancelRunError {
     RunNotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunActionError {
+    RunNotFound,
+    /// The action is not valid from the run's current state.
+    InvalidState {
+        current: i32,
+        action: &'static str,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -843,25 +872,22 @@ impl CoordinatorState {
                 now_millis,
             )
             .map_err(map_checkpoint_error)?;
-        let duplicate_reports = record
+        // Dedupe per (worker, artifact_name): a worker may legitimately report
+        // several distinct artifacts (distributed checkpoint formats write
+        // multiple files per rank), but re-reporting the *same* artifact name
+        // must carry identical metadata (idempotent retry) — anything else is
+        // a conflict.
+        let latest = record
             .checkpoint
             .artifacts
+            .last()
+            .expect("artifact list must contain at least one item")
+            .clone();
+        let last_index = record.checkpoint.artifacts.len() - 1;
+        if let Some(first) = record.checkpoint.artifacts[..last_index]
             .iter()
-            .filter(|a| a.worker_id.0 == worker_id)
-            .count();
-        if duplicate_reports > 1 {
-            let latest = record
-                .checkpoint
-                .artifacts
-                .last()
-                .expect("artifact list must contain at least one item")
-                .clone();
-            let first = record
-                .checkpoint
-                .artifacts
-                .iter()
-                .find(|a| a.worker_id.0 == worker_id)
-                .expect("worker artifact must exist");
+            .find(|a| a.worker_id.0 == worker_id && a.artifact_name == latest.artifact_name)
+        {
             if first != &latest {
                 return Err(ReportCheckpointArtifactError::InvalidInput(
                     "worker already reported conflicting artifact metadata",
@@ -966,13 +992,13 @@ impl CoordinatorState {
             let commit_count = set.len();
             drop(set);
 
-            // Check whether all workers have voted by comparing against the
-            // expected artifact count (which equals world_size at begin_checkpoint).
+            // Check whether every worker registered at begin_checkpoint has
+            // voted.
             let checkpoints = checkpoints_arc.read().unwrap();
             let record = checkpoints
                 .get(&checkpoint_id)
                 .ok_or(CommitCheckpointError::CheckpointNotFound)?;
-            commit_count >= record.expected_artifact_count as usize
+            commit_count >= record.expected_worker_ids.len()
         } else {
             // Legacy path: no worker_id supplied → skip vote-count gate and
             // rely solely on artifact completeness (backward compatible).
@@ -1014,12 +1040,14 @@ impl CoordinatorState {
         if record.checkpoint.artifacts.is_empty() {
             return Err(CommitCheckpointError::InvalidState);
         }
-        if record.expected_artifact_count == 0 {
+        if record.expected_worker_ids.is_empty() {
             return Err(CommitCheckpointError::InvalidState);
         }
-        if record.checkpoint.artifacts.len() != record.expected_artifact_count as usize {
-            return Err(CommitCheckpointError::InvalidState);
-        }
+        // Completeness = per-worker coverage, not a fixed artifact count:
+        // distributed checkpoint formats (e.g. torch DCP) legitimately write a
+        // variable number of files per rank (rank 0 adds metadata files).
+        // Every worker registered at begin must have reported at least one
+        // artifact, and no artifacts may come from unexpected workers.
         let reported_workers: std::collections::BTreeSet<String> = record
             .checkpoint
             .artifacts
@@ -1130,6 +1158,194 @@ impl CoordinatorState {
         Ok(record)
     }
 
+    /// All checkpoints for a run, newest step first.  Uses the durable store
+    /// when configured (so pre-restart checkpoints are included), otherwise
+    /// the in-memory records.
+    pub fn list_checkpoints(
+        &self,
+        run_id: &str,
+        committed_only: bool,
+        limit: usize,
+    ) -> Result<Vec<CoordinatorCheckpointRecord>, ListCheckpointsError> {
+        if !self.runs.contains_key(run_id) {
+            return Err(ListCheckpointsError::RunNotFound);
+        }
+        let mut records = if let Some(store) = &self.metadata_store {
+            store
+                .load_checkpoints_for_run(run_id)
+                .map_err(|_| ListCheckpointsError::PersistenceUnavailable)?
+        } else {
+            let mut records: Vec<CoordinatorCheckpointRecord> = self
+                .checkpoints_by_run
+                .get(run_id)
+                .map(|arc| arc.read().unwrap().values().cloned().collect())
+                .unwrap_or_default();
+            records.sort_by(|a, b| {
+                b.checkpoint.step.cmp(&a.checkpoint.step).then_with(|| {
+                    b.checkpoint
+                        .checkpoint_id
+                        .0
+                        .cmp(&a.checkpoint.checkpoint_id.0)
+                })
+            });
+            records
+        };
+        if committed_only {
+            records.retain(|r| r.checkpoint.state == DomainCheckpointState::Committed);
+        }
+        if limit > 0 {
+            records.truncate(limit);
+        }
+        Ok(records)
+    }
+
+    /// Mark a checkpoint corrupt: the record becomes FAILED and the run's
+    /// latest-checkpoint pointer falls back to the newest remaining committed
+    /// checkpoint.  Returns the fallback checkpoint id, if any remains.
+    pub fn report_checkpoint_corrupt(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+        reason: &str,
+    ) -> Result<Option<String>, ReportCorruptError> {
+        if !self.runs.contains_key(run_id) {
+            return Err(ReportCorruptError::RunNotFound);
+        }
+        let known_in_memory = self
+            .checkpoints_by_run
+            .get(run_id)
+            .map(|arc| arc.read().unwrap().contains_key(checkpoint_id))
+            .unwrap_or(false);
+        let known_in_store = if let Some(store) = &self.metadata_store {
+            store
+                .load_checkpoints_for_run(run_id)
+                .map_err(|_| ReportCorruptError::PersistenceUnavailable)?
+                .iter()
+                .any(|r| r.checkpoint.checkpoint_id.0 == checkpoint_id)
+        } else {
+            false
+        };
+        if !known_in_memory && !known_in_store {
+            return Err(ReportCorruptError::CheckpointNotFound);
+        }
+
+        tracing::warn!(
+            run_id = %run_id,
+            checkpoint_id = %checkpoint_id,
+            reason = %reason,
+            "checkpoint reported corrupt; marking failed and recomputing latest"
+        );
+
+        // Fail the record in memory and in the store.
+        if let Some(arc) = self.checkpoints_by_run.get(run_id) {
+            if let Some(record) = arc.write().unwrap().get_mut(checkpoint_id) {
+                record.checkpoint.state = DomainCheckpointState::Failed;
+            }
+        }
+        if let Some(store) = &self.metadata_store {
+            store
+                .mark_checkpoint_failed(run_id, checkpoint_id)
+                .map_err(|_| ReportCorruptError::PersistenceUnavailable)?;
+        }
+
+        // Recompute the latest committed checkpoint, excluding the failed one.
+        let fallback = self
+            .list_checkpoints(run_id, true, 0)
+            .map_err(|_| ReportCorruptError::PersistenceUnavailable)?
+            .into_iter()
+            .find(|r| r.checkpoint.checkpoint_id.0 != checkpoint_id);
+
+        if let Some(mut run) = self.runs.get_mut(run_id) {
+            match &fallback {
+                Some(record) => {
+                    run.latest_checkpoint_id = Some(CheckpointId {
+                        value: record.checkpoint.checkpoint_id.0.clone(),
+                    });
+                    run.latest_checkpoint_state = CheckpointState::Committed as i32;
+                }
+                None => {
+                    run.latest_checkpoint_id = None;
+                    run.latest_checkpoint_state = CheckpointState::Unspecified as i32;
+                }
+            }
+        }
+        if let Some(store) = &self.metadata_store {
+            let latest = fallback.as_ref().map(|record| {
+                (
+                    record.checkpoint.checkpoint_id.0.as_str(),
+                    record.committed_at_millis.unwrap_or_default(),
+                )
+            });
+            store
+                .set_latest_checkpoint(run_id, latest)
+                .map_err(|_| ReportCorruptError::PersistenceUnavailable)?;
+        }
+
+        Ok(fallback.map(|r| r.checkpoint.checkpoint_id.0))
+    }
+
+    /// Retention/GC policy: keep the newest `keep_last` committed checkpoints
+    /// per run and drop the rest (records in memory + store).  Returns the
+    /// (run_id, checkpoint_id) pairs removed so the caller can delete their
+    /// artifacts from storage.  Non-committed (failed/aborted) checkpoints
+    /// older than the newest committed one are also collected.
+    pub fn enforce_checkpoint_retention(&self, keep_last: usize) -> Vec<(String, String)> {
+        if keep_last == 0 {
+            return Vec::new();
+        }
+        let run_ids: Vec<String> = self.runs.iter().map(|r| r.key().clone()).collect();
+        let mut removed = Vec::new();
+        for run_id in run_ids {
+            let Ok(records) = self.list_checkpoints(&run_id, false, 0) else {
+                continue;
+            };
+            let mut committed_seen = 0usize;
+            let mut doomed: Vec<String> = Vec::new();
+            for record in &records {
+                if record.checkpoint.state == DomainCheckpointState::Committed {
+                    committed_seen += 1;
+                    if committed_seen > keep_last {
+                        doomed.push(record.checkpoint.checkpoint_id.0.clone());
+                    }
+                } else if record.checkpoint.state == DomainCheckpointState::Failed
+                    || record.checkpoint.state == DomainCheckpointState::Aborted
+                {
+                    // Failed/aborted checkpoints are only GC'd once at least
+                    // one newer committed checkpoint exists, so an operator
+                    // can still inspect a fresh failure.
+                    if committed_seen >= 1 {
+                        doomed.push(record.checkpoint.checkpoint_id.0.clone());
+                    }
+                }
+            }
+            for checkpoint_id in doomed {
+                if let Some(arc) = self.checkpoints_by_run.get(&run_id) {
+                    arc.write().unwrap().remove(&checkpoint_id);
+                }
+                if let Some(store) = &self.metadata_store {
+                    if let Err(e) = store.delete_checkpoint(&run_id, &checkpoint_id) {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            checkpoint_id = %checkpoint_id,
+                            error = %e,
+                            "checkpoint retention: failed to delete rows (will retry next sweep)"
+                        );
+                        continue;
+                    }
+                }
+                self.checkpoint_commits
+                    .remove(&(run_id.clone(), checkpoint_id.clone()));
+                tracing::info!(
+                    run_id = %run_id,
+                    checkpoint_id = %checkpoint_id,
+                    "checkpoint retention: removed checkpoint records"
+                );
+                removed.push((run_id.clone(), checkpoint_id));
+            }
+        }
+        removed
+    }
+
     pub fn register_run(&self, request: RegisterRunRequest) -> RegisteredRun {
         // Atomic idempotency check.
         if !request.idempotency_key.is_empty() {
@@ -1168,6 +1384,7 @@ impl CoordinatorState {
             state_reason: String::new(),
             idempotency_key: request.idempotency_key.clone(),
             state_updated_at: registered_at,
+            retry_count: 0,
         };
 
         self.runs.insert(run_id.clone(), record.clone());
@@ -1405,6 +1622,193 @@ impl CoordinatorState {
         };
         self.set_run_state(run_id, RunState::Cancelled, reason);
         Ok(self.runs.get(run_id).map(|r| r.state).unwrap_or_default())
+    }
+
+    // ── admin run lifecycle ──────────────────────────────────────────────────
+
+    /// Directly set a run's state + reason and persist, bypassing the terminal
+    /// guard in [`set_run_state`].  Used by admin actions that legitimately
+    /// move out of/into otherwise-guarded states (e.g. retry: FAILED→PENDING).
+    /// Returns the new state and reason.
+    fn force_run_state(
+        &self,
+        run_id: &str,
+        state: RunState,
+        reason: impl Into<String>,
+    ) -> (i32, String) {
+        let snapshot = {
+            let mut run = self.runs.get_mut(run_id).expect("run exists");
+            run.state = state as i32;
+            run.state_reason = reason.into();
+            run.state_updated_at = SystemTime::now();
+            run.clone()
+        };
+        tracing::info!(run_id = %run_id, state = ?state, reason = %snapshot.state_reason, "admin run state transition");
+        self.persist_run(&snapshot);
+        (snapshot.state, snapshot.state_reason)
+    }
+
+    fn run_state(&self, run_id: &str) -> Option<i32> {
+        self.runs.get(run_id).map(|r| r.state)
+    }
+
+    /// Pause a live run.  Workers keep heartbeating but observe PAUSED.
+    pub fn pause_run(&self, run_id: &str, reason: &str) -> Result<(i32, String), RunActionError> {
+        let current = self.run_state(run_id).ok_or(RunActionError::RunNotFound)?;
+        match RunState::try_from(current) {
+            Ok(RunState::Pending) | Ok(RunState::Running) | Ok(RunState::Recovering) => {
+                let msg = if reason.is_empty() {
+                    "paused by administrator".to_string()
+                } else {
+                    format!("paused: {reason}")
+                };
+                Ok(self.force_run_state(run_id, RunState::Paused, msg))
+            }
+            _ => Err(RunActionError::InvalidState {
+                current,
+                action: "pause",
+            }),
+        }
+    }
+
+    /// Resume a paused run.  Returns to RUNNING when workers are present,
+    /// otherwise PENDING so a fresh launch can form the process group.
+    pub fn resume_run(&self, run_id: &str) -> Result<(i32, String), RunActionError> {
+        let current = self.run_state(run_id).ok_or(RunActionError::RunNotFound)?;
+        if RunState::try_from(current) != Ok(RunState::Paused) {
+            return Err(RunActionError::InvalidState {
+                current,
+                action: "resume",
+            });
+        }
+        let active = self
+            .runs
+            .get(run_id)
+            .map(|r| r.active_worker_count)
+            .unwrap_or(0);
+        let target = if active > 0 {
+            RunState::Running
+        } else {
+            RunState::Pending
+        };
+        Ok(self.force_run_state(run_id, target, "resumed by administrator"))
+    }
+
+    /// Retry a failed run: reset to PENDING, bump the retry counter, and clear
+    /// the stale worker roster + rendezvous so a fresh launch forms a clean
+    /// process group (and resumes from the latest committed checkpoint).
+    pub fn retry_run(&self, run_id: &str) -> Result<(i32, String, u32), RunActionError> {
+        let current = self.run_state(run_id).ok_or(RunActionError::RunNotFound)?;
+        if RunState::try_from(current) != Ok(RunState::Failed) {
+            return Err(RunActionError::InvalidState {
+                current,
+                action: "retry",
+            });
+        }
+        let retry_count = {
+            let mut run = self.runs.get_mut(run_id).expect("run exists");
+            run.retry_count += 1;
+            run.retry_count
+        };
+        self.workers_by_run.remove(run_id);
+        self.rendezvous_by_run.remove(run_id);
+        if let Some(mut run) = self.runs.get_mut(run_id) {
+            run.active_worker_count = 0;
+        }
+        let (state, reason) = self.force_run_state(
+            run_id,
+            RunState::Pending,
+            format!("retry #{retry_count} by administrator"),
+        );
+        Ok((state, reason, retry_count))
+    }
+
+    /// Drain a run: workers finish current work, checkpoint, and exit; the run
+    /// completes when the roster empties.
+    pub fn drain_run(&self, run_id: &str, reason: &str) -> Result<(i32, String), RunActionError> {
+        let current = self.run_state(run_id).ok_or(RunActionError::RunNotFound)?;
+        match RunState::try_from(current) {
+            Ok(RunState::Pending)
+            | Ok(RunState::Running)
+            | Ok(RunState::Recovering)
+            | Ok(RunState::Paused) => {
+                let msg = if reason.is_empty() {
+                    "draining by administrator".to_string()
+                } else {
+                    format!("draining: {reason}")
+                };
+                Ok(self.force_run_state(run_id, RunState::Draining, msg))
+            }
+            _ => Err(RunActionError::InvalidState {
+                current,
+                action: "drain",
+            }),
+        }
+    }
+
+    // ── admin inspection ─────────────────────────────────────────────────────
+
+    /// All runs (optionally filtered to one state), newest registration first.
+    pub fn list_runs(&self, state_filter: Option<i32>) -> Vec<RunRecord> {
+        let mut runs: Vec<RunRecord> = self
+            .runs
+            .iter()
+            .filter(|r| state_filter.is_none_or(|s| r.state == s))
+            .map(|r| r.clone())
+            .collect();
+        runs.sort_by(|a, b| {
+            b.registered_at
+                .cmp(&a.registered_at)
+                .then(a.run_id.cmp(&b.run_id))
+        });
+        runs
+    }
+
+    /// Workers for a run (optionally filtered to one state), by rank then id.
+    ///
+    /// Returns `None` only when the run itself does not exist; a run with no
+    /// registered workers (e.g. still PENDING, or just retried) yields
+    /// `Some(vec![])` so callers can tell "unknown run" from "no workers yet".
+    pub fn list_workers(
+        &self,
+        run_id: &str,
+        state_filter: Option<i32>,
+    ) -> Option<Vec<WorkerRecord>> {
+        if !self.runs.contains_key(run_id) {
+            return None;
+        }
+        let mut workers: Vec<WorkerRecord> = match self.workers_by_run.get(run_id) {
+            Some(arc) => arc
+                .read()
+                .unwrap()
+                .values()
+                .filter(|w| state_filter.is_none_or(|s| w.state == s))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        workers.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.worker_id.cmp(&b.worker_id)));
+        Some(workers)
+    }
+
+    /// Shard-progress / lease records for a run (optionally one dataset).
+    pub fn list_shard_progress(
+        &self,
+        run_id: &str,
+        dataset_id: Option<&str>,
+    ) -> Vec<ShardProgressRecord> {
+        let mut out: Vec<ShardProgressRecord> = self
+            .shard_progress
+            .iter()
+            .filter(|e| e.run_id == run_id && dataset_id.is_none_or(|d| e.dataset_id == d))
+            .map(|e| e.clone())
+            .collect();
+        out.sort_by(|a, b| {
+            a.dataset_id
+                .cmp(&b.dataset_id)
+                .then(a.shard_id.cmp(&b.shard_id))
+        });
+        out
     }
 
     /// Stuck-run detection: a non-terminal run whose entire roster has been
@@ -1805,6 +2209,9 @@ impl CoordinatorState {
                     .map(|p| p.progress_offset)
                     .unwrap_or_default(),
                 shard_uri: shard.shard_uri,
+                checksum: shard.checksum,
+                checksum_algorithm: shard.checksum_algorithm,
+                size_bytes: shard.size_bytes,
             })
             .collect();
 
@@ -3679,6 +4086,163 @@ mod tests {
     }
 
     #[test]
+    fn pause_then_resume_round_trips_through_state() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+
+        // Pending -> Paused.
+        let (paused, reason) = state.pause_run(&run_id.value, "maintenance").unwrap();
+        assert_eq!(paused, RunState::Paused as i32);
+        assert!(reason.contains("maintenance"), "{reason}");
+        assert_eq!(run_state_of(&state, &run_id), RunState::Paused as i32);
+
+        // Paused with no active workers resumes to Pending (needs a fresh launch).
+        let (resumed, _) = state.resume_run(&run_id.value).unwrap();
+        assert_eq!(resumed, RunState::Pending as i32);
+    }
+
+    #[test]
+    fn resume_with_active_workers_returns_to_running() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+        register_lifecycle_worker(&state, &run_id, "w0");
+        state.reconcile_worker_liveness();
+
+        state.pause_run(&run_id.value, "").unwrap();
+        let (resumed, _) = state.resume_run(&run_id.value).unwrap();
+        assert_eq!(resumed, RunState::Running as i32);
+    }
+
+    #[test]
+    fn pause_rejects_terminal_run() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+        state.cancel_run(&run_id.value, "").unwrap();
+
+        assert_eq!(
+            state.pause_run(&run_id.value, ""),
+            Err(RunActionError::InvalidState {
+                current: RunState::Cancelled as i32,
+                action: "pause",
+            })
+        );
+    }
+
+    #[test]
+    fn resume_rejects_non_paused_run() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+        assert_eq!(
+            state.resume_run(&run_id.value),
+            Err(RunActionError::InvalidState {
+                current: RunState::Pending as i32,
+                action: "resume",
+            })
+        );
+    }
+
+    #[test]
+    fn retry_failed_run_resets_to_pending_and_clears_roster() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+        register_lifecycle_worker(&state, &run_id, "w0");
+        state.reconcile_worker_liveness();
+        state.set_run_state(&run_id.value, RunState::Failed, "boom");
+
+        let (retried, reason, count) = state.retry_run(&run_id.value).unwrap();
+        assert_eq!(retried, RunState::Pending as i32);
+        assert_eq!(count, 1);
+        assert!(reason.contains("retry"), "{reason}");
+
+        let run = state.get_run(&run_id).unwrap();
+        assert_eq!(run.retry_count, 1);
+        assert_eq!(run.active_worker_count, 0);
+        // Roster was cleared so a fresh launch forms a clean process group.
+        assert!(state.list_workers(&run_id.value, None).unwrap().is_empty());
+
+        // A second failure + retry bumps the counter again.
+        state.set_run_state(&run_id.value, RunState::Failed, "boom again");
+        let (_, _, count2) = state.retry_run(&run_id.value).unwrap();
+        assert_eq!(count2, 2);
+    }
+
+    #[test]
+    fn retry_rejects_non_failed_run() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+        assert_eq!(
+            state.retry_run(&run_id.value),
+            Err(RunActionError::InvalidState {
+                current: RunState::Pending as i32,
+                action: "retry",
+            })
+        );
+    }
+
+    #[test]
+    fn drain_moves_run_to_draining_but_stays_non_terminal() {
+        let state = CoordinatorState::default();
+        let run_id = register_lifecycle_run(&state, 1);
+        register_lifecycle_worker(&state, &run_id, "w0");
+        state.reconcile_worker_liveness();
+
+        let (drained, reason) = state.drain_run(&run_id.value, "node cordon").unwrap();
+        assert_eq!(drained, RunState::Draining as i32);
+        assert!(reason.contains("node cordon"), "{reason}");
+
+        let run = state.get_run(&run_id).unwrap();
+        assert!(!run.is_terminal());
+    }
+
+    #[test]
+    fn admin_actions_report_run_not_found() {
+        let state = CoordinatorState::default();
+        assert_eq!(
+            state.pause_run("nope", ""),
+            Err(RunActionError::RunNotFound)
+        );
+        assert_eq!(state.resume_run("nope"), Err(RunActionError::RunNotFound));
+        assert_eq!(state.retry_run("nope"), Err(RunActionError::RunNotFound));
+        assert_eq!(
+            state.drain_run("nope", ""),
+            Err(RunActionError::RunNotFound)
+        );
+    }
+
+    #[test]
+    fn list_runs_filters_by_state_and_lists_workers() {
+        let state = CoordinatorState::default();
+        let running = register_lifecycle_run(&state, 1);
+        register_lifecycle_worker(&state, &running, "w0");
+        let failed = {
+            let registered = state.register_run(RegisterRunRequest {
+                idempotency_key: "second".to_string(),
+                run_name: "second".to_string(),
+                assignment_policy: AssignmentPolicy::StaticRank as i32,
+                storage_backend_kind: StorageBackendKind::LocalFilesystem as i32,
+                world_size: 1,
+                run_version: "v1".to_string(),
+                ..Default::default()
+            });
+            registered.run_id
+        };
+        state.set_run_state(&failed.value, RunState::Failed, "boom");
+
+        // Unfiltered lists both runs.
+        assert_eq!(state.list_runs(None).len(), 2);
+        // Filtering to Failed returns only the failed run.
+        let failed_only = state.list_runs(Some(RunState::Failed as i32));
+        assert_eq!(failed_only.len(), 1);
+        assert_eq!(failed_only[0].run_id, failed.value);
+
+        // list_workers returns the roster; unknown run -> None.
+        let workers = state.list_workers(&running.value, None).unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].worker_id, "w0");
+        assert!(state.list_workers("no-such-run", None).is_none());
+    }
+
+    #[test]
     fn silent_run_is_detected_as_stuck_and_failed() {
         let state = CoordinatorState::default();
         let run_id = register_lifecycle_run(&state, 1);
@@ -3719,6 +4283,164 @@ mod tests {
                 }
             )
             .is_none());
+    }
+
+    // ── checkpoint listing / corruption / retention ──────────────────────────
+
+    /// Register a run + worker and commit `count` checkpoints at steps 1..=count.
+    fn state_with_committed_checkpoints(state: &CoordinatorState, count: u64) -> (RunId, WorkerId) {
+        let run_id = state.register_run(register_request("ckpt-run")).run_id;
+        let worker = state
+            .register_worker(worker_request(run_id.clone(), "ckpt-worker"))
+            .expect("worker registers")
+            .worker_id;
+        for step in 1..=count {
+            let checkpoint_id = format!("ckpt-{step}");
+            state
+                .begin_checkpoint(
+                    run_id.value.clone(),
+                    worker.value.clone(),
+                    checkpoint_id.clone(),
+                    step,
+                    format!("begin-{checkpoint_id}"),
+                )
+                .expect("begin");
+            state
+                .report_checkpoint_artifact(
+                    run_id.value.clone(),
+                    worker.value.clone(),
+                    checkpoint_id.clone(),
+                    "model.bin".to_string(),
+                    format!("file:///a/{checkpoint_id}/model.bin"),
+                    10,
+                    "sum".to_string(),
+                    "sha256".to_string(),
+                    format!("artifact-{checkpoint_id}"),
+                )
+                .expect("artifact");
+            state
+                .commit_checkpoint(
+                    run_id.value.clone(),
+                    checkpoint_id.clone(),
+                    format!("commit-{checkpoint_id}"),
+                    String::new(),
+                )
+                .expect("commit");
+        }
+        (run_id, worker)
+    }
+
+    #[test]
+    fn list_checkpoints_orders_newest_first_and_respects_filters() {
+        let state = CoordinatorState::default();
+        let (run_id, worker) = state_with_committed_checkpoints(&state, 3);
+        // One extra non-committed checkpoint at a higher step.
+        state
+            .begin_checkpoint(
+                run_id.value.clone(),
+                worker.value.clone(),
+                "ckpt-open".to_string(),
+                9,
+                "begin-open".to_string(),
+            )
+            .expect("begin");
+
+        let all = state.list_checkpoints(&run_id.value, false, 0).unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0].checkpoint.checkpoint_id.0, "ckpt-open");
+
+        let committed = state.list_checkpoints(&run_id.value, true, 0).unwrap();
+        assert_eq!(committed.len(), 3);
+        assert_eq!(committed[0].checkpoint.checkpoint_id.0, "ckpt-3");
+
+        let limited = state.list_checkpoints(&run_id.value, true, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+
+        assert_eq!(
+            state.list_checkpoints("nope", false, 0),
+            Err(ListCheckpointsError::RunNotFound)
+        );
+    }
+
+    #[test]
+    fn corrupt_report_fails_checkpoint_and_falls_back_to_previous() {
+        let dir = tempdir().unwrap();
+        let store = SqliteMetadataStore::open(dir.path().join("ck.db")).unwrap();
+        store.init_schema().unwrap();
+        let state = CoordinatorState::with_metadata_store(Arc::new(store));
+        let (run_id, _) = state_with_committed_checkpoints(&state, 2);
+
+        assert_eq!(
+            state
+                .get_latest_checkpoint(run_id.value.clone())
+                .unwrap()
+                .checkpoint
+                .checkpoint_id
+                .0,
+            "ckpt-2"
+        );
+
+        let fallback = state
+            .report_checkpoint_corrupt(&run_id.value, "ckpt-2", "checksum mismatch")
+            .expect("report succeeds");
+        assert_eq!(fallback.as_deref(), Some("ckpt-1"));
+        assert_eq!(
+            state
+                .get_latest_checkpoint(run_id.value.clone())
+                .unwrap()
+                .checkpoint
+                .checkpoint_id
+                .0,
+            "ckpt-1"
+        );
+
+        // Corrupting the last remaining committed checkpoint leaves none.
+        let fallback = state
+            .report_checkpoint_corrupt(&run_id.value, "ckpt-1", "unreadable")
+            .expect("report succeeds");
+        assert_eq!(fallback, None);
+        assert!(state.get_latest_checkpoint(run_id.value.clone()).is_err());
+
+        assert_eq!(
+            state.report_checkpoint_corrupt(&run_id.value, "nope", ""),
+            Err(ReportCorruptError::CheckpointNotFound)
+        );
+    }
+
+    #[test]
+    fn retention_keeps_newest_committed_checkpoints() {
+        let dir = tempdir().unwrap();
+        let store = SqliteMetadataStore::open(dir.path().join("gc.db")).unwrap();
+        store.init_schema().unwrap();
+        let state = CoordinatorState::with_metadata_store(Arc::new(store));
+        let (run_id, _) = state_with_committed_checkpoints(&state, 3);
+
+        // keep_last == 0 disables GC entirely.
+        assert!(state.enforce_checkpoint_retention(0).is_empty());
+
+        let removed = state.enforce_checkpoint_retention(1);
+        assert_eq!(
+            removed,
+            vec![
+                (run_id.value.clone(), "ckpt-2".to_string()),
+                (run_id.value.clone(), "ckpt-1".to_string()),
+            ]
+        );
+        let remaining = state.list_checkpoints(&run_id.value, false, 0).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].checkpoint.checkpoint_id.0, "ckpt-3");
+        // The latest pointer still resolves.
+        assert_eq!(
+            state
+                .get_latest_checkpoint(run_id.value.clone())
+                .unwrap()
+                .checkpoint
+                .checkpoint_id
+                .0,
+            "ckpt-3"
+        );
+        // Idempotent: nothing more to remove.
+        assert!(state.enforce_checkpoint_retention(1).is_empty());
     }
 
     #[test]

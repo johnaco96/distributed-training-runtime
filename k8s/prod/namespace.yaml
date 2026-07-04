@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dtruntime
+  labels:
+    app.kubernetes.io/part-of: dtruntime
+    # Enforce the restricted Pod Security Standard for this namespace.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

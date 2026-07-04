@@ -1,0 +1,12 @@
+# The coordinator needs no Kubernetes API access — just an identity for pod
+# admission, IRSA/Workload-Identity annotations, and image pull. No Role or
+# RoleBinding is granted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: runtime-coordinator
+  namespace: dtruntime
+  labels:
+    app: runtime-coordinator
+    app.kubernetes.io/part-of: dtruntime
+automountServiceAccountToken: false

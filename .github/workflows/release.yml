@@ -1,0 +1,133 @@
+name: Release
+
+# Triggered by pushing a SemVer tag, e.g. `git tag v0.1.0 && git push --tags`.
+# Builds the Python SDK distributions, the container images (signed, with SLSA
+# provenance + SBOM), and packages the Helm chart, then attaches everything to a
+# GitHub Release. See docs/RELEASING.md.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write        # create the GitHub Release
+  packages: write        # push images to GHCR
+  id-token: write        # cosign keyless (OIDC) signing + provenance
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_COORDINATOR: ghcr.io/${{ github.repository }}
+  IMAGE_OPERATOR: ghcr.io/${{ github.repository }}-operator
+
+jobs:
+  python-sdk:
+    name: Build Python SDK (sdist + wheel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+      # Publishing to PyPI is intentionally gated behind a manual environment so
+      # a tag alone does not publish. Configure the "pypi" environment with a
+      # trusted publisher, then uncomment:
+      # - uses: pypa/gh-action-pypi-publish@release/v1
+
+  images:
+    name: Build & sign container images
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            image: coordinator
+          - dockerfile: Dockerfile.operator
+            image: operator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}${{ matrix.image == 'operator' && '-operator' || '' }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build & push (multi-arch, with provenance + SBOM)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Sign the image (keyless, Sigstore)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
+            cosign sign --yes "${tag%%:*}@${DIGEST}"
+          done
+
+  helm:
+    name: Package Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Lint & package
+        run: |
+          helm lint deploy/helm/dtruntime
+          helm package deploy/helm/dtruntime --destination dist-helm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: dist-helm/*.tgz
+      # Push to an OCI registry (optional):
+      # - run: helm push dist-helm/*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+
+  github-release:
+    name: Create GitHub Release
+    needs: [python-sdk, images, helm]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/python-dist/*
+            artifacts/helm-chart/*

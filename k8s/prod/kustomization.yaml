@@ -1,0 +1,25 @@
+# Production coordinator bundle (raw manifests, for GitOps / non-Helm users).
+# The Helm chart at deploy/helm/dtruntime is the recommended install path and
+# is more configurable; this kustomization is the equivalent for teams that
+# prefer plain manifests.
+#
+#   kubectl apply -k k8s/prod
+#
+# Prerequisites (create out of band):
+#   - Secret "postgres-credentials" (key DATABASE_URL) in namespace dtruntime
+#   - cert-manager installed; apply k8s/prod/cert-manager/ first
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: dtruntime
+resources:
+  - namespace.yaml
+  - coordinator-rbac.yaml
+  - coordinator-service.yaml
+  - coordinator-deployment.yaml
+  - coordinator-pdb.yaml
+  - coordinator-networkpolicy.yaml
+
+images:
+  - name: distributed-training-runtime
+    newName: ghcr.io/johnaco96/distributed-training-runtime
+    newTag: "0.1.0"

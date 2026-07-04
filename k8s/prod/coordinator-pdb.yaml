@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: runtime-coordinator
+  namespace: dtruntime
+  labels:
+    app: runtime-coordinator
+    app.kubernetes.io/part-of: dtruntime
+spec:
+  # Keep at least the leader available during voluntary disruptions.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: runtime-coordinator

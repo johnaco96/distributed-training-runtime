@@ -10,6 +10,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# The benchmark example imports torch at module load; skip cleanly without it.
+pytest.importorskip("torch")
+
 MODULE = Path(__file__).parents[2] / "python" / "examples" / "multi_worker_async_benchmark.py"
 
 

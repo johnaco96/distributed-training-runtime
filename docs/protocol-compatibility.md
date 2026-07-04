@@ -45,6 +45,30 @@ Current `GetRuntimeInfo` capabilities are:
 - `local-scaling-benchmarks`
 - `s3-storage`
 
+## Enforcement (mechanical)
+
+The change-safety rules above are enforced by a golden-snapshot test so a
+breaking wire change cannot merge accidentally:
+
+- `proto/compat_snapshot.json` records, for every message and enum, each
+  field/value's **number and type** — the wire-significant facts.
+- `python/tests/test_proto_compatibility.py` reparses `proto/runtime.proto`
+  and asserts that every entry in the snapshot still exists with the **same
+  number and type**. Removing, renaming, renumbering, or retyping a shipped
+  field fails the test. It also checks no field number is reused within a
+  message and that every enum has a 0 default (proto3's forward-compatible
+  fallback for unknown values).
+
+Additive changes (new fields/messages/enum values/RPCs) are allowed — they are
+not in the snapshot, so they pass. When you make an intentional additive
+change, regenerate and commit the snapshot:
+
+```bash
+python python/tests/proto_compat.py --update
+```
+
+The snapshot diff makes the additive change explicit and reviewable.
+
 ## Planned future versioning work
 
 Later hardening phases may add one or both of:
@@ -52,7 +76,7 @@ Later hardening phases may add one or both of:
 - explicit protocol version fields in selected requests/responses, and/or
 - capability negotiation between client and coordinator.
 
-Those mechanisms are beyond the current informational metadata and are not yet enforced at runtime.
+Those mechanisms are beyond the current informational metadata and are not yet enforced at runtime; the snapshot test above is the current backstop for wire compatibility.
 
 
 ## Related reliability notes

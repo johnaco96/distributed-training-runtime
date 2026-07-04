@@ -19,7 +19,7 @@ class RuntimeClient:
     available for low-level use.
     """
 
-    def __init__(self, address: str, tls_ca_cert: str | Path | None = None, tls_client_cert: str | Path | None = None, tls_client_key: str | Path | None = None, auth_subject: str | None = None, auth_role: str | None = None, auth_worker_id: str | None = None) -> None:
+    def __init__(self, address: str, tls_ca_cert: str | Path | None = None, tls_client_cert: str | Path | None = None, tls_client_key: str | Path | None = None, auth_subject: str | None = None, auth_role: str | None = None, auth_worker_id: str | None = None, auth_token: str | None = None) -> None:
         """Create a client connected to a coordinator gRPC address."""
         try:
             import grpc
@@ -44,7 +44,17 @@ class RuntimeClient:
         auth_subject = auth_subject or os.getenv("DTRUNTIME_AUTH_SUBJECT")
         auth_role = auth_role or os.getenv("DTRUNTIME_AUTH_ROLE")
         auth_worker_id = auth_worker_id or os.getenv("DTRUNTIME_AUTH_WORKER_ID")
+        auth_token = auth_token or os.getenv("DTRUNTIME_AUTH_TOKEN")
         self._auth_metadata: list[tuple[str, str]] = []
+        # A bearer token (OIDC/JWT) is the strongest credential; when present it
+        # is validated server-side and the dev metadata-identity headers are
+        # ignored, so we only attach the ones the caller actually set.
+        if auth_token:
+            token = auth_token.strip()
+            # Accept either a bare token or a full "Bearer <token>" value.
+            if token.lower().startswith("bearer "):
+                token = token[len("bearer "):].strip()
+            self._auth_metadata.append(("authorization", f"Bearer {token}"))
         if auth_subject:
             self._auth_metadata.append(("x-dtruntime-subject", auth_subject))
         if auth_role:
@@ -401,6 +411,89 @@ class RuntimeClient:
         )
         return self._stub.GetLatestCheckpoint(request, metadata=self.rpc_metadata())
 
+    def get_runtime_info(
+        self, timeout: float | None = None
+    ) -> "runtime_pb2.GetRuntimeInfoResponse":
+        """Fetch the coordinator's protocol version and advertised capabilities.
+
+        Used as a lightweight liveness/handshake probe (``dtruntime-admin
+        doctor``): a successful response confirms the coordinator is reachable
+        and negotiates protocol compatibility.
+        """
+        request = self._runtime_pb2.GetRuntimeInfoRequest()
+        return self._stub.GetRuntimeInfo(
+            request, metadata=self.rpc_metadata(), timeout=timeout
+        )
+
+    def list_checkpoints(
+        self,
+        run_id: str,
+        committed_only: bool = False,
+        limit: int = 0,
+    ) -> "runtime_pb2.ListCheckpointsResponse":
+        """List checkpoints for a run, newest step first."""
+        request = self._runtime_pb2.ListCheckpointsRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            committed_only=committed_only,
+            limit=limit,
+        )
+        return self._stub.ListCheckpoints(request, metadata=self.rpc_metadata())
+
+    def report_checkpoint_corrupt(
+        self,
+        run_id: str,
+        worker_id: str,
+        checkpoint_id: str,
+        reason: str,
+        idempotency_key: str = "",
+    ) -> "runtime_pb2.ReportCheckpointCorruptResponse":
+        """Mark a checkpoint corrupt; the latest pointer falls back to the
+        newest remaining committed checkpoint."""
+        request = self._runtime_pb2.ReportCheckpointCorruptRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+        return self._stub.ReportCheckpointCorrupt(
+            request, metadata=self.rpc_metadata(worker_id=worker_id)
+        )
+
+    def fetch_checkpoint_artifact(
+        self,
+        run_id: str,
+        worker_id: str,
+        checkpoint_id: str,
+        artifact_name: str,
+        owner_worker_id: str,
+        destination: "str | Path",
+    ) -> tuple[int, str]:
+        """Download one checkpoint artifact through the coordinator into
+        ``destination``.  Returns (size_bytes, checksum) as computed by the
+        coordinator while streaming; callers verify against the manifest."""
+        request = self._runtime_pb2.FetchCheckpointArtifactRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            worker_id=self._runtime_pb2.WorkerId(value=worker_id),
+            checkpoint_id=self._runtime_pb2.CheckpointId(value=checkpoint_id),
+            artifact_name=artifact_name,
+            owner_worker_id=self._runtime_pb2.WorkerId(value=owner_worker_id),
+        )
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        total = 0
+        checksum = ""
+        with destination.open("wb") as out:
+            for chunk in self._stub.FetchCheckpointArtifact(
+                request, metadata=self.rpc_metadata(worker_id=worker_id)
+            ):
+                if chunk.data:
+                    out.write(chunk.data)
+                    total += len(chunk.data)
+                if chunk.last:
+                    checksum = chunk.checksum
+        return total, checksum
+
     def join_rendezvous(
         self,
         run_id: str,
@@ -486,6 +579,101 @@ class RuntimeClient:
             run_id=self._runtime_pb2.RunId(value=run_id),
         )
         return self._stub.GetRunStatus(
+            request, metadata=self.rpc_metadata(), timeout=timeout
+        )
+
+    def _run_action(
+        self, rpc, run_id: str, reason: str, idempotency_key: str, timeout: float | None
+    ) -> "runtime_pb2.RunActionResponse":
+        request = self._runtime_pb2.RunActionRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+        return rpc(request, metadata=self.rpc_metadata(), timeout=timeout)
+
+    def pause_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        idempotency_key: str = "",
+        timeout: float | None = None,
+    ) -> "runtime_pb2.RunActionResponse":
+        """Pause a PENDING/RUNNING/RECOVERING run (admin).
+
+        The run stops making progress but is not terminal; resume returns it to
+        service.  Fails with FAILED_PRECONDITION if the run is not in a pausable
+        state.
+        """
+        return self._run_action(self._stub.PauseRun, run_id, reason, idempotency_key, timeout)
+
+    def resume_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        idempotency_key: str = "",
+        timeout: float | None = None,
+    ) -> "runtime_pb2.RunActionResponse":
+        """Resume a PAUSED run (admin).  Returns to RUNNING when workers are
+        still connected, otherwise PENDING so a fresh launch can form the
+        process group."""
+        return self._run_action(self._stub.ResumeRun, run_id, reason, idempotency_key, timeout)
+
+    def retry_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        idempotency_key: str = "",
+        timeout: float | None = None,
+    ) -> "runtime_pb2.RunActionResponse":
+        """Retry a FAILED run (admin): reset to PENDING, bump the retry counter,
+        and clear the stale worker roster so a fresh launch resumes from the
+        latest committed checkpoint."""
+        return self._run_action(self._stub.RetryRun, run_id, reason, idempotency_key, timeout)
+
+    def drain_run(
+        self,
+        run_id: str,
+        reason: str = "",
+        idempotency_key: str = "",
+        timeout: float | None = None,
+    ) -> "runtime_pb2.RunActionResponse":
+        """Drain a run (admin): move it to DRAINING so workers finish current
+        work, checkpoint, and exit gracefully; the run completes when the roster
+        empties."""
+        return self._run_action(self._stub.DrainRun, run_id, reason, idempotency_key, timeout)
+
+    def list_runs(
+        self, state_filter: int = 0, timeout: float | None = None
+    ) -> "runtime_pb2.ListRunsResponse":
+        """List runs (admin), optionally filtered to one lifecycle state.
+
+        ``state_filter=0`` (RUN_STATE_UNSPECIFIED) returns all runs.
+        """
+        request = self._runtime_pb2.ListRunsRequest(state_filter=state_filter)
+        return self._stub.ListRuns(request, metadata=self.rpc_metadata(), timeout=timeout)
+
+    def list_workers(
+        self, run_id: str, state_filter: int = 0, timeout: float | None = None
+    ) -> "runtime_pb2.ListWorkersResponse":
+        """List a run's workers (admin), optionally filtered to one worker
+        state (``state_filter=0`` returns all)."""
+        request = self._runtime_pb2.ListWorkersRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            state_filter=state_filter,
+        )
+        return self._stub.ListWorkers(request, metadata=self.rpc_metadata(), timeout=timeout)
+
+    def list_shard_progress(
+        self, run_id: str, dataset_id: str = "", timeout: float | None = None
+    ) -> "runtime_pb2.ListShardProgressResponse":
+        """List shard-progress / lease records for a run (admin), optionally
+        restricted to one dataset (empty ``dataset_id`` = all datasets)."""
+        request = self._runtime_pb2.ListShardProgressRequest(
+            run_id=self._runtime_pb2.RunId(value=run_id),
+            dataset_id=self._runtime_pb2.DatasetId(value=dataset_id) if dataset_id else None,
+        )
+        return self._stub.ListShardProgress(
             request, metadata=self.rpc_metadata(), timeout=timeout
         )
 

@@ -1,0 +1,60 @@
+# Recording rules — precompute the SLIs used by the SLOs (docs/slos.md) and by
+# the alerting rules (alerts.rules.yml). Recording rules keep expensive ratios
+# cheap to alert/dashboard on and give the SLIs stable names.
+groups:
+  - name: dtruntime.sli.recording
+    interval: 30s
+    rules:
+      # ── Availability SLI ─────────────────────────────────────────────
+      # Fraction of scrapes where the coordinator was up, over several windows.
+      - record: job:dtruntime_up:ratio_rate5m
+        expr: avg_over_time(up{job="dtruntime-coordinator"}[5m])
+      - record: job:dtruntime_up:ratio_rate30m
+        expr: avg_over_time(up{job="dtruntime-coordinator"}[30m])
+      - record: job:dtruntime_up:ratio_rate1h
+        expr: avg_over_time(up{job="dtruntime-coordinator"}[1h])
+      - record: job:dtruntime_up:ratio_rate6h
+        expr: avg_over_time(up{job="dtruntime-coordinator"}[6h])
+
+      # ── Checkpoint durability SLI ────────────────────────────────────
+      # Commit success ratio = committed / started over a window. The
+      # clamp_min guards against divide-by-zero when no checkpoints ran; when
+      # there is no traffic the ratio reads as 1 (no failures observed).
+      - record: dtruntime:checkpoint_commit_success:ratio_rate30m
+        expr: |
+          (
+            sum(rate(dtruntime_checkpoints_committed_total[30m]))
+            /
+            clamp_min(sum(rate(dtruntime_checkpoints_started_total[30m])), 1e-9)
+          ) >= 0 or vector(1)
+      - record: dtruntime:checkpoint_failure:ratio_rate5m
+        expr: |
+          sum(rate(dtruntime_checkpoint_failures_total[5m]))
+          /
+          clamp_min(sum(rate(dtruntime_checkpoints_started_total[5m])), 1e-9)
+      - record: dtruntime:checkpoint_failure:ratio_rate1h
+        expr: |
+          sum(rate(dtruntime_checkpoint_failures_total[1h]))
+          /
+          clamp_min(sum(rate(dtruntime_checkpoints_started_total[1h])), 1e-9)
+
+      # ── Worker health SLI ────────────────────────────────────────────
+      # Fraction of known workers that are not healthy (stale or failed).
+      - record: dtruntime:workers_unhealthy:ratio
+        expr: |
+          (dtruntime_stale_workers + dtruntime_failed_workers)
+          /
+          clamp_min(
+            dtruntime_active_workers + dtruntime_stale_workers + dtruntime_failed_workers,
+            1
+          )
+
+      # ── Auth SLI (security signal) ───────────────────────────────────
+      - record: dtruntime:auth_denied:ratio_rate5m
+        expr: |
+          sum(rate(dtruntime_auth_denied_total[5m]))
+          /
+          clamp_min(
+            sum(rate(dtruntime_auth_allowed_total[5m])) + sum(rate(dtruntime_auth_denied_total[5m])),
+            1e-9
+          )

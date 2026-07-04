@@ -4,6 +4,47 @@ All numbers below were captured against the current codebase on a local developm
 
 ---
 
+## Measured results — Phase 9 build (2026-07-03, Windows 11 / release)
+
+Captured with `target/release/runtime-bench` on the security-hardened build
+(OIDC/JWT + RBAC + SIEM audit) on the local dev machine. Raw JSON is committed
+under [`observability/benchmarks/`](../observability/benchmarks/). These are
+single-node, simulated-worker numbers — not real GPU-cluster results.
+
+**Control plane — `logical-workers`, 500 workers, 30 s, checkpoints every 10 s**
+(→ `observability/benchmarks/logical-workers-500w-30s.json`):
+
+| Metric | Value |
+|---|---|
+| Control-plane RPCs | 24,515 ops (register + heartbeat + shard-assign + checkpoint begin/report/commit + restore) |
+| Success rate | 99.98% (6 failures / 24,515) |
+| Sustained rate | ~804 ops/s (paced by the 1 s heartbeat interval, not saturation) |
+| RPC latency | p50 **0.28 ms**, p90 0.37 ms, p99 **0.48 ms** |
+| Heartbeat latency | p50 0.19 ms / p99 0.32 ms |
+| Checkpoint commit latency | p50 0.28 ms / p99 0.33 ms |
+
+**Checkpoint write — 32 artifacts × 1 MiB**
+(→ `observability/benchmarks/checkpoint-write-32x1MiB.json`): 32 MiB written at
+**629 MB/s**, p99 1.59 ms, 100% success.
+
+**Data plane — `sharded-data-load`, 128 shards × 1 MiB, 16 workers**
+(→ `observability/benchmarks/sharded-data-load-128x1MiB.json`): 128 MiB read via
+coordinator-assigned shard URIs at **~5.75 GB/s** aggregate local-filesystem
+read throughput (assignment + read path; the op count includes per-worker
+assignment calls that terminate a worker's shard stream).
+
+**Resilience (gated ops tests, this run):**
+
+| Test | Scenario | Result |
+|---|---|---|
+| `test_failover.py` | Hard-kill coordinator + restart on same SQLite store | Run state + idempotency rehydrated; same `run_id` returned |
+| `test_chaos.py` | 40 workers, 30% preemption **with recovery**, 20 s, checkpoints | Coordinator survived; fleet recovered; healthy success ratio |
+| `test_soak.py` | 100 workers, 60 s sustained, checkpoints | >99% success, p99 < 2 s, no degradation |
+
+See [observability-ops-tests.md](observability-ops-tests.md) to reproduce.
+
+---
+
 ## Logical-workers benchmark (control-plane throughput)
 
 `runtime-bench logical-workers` emulates hundreds of logical workers against a live coordinator over real gRPC. Each logical worker performs the full lifecycle: register → shard assignment → heartbeat → checkpoint → restore. No GPU or real training loop is involved; this isolates coordinator control-plane performance.

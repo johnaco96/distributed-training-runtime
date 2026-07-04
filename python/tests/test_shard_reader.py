@@ -6,7 +6,8 @@ import io
 import struct
 
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")  # this module exercises tensor I/O
 
 from dtruntime.shard_reader import (
     HEADER_SIZE,

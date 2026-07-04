@@ -122,10 +122,60 @@ class CoordinatorServiceStub:
                 request_serializer=runtime__pb2.DeregisterWorkerRequest.SerializeToString,
                 response_deserializer=runtime__pb2.DeregisterWorkerResponse.FromString,
                 _registered_method=True)
+        self.FetchCheckpointArtifact = channel.unary_stream(
+                '/runtime.v1.CoordinatorService/FetchCheckpointArtifact',
+                request_serializer=runtime__pb2.FetchCheckpointArtifactRequest.SerializeToString,
+                response_deserializer=runtime__pb2.FetchCheckpointArtifactChunk.FromString,
+                _registered_method=True)
+        self.ListCheckpoints = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ListCheckpoints',
+                request_serializer=runtime__pb2.ListCheckpointsRequest.SerializeToString,
+                response_deserializer=runtime__pb2.ListCheckpointsResponse.FromString,
+                _registered_method=True)
+        self.ReportCheckpointCorrupt = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ReportCheckpointCorrupt',
+                request_serializer=runtime__pb2.ReportCheckpointCorruptRequest.SerializeToString,
+                response_deserializer=runtime__pb2.ReportCheckpointCorruptResponse.FromString,
+                _registered_method=True)
         self.CancelRun = channel.unary_unary(
                 '/runtime.v1.CoordinatorService/CancelRun',
                 request_serializer=runtime__pb2.CancelRunRequest.SerializeToString,
                 response_deserializer=runtime__pb2.CancelRunResponse.FromString,
+                _registered_method=True)
+        self.PauseRun = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/PauseRun',
+                request_serializer=runtime__pb2.RunActionRequest.SerializeToString,
+                response_deserializer=runtime__pb2.RunActionResponse.FromString,
+                _registered_method=True)
+        self.ResumeRun = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ResumeRun',
+                request_serializer=runtime__pb2.RunActionRequest.SerializeToString,
+                response_deserializer=runtime__pb2.RunActionResponse.FromString,
+                _registered_method=True)
+        self.RetryRun = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/RetryRun',
+                request_serializer=runtime__pb2.RunActionRequest.SerializeToString,
+                response_deserializer=runtime__pb2.RunActionResponse.FromString,
+                _registered_method=True)
+        self.DrainRun = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/DrainRun',
+                request_serializer=runtime__pb2.RunActionRequest.SerializeToString,
+                response_deserializer=runtime__pb2.RunActionResponse.FromString,
+                _registered_method=True)
+        self.ListRuns = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ListRuns',
+                request_serializer=runtime__pb2.ListRunsRequest.SerializeToString,
+                response_deserializer=runtime__pb2.ListRunsResponse.FromString,
+                _registered_method=True)
+        self.ListWorkers = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ListWorkers',
+                request_serializer=runtime__pb2.ListWorkersRequest.SerializeToString,
+                response_deserializer=runtime__pb2.ListWorkersResponse.FromString,
+                _registered_method=True)
+        self.ListShardProgress = channel.unary_unary(
+                '/runtime.v1.CoordinatorService/ListShardProgress',
+                request_serializer=runtime__pb2.ListShardProgressRequest.SerializeToString,
+                response_deserializer=runtime__pb2.ListShardProgressResponse.FromString,
                 _registered_method=True)
 
 
@@ -244,10 +294,89 @@ class CoordinatorServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def FetchCheckpointArtifact(self, request, context):
+        """Download a checkpoint artifact through the coordinator's storage backend.
+        This is the restore data plane for multi-machine training: workers on any
+        node can read artifacts regardless of whether the coordinator stores them
+        on its local filesystem or in S3.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListCheckpoints(self, request, context):
+        """List checkpoints for a run (newest step first), including their states.
+        Used for corrupt-checkpoint fallback and admin inspection.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReportCheckpointCorrupt(self, request, context):
+        """Report a committed checkpoint as corrupt (checksum mismatch or unreadable
+        artifacts observed during restore).  The checkpoint is marked FAILED and
+        the latest-checkpoint pointer falls back to the newest remaining
+        committed checkpoint.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def CancelRun(self, request, context):
         """Cancel a run (admin).  Terminal: workers observe RUN_STATE_CANCELLED on
         their next heartbeat and exit; launchers stop restarting workers.
         """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PauseRun(self, request, context):
+        """── admin run lifecycle ────────────────────────────────────────────────
+        Pause a run: workers keep heartbeating but observe RUN_STATE_PAUSED and
+        stop advancing training at the next step boundary.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ResumeRun(self, request, context):
+        """Resume a paused run back to running.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RetryRun(self, request, context):
+        """Retry a failed run: reset it to PENDING so workers re-register and resume
+        from the latest committed checkpoint.  Increments the retry counter.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DrainRun(self, request, context):
+        """Drain a run: workers finish their current work, checkpoint, and exit
+        gracefully; the run completes when the roster empties.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListRuns(self, request, context):
+        """── admin inspection ───────────────────────────────────────────────────
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListWorkers(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListShardProgress(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -340,10 +469,60 @@ def add_CoordinatorServiceServicer_to_server(servicer, server):
                     request_deserializer=runtime__pb2.DeregisterWorkerRequest.FromString,
                     response_serializer=runtime__pb2.DeregisterWorkerResponse.SerializeToString,
             ),
+            'FetchCheckpointArtifact': grpc.unary_stream_rpc_method_handler(
+                    servicer.FetchCheckpointArtifact,
+                    request_deserializer=runtime__pb2.FetchCheckpointArtifactRequest.FromString,
+                    response_serializer=runtime__pb2.FetchCheckpointArtifactChunk.SerializeToString,
+            ),
+            'ListCheckpoints': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListCheckpoints,
+                    request_deserializer=runtime__pb2.ListCheckpointsRequest.FromString,
+                    response_serializer=runtime__pb2.ListCheckpointsResponse.SerializeToString,
+            ),
+            'ReportCheckpointCorrupt': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReportCheckpointCorrupt,
+                    request_deserializer=runtime__pb2.ReportCheckpointCorruptRequest.FromString,
+                    response_serializer=runtime__pb2.ReportCheckpointCorruptResponse.SerializeToString,
+            ),
             'CancelRun': grpc.unary_unary_rpc_method_handler(
                     servicer.CancelRun,
                     request_deserializer=runtime__pb2.CancelRunRequest.FromString,
                     response_serializer=runtime__pb2.CancelRunResponse.SerializeToString,
+            ),
+            'PauseRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.PauseRun,
+                    request_deserializer=runtime__pb2.RunActionRequest.FromString,
+                    response_serializer=runtime__pb2.RunActionResponse.SerializeToString,
+            ),
+            'ResumeRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResumeRun,
+                    request_deserializer=runtime__pb2.RunActionRequest.FromString,
+                    response_serializer=runtime__pb2.RunActionResponse.SerializeToString,
+            ),
+            'RetryRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.RetryRun,
+                    request_deserializer=runtime__pb2.RunActionRequest.FromString,
+                    response_serializer=runtime__pb2.RunActionResponse.SerializeToString,
+            ),
+            'DrainRun': grpc.unary_unary_rpc_method_handler(
+                    servicer.DrainRun,
+                    request_deserializer=runtime__pb2.RunActionRequest.FromString,
+                    response_serializer=runtime__pb2.RunActionResponse.SerializeToString,
+            ),
+            'ListRuns': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListRuns,
+                    request_deserializer=runtime__pb2.ListRunsRequest.FromString,
+                    response_serializer=runtime__pb2.ListRunsResponse.SerializeToString,
+            ),
+            'ListWorkers': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListWorkers,
+                    request_deserializer=runtime__pb2.ListWorkersRequest.FromString,
+                    response_serializer=runtime__pb2.ListWorkersResponse.SerializeToString,
+            ),
+            'ListShardProgress': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListShardProgress,
+                    request_deserializer=runtime__pb2.ListShardProgressRequest.FromString,
+                    response_serializer=runtime__pb2.ListShardProgressResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -819,6 +998,87 @@ class CoordinatorService:
             _registered_method=True)
 
     @staticmethod
+    def FetchCheckpointArtifact(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/FetchCheckpointArtifact',
+            runtime__pb2.FetchCheckpointArtifactRequest.SerializeToString,
+            runtime__pb2.FetchCheckpointArtifactChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListCheckpoints(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ListCheckpoints',
+            runtime__pb2.ListCheckpointsRequest.SerializeToString,
+            runtime__pb2.ListCheckpointsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReportCheckpointCorrupt(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ReportCheckpointCorrupt',
+            runtime__pb2.ReportCheckpointCorruptRequest.SerializeToString,
+            runtime__pb2.ReportCheckpointCorruptResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def CancelRun(request,
             target,
             options=(),
@@ -835,6 +1095,195 @@ class CoordinatorService:
             '/runtime.v1.CoordinatorService/CancelRun',
             runtime__pb2.CancelRunRequest.SerializeToString,
             runtime__pb2.CancelRunResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PauseRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/PauseRun',
+            runtime__pb2.RunActionRequest.SerializeToString,
+            runtime__pb2.RunActionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ResumeRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ResumeRun',
+            runtime__pb2.RunActionRequest.SerializeToString,
+            runtime__pb2.RunActionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RetryRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/RetryRun',
+            runtime__pb2.RunActionRequest.SerializeToString,
+            runtime__pb2.RunActionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DrainRun(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/DrainRun',
+            runtime__pb2.RunActionRequest.SerializeToString,
+            runtime__pb2.RunActionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListRuns(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ListRuns',
+            runtime__pb2.ListRunsRequest.SerializeToString,
+            runtime__pb2.ListRunsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListWorkers(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ListWorkers',
+            runtime__pb2.ListWorkersRequest.SerializeToString,
+            runtime__pb2.ListWorkersResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListShardProgress(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/runtime.v1.CoordinatorService/ListShardProgress',
+            runtime__pb2.ListShardProgressRequest.SerializeToString,
+            runtime__pb2.ListShardProgressResponse.FromString,
             options,
             channel_credentials,
             insecure,

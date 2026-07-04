@@ -333,6 +333,159 @@ def test_coordinator_restart_mid_training_is_transparent(tmp_path: Path) -> None
         _stop(coordinator)
 
 
+def _launch_elastic(
+    address: str,
+    run_name: str,
+    test_dir: Path,
+    nproc: int,
+    script_args: list[str],
+    extra_env: dict[str, str] | None = None,
+    timeout: float = 600.0,
+) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.update(
+        {
+            "PYTHONPATH": str(REPO_ROOT / "python"),
+            "DTRUNTIME_TEST_DIR": str(test_dir),
+            "DTRUNTIME_HEARTBEAT_INTERVAL": "1",
+            "DTRUNTIME_WORKER_HOST": "127.0.0.1",
+        }
+    )
+    if extra_env:
+        env.update(extra_env)
+    command = [
+        sys.executable, "-m", "dtruntime.launch",
+        "--coordinator", address,
+        "--run-name", run_name,
+        "--nproc-per-node", str(nproc),
+        "--min-workers", "1",
+        "--max-workers", "4",
+        "--settle-timeout-ms", "3000",
+        "--backend", "gloo",
+        "--worker-host", "127.0.0.1",
+        str(EXAMPLE), *script_args,
+    ]
+    return subprocess.run(
+        command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout
+    )
+
+
+def test_checkpoint_restore_across_world_sizes(tmp_path: Path) -> None:
+    """Save a DCP checkpoint from 2 workers, then restore it into 1 worker of
+    the same run: real multi-process checkpoint restore through the
+    coordinator data plane, resharded across world sizes."""
+    _gate()
+    store = tmp_path / "store"
+    coordinator, address = _start_coordinator(
+        tmp_path, extra_args=["--storage-root", str(store)]
+    )
+    try:
+        run_name = f"ddp-ckpt-{uuid.uuid4().hex[:8]}"
+        save_dir = tmp_path / "save"
+        save_dir.mkdir()
+        result = _launch_elastic(
+            address,
+            run_name,
+            save_dir,
+            nproc=2,
+            script_args=["--steps", "6", "--checkpoint", "--checkpoint-every", "3", "--checkpoint-async"],
+            extra_env={"DTRUNTIME_TEST_EXIT_AFTER_SAVE": "1"},
+        )
+        assert result.returncode == 0, (
+            f"save phase failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        save_reports = _load_reports(save_dir)
+        assert len(save_reports) == 2
+        assert all(r["world_size"] == 2 for r in save_reports)
+        saved_param_sum = save_reports[0]["param_sum"]
+        assert 5 in save_reports[0]["saved_steps"]
+
+        restore_dir = tmp_path / "restore"
+        restore_dir.mkdir()
+        result = _launch_elastic(
+            address,
+            run_name,
+            restore_dir,
+            nproc=1,
+            script_args=["--steps", "6", "--restore"],
+        )
+        assert result.returncode == 0, (
+            f"restore phase failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        restore_reports = _load_reports(restore_dir)
+        assert len(restore_reports) == 1
+        report = restore_reports[0]
+        # Restored at a different world size...
+        assert report["world_size"] == 1
+        assert report["restored_step"] == 5
+        assert report["restored_checkpoint_id"] == "dcp-step-5"
+        # ...with the exact trained parameters (no further steps ran).
+        assert abs(report["param_sum"] - saved_param_sum) < 1e-4, (
+            f"restored params diverged: {report['param_sum']} vs {saved_param_sum}"
+        )
+    finally:
+        _stop(coordinator)
+
+
+def test_corrupt_checkpoint_detection_and_fallback(tmp_path: Path) -> None:
+    """Corrupt the newest committed checkpoint's artifact on coordinator
+    storage: restore must detect the checksum mismatch, report it, and fall
+    back to the previous committed checkpoint."""
+    _gate()
+    store = tmp_path / "store"
+    coordinator, address = _start_coordinator(
+        tmp_path, extra_args=["--storage-root", str(store)]
+    )
+    try:
+        run_name = f"ddp-corrupt-{uuid.uuid4().hex[:8]}"
+        save_dir = tmp_path / "save"
+        save_dir.mkdir()
+        result = _launch_elastic(
+            address,
+            run_name,
+            save_dir,
+            nproc=1,
+            # checkpoint-every 3 over 6 steps → dcp-step-2 and dcp-step-5.
+            script_args=["--steps", "6", "--checkpoint", "--checkpoint-every", "3"],
+            extra_env={"DTRUNTIME_TEST_EXIT_AFTER_SAVE": "1"},
+        )
+        assert result.returncode == 0, (
+            f"save phase failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+        # Corrupt every data artifact of the newest checkpoint (dcp-step-5).
+        run_dirs = list((store / "runs").iterdir())
+        assert len(run_dirs) == 1
+        latest_dir = run_dirs[0] / "checkpoints" / "dcp-step-5"
+        corrupted = 0
+        for path in latest_dir.rglob("*.distcp"):
+            data = bytearray(path.read_bytes())
+            data[: min(64, len(data))] = b"\xde\xad\xbe\xef" * (min(64, len(data)) // 4)
+            path.write_bytes(bytes(data))
+            corrupted += 1
+        assert corrupted > 0, f"no artifacts found under {latest_dir}"
+
+        restore_dir = tmp_path / "restore"
+        restore_dir.mkdir()
+        result = _launch_elastic(
+            address,
+            run_name,
+            restore_dir,
+            nproc=1,
+            script_args=["--steps", "6", "--restore"],
+        )
+        assert result.returncode == 0, (
+            f"restore phase failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        report = _load_reports(restore_dir)[0]
+        # Fallback to the older committed checkpoint, then training continued
+        # from there to completion.
+        assert report["restored_checkpoint_id"] == "dcp-step-2", report
+        assert report["restored_step"] == 2
+    finally:
+        _stop(coordinator)
+
+
 def test_worker_crash_restart_and_rerendezvous(tmp_path: Path) -> None:
     _gate()
     coordinator, address = _start_coordinator(tmp_path)

@@ -1,0 +1,59 @@
+name: Ops resilience tests
+
+# Failover / chaos / soak against the real release binaries. Kept out of the
+# per-PR CI (they build release binaries and run for minutes); run nightly and
+# on demand.
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      soak_duration_secs:
+        description: "Soak duration in seconds"
+        default: "120"
+        required: false
+
+jobs:
+  ops-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release -p runtime-coordinator -p runtime-bench
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Failover test
+        run: python -m pytest python/tests/test_failover.py -q
+        env:
+          DTRUNTIME_RUN_FAILOVER_TESTS: "1"
+
+      - name: Chaos / preemption test
+        run: python -m pytest python/tests/test_chaos.py -q
+        env:
+          DTRUNTIME_RUN_CHAOS_TESTS: "1"
+          DTRUNTIME_CHAOS_WORKERS: "40"
+          DTRUNTIME_CHAOS_DURATION_SECS: "20"
+
+      - name: Soak test
+        run: python -m pytest python/tests/test_soak.py -q
+        env:
+          DTRUNTIME_RUN_SOAK_TESTS: "1"
+          DTRUNTIME_SOAK_WORKERS: "100"
+          DTRUNTIME_SOAK_DURATION_SECS: ${{ github.event.inputs.soak_duration_secs || '120' }}

@@ -1,0 +1,25 @@
+apiVersion: v2
+name: dtruntime
+description: >-
+  Distributed Training Runtime — a coordinator control plane for PyTorch
+  distributed training (rendezvous, sharded data, distributed checkpointing)
+  with optional Kubernetes operator and observability.
+type: application
+# Chart version — bump on any chart change (SemVer).
+version: 0.1.0
+# The app version tracks the coordinator/SDK release this chart deploys.
+appVersion: "0.1.0"
+kubeVersion: ">=1.24.0-0"
+home: https://github.com/johnaco96/distributed-training-runtime
+sources:
+  - https://github.com/johnaco96/distributed-training-runtime
+keywords:
+  - pytorch
+  - distributed-training
+  - machine-learning
+  - coordinator
+maintainers:
+  - name: distributed-training-runtime maintainers
+    url: https://github.com/johnaco96/distributed-training-runtime
+annotations:
+  category: MachineLearning

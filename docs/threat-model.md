@@ -49,37 +49,53 @@
 
 ### Implemented
 
-- Idempotency keys in coordinator mutation paths.
-- Checkpoint checksum/integrity-oriented validation on commit paths.
-- Optional TLS/mTLS transport for coordinator gRPC and Python client.
-- Certificate handling model for local/dev and future production integration tests.
-- Workload identity model with optional metadata-based caller identity.
-- Explicit authorization policy scaffolding for coordinator RPCs.
-- Identity-to-action mapping (e.g., worker scoped to its own reports/checkpoints).
-- Structured audit/security event logging.
-- Local Kubernetes manifests avoid privileged pod settings.
-- Local coordinator Service is ClusterIP-only.
-- Non-production limitations are explicitly documented.
-- Storage abstraction supports local filesystem and S3-compatible paths.
+- **Unauthenticated access** → auth enforcement (`--auth-mode metadata`) with
+  layered OIDC/JWT + SPIFFE credentials; header identity disable-able.
+- **Worker impersonation** → worker-self checks bind the request `worker_id` to
+  the verified credential (JWT `worker_id` claim or SPIFFE path segment).
+- **Privilege escalation / unauthorized run or dataset registration** →
+  role/permission RBAC (viewer read-only, operator manage, admin all).
+- **Token forgery / tampering** → signature verification with algorithm pinning
+  (blocks alg-confusion); `exp`/`nbf`/`iss`/`aud` enforced.
+- **Credential theft blast radius** → short-lived tokens + SVIDs; JWT keys
+  hot-rotate without downtime.
+- **Replayed RPCs** → idempotency keys in mutation paths.
+- **Forged/tampered checkpoint artifacts** → checksum validation on
+  commit/stream/download with corrupt-fallback.
+- **Stolen object-store credentials** → least-privilege, scoped, short-lived
+  credentials guidance ([secret-rotation.md](secret-rotation.md)).
+- **Log leakage of secrets** → audit sinks never emit tokens/keys/credentials.
+- **Weak audit/forensics** → structured audit to DB + NDJSON/SIEM sink + auth
+  allow/deny counters.
+- **Vulnerable dependencies** → `cargo-deny` + `pip-audit` in CI; Dependabot.
+- **Accidental exposure** → local Service is ClusterIP-only; non-privileged pods.
 
 ### Planned
 
-- Dashboard authentication/authorization.
-- HA consistency and failover hardening.
-- Production-grade secret management integration.
-- Deeper production S3 operational hardening/tuning.
+- Dashboard authentication/authorization (no dashboard yet).
+- Validation against a live SPIRE server and a production OIDC provider/SIEM.
+- Per-run / per-namespace attribute-based scoping beyond roles.
 
-## 5) Security test plan (future)
+## 5) Security validation
 
-Planned security-focused test coverage includes:
-- Missing/invalid client cert is rejected (when TLS/mTLS is configured).
-- Unauthorized worker cannot report another worker's checkpoint artifacts.
-- Replayed idempotency-key requests remain safe/idempotent.
-- Wrong workload identity is rejected for protected RPCs.
-- Checkpoint checksum mismatch is rejected.
-- Object-store credentials are not emitted in logs.
-- Dashboard requires authentication once dashboard is added.
-- HA failover path does not double-commit checkpoint state.
+The following are covered by automated tests (Rust unit + service, Python), and
+several were additionally validated live against a running coordinator:
+
+- Missing/invalid credential is rejected as `UNAUTHENTICATED`; unauthorized role
+  as `PERMISSION_DENIED` (`auth.rs`, `service.rs` tests).
+- Forged JWT signature, expired token, wrong `aud`/`iss` are rejected
+  (`security::jwt` tests; `threat_*` service tests; live).
+- Spoofed metadata role does not authorize when header identity is disabled
+  (`threat_header_identity_ignored_when_fallback_disabled`; live).
+- Viewer can read but not manage; operator can manage (`viewer_can_read_but_not_manage`,
+  `operator_can_manage_runs`; live).
+- Wrong worker identity cannot act as another worker (`metadata_auth_worker_scoped_*`).
+- JWT key rotation: a token signed by the rotated key validates, the retired key
+  is rejected (`security::jwt::key_rotation_*`; live secret-file rotation).
+- SPIFFE ID from the wrong trust domain / unmapped path is rejected
+  (`security::spiffe` tests).
+- Object-store credentials and tokens are not emitted in audit output
+  ([audit-logging.md](audit-logging.md)).
 
 ## 6) Security scope
 
@@ -87,7 +103,14 @@ This document defines security risks and controls. Not all future controls liste
 
 ## 7) Authorization model
 
-An optional metadata-based caller identity model is available for local/dev testing. Default mode remains disabled for compatibility. Enable with `runtime-coordinator --addr 0.0.0.0:50051 --auth-mode metadata` or `DTRUNTIME_AUTH_MODE=metadata`. Python client can attach `x-dtruntime-subject`, `x-dtruntime-role`, and optional `x-dtruntime-worker-id` via constructor args or env (`DTRUNTIME_AUTH_SUBJECT`, `DTRUNTIME_AUTH_ROLE`, `DTRUNTIME_AUTH_WORKER_ID`). This is policy scaffolding only — not full SPIFFE/SPIRE or production RBAC.
+Enforcement is enabled with `--auth-mode metadata` (or
+`DTRUNTIME_AUTH_MODE=metadata`; default `disabled` for local dev). Identity is
+established by a layered authenticator — OIDC/JWT bearer tokens, SPIFFE
+X.509-SVID, or dev metadata headers — and mapped to roles
+(admin/operator/viewer/worker), each granting a set of permissions checked
+per-RPC. Header identity can be disabled (`--auth-disable-header-identity`) so
+only cryptographically-proven credentials authenticate. See
+[security-auth.md](security-auth.md).
 
 ## 8) Audit logging
 

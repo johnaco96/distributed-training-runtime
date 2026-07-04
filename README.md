@@ -80,10 +80,12 @@ See `python/examples/` for complete working examples including PyTorch integrati
 | Kubernetes operator | TrainingRun CRD → managed coordinator + Indexed worker Jobs; GPU/placement/topology aware; Volcano gang scheduling and Kueue queueing backends |
 | Run lifecycle | Durable states (pending/running/recovering/completed/failed/cancelled) surviving coordinator restarts; cancellation, stuck-run detection, retention cleanup |
 | Shard assignment | Deterministic by rank; cache-aware placement; configurable shard count |
+| Data pipeline | Streaming `IterableDataset` for PyTorch `DataLoader`; deterministic epoch shuffle; disk cache with prefetch/backpressure; content-addressed versioning; npz/dtrs/jsonl/parquet/webdataset formats |
 | Crash recovery | Per-shard progress offset persisted to SQLite or PostgreSQL; workers resume on restart |
-| Distributed checkpointing | Two-phase commit; globally committed only when all registered workers vote |
+| Distributed checkpointing | DCP-based model+optimizer state with world-size/strategy resharding; 2PC commit; corruption fallback; retention/GC; async save |
 | Coordinator HA | PostgreSQL advisory lock leader election; standby takeover in ~5 s |
-| S3-compatible storage | Checkpoint artifacts to any S3-compatible store (MinIO, AWS S3); configurable concurrency |
+| S3-compatible storage | Any S3-compatible store (MinIO, AWS S3); multipart upload, retryable-vs-permanent error classification, full-jitter backoff, server-side encryption |
+| Schema migrations | Versioned, forward-only migration ledger; SQLite WAL durability; wire-compatibility enforced by a proto golden-snapshot test |
 | TLS / mTLS | cert-manager-compatible; ECDSA P-256 certs with automatic rotation |
 | Role-based auth | Admin vs. worker identity enforced on all RPCs |
 | Audit logging | Structured events written to PostgreSQL for security-relevant operations |
@@ -146,18 +148,32 @@ The coordinator is a single Rust binary. Workers connect over gRPC and interact 
 
 Deploy two replicas. One acquires the PostgreSQL advisory lock and binds the gRPC port; the other polls in standby. The Kubernetes readiness probe (TCP on port 50051) keeps the standby out of the Service endpoints until it takes over.
 
-### Kubernetes
+### Kubernetes — Helm (recommended)
 
 ```bash
-# Install cert-manager, then apply the PKI resources
-kubectl apply -f k8s/prod/cert-manager/cluster-issuer.yaml
-kubectl apply -n dtruntime -f k8s/prod/cert-manager/coordinator-certificate.yaml
+kubectl -n dtruntime create secret generic postgres-credentials \
+  --from-literal=DATABASE_URL='postgres://user:pass@host:5432/dtruntime'
 
-# Deploy the 2-replica coordinator
-kubectl apply -f k8s/prod/coordinator-deployment.yaml
+helm install dtruntime deploy/helm/dtruntime \
+  -n dtruntime --create-namespace \
+  -f deploy/helm/dtruntime/values-production.yaml \
+  --set image.tag=0.1.0
 ```
 
-See [docs/kubernetes-local.md](docs/kubernetes-local.md) for the full local cluster runbook using Docker Desktop or kind.
+The chart deploys the HA coordinator (leader + standby), Service, hardened
+non-root pods, PodDisruptionBudget, NetworkPolicy, and optional cert-manager
+`Certificate`, `ServiceMonitor`, `PrometheusRule`, and the operator.
+
+### Kubernetes — raw manifests (kustomize)
+
+```bash
+kubectl apply -f k8s/prod/cert-manager/     # ClusterIssuer + Certificate
+kubectl apply -k k8s/prod                   # namespace, SA, Service, Deployment, PDB, NetworkPolicy
+```
+
+Two replicas: one acquires the PostgreSQL advisory lock and binds the gRPC port; the other polls in standby. The readiness probe keeps the standby out of the Service endpoints until it takes over.
+
+See [docs/production-deployment.md](docs/production-deployment.md) for the full production guide, [docs/kubernetes-local.md](docs/kubernetes-local.md) for the local cluster runbook, and [docs/RELEASING.md](docs/RELEASING.md) for the release/signing process.
 
 ## Python SDK
 
@@ -167,9 +183,23 @@ pip install -e python/
 
 Key entry points:
 
-- **`RuntimeClient`** (`dtruntime.client`) — gRPC client with TLS, mTLS, and auth header support. Reads credentials from constructor args or `DTRUNTIME_TLS_*` / `DTRUNTIME_AUTH_*` env vars.
+- **`RuntimeClient`** (`dtruntime.client`) — gRPC client with TLS, mTLS, and auth header support. Reads credentials from constructor args or `DTRUNTIME_TLS_*` / `DTRUNTIME_AUTH_*` env vars. Includes admin operations (`pause_run`/`resume_run`/`retry_run`/`drain_run`/`cancel_run`) and inspection (`list_runs`/`list_workers`/`list_shard_progress`/`list_checkpoints`).
 - **`ShardLoader`** (`dtruntime.shard_loader`) — request shard assignment, read bytes from `file://` or `s3://` URIs, report progress, all in one call.
 - **`build_and_write_shards`** (`dtruntime.shard_loader`) — split a numpy dataset into `.npz` shard files and return the metadata list ready to pass to `register_dataset`.
+
+## Operator CLI
+
+```bash
+dtruntime-admin runs list --state running        # active jobs
+dtruntime-admin doctor RUN_ID                     # diagnose stuck workers / bad checkpoints
+dtruntime-admin run pause|resume|retry|drain|cancel RUN_ID
+```
+
+`dtruntime-admin` (installed with the Python package) inspects and manages runs
+against a live coordinator: list runs/workers/shards/checkpoints, drive
+lifecycle actions, verify checkpoints, and diagnose stuck runs. Supports `--json`
+output and structured, remediation-oriented errors. See
+[docs/admin-cli.md](docs/admin-cli.md).
 
 ## Building from source
 
@@ -204,18 +234,41 @@ cargo run -p runtime-bench -- logical-workers \
 
 ## Documentation
 
+**[📖 Documentation index](docs/README.md)** — start here. Highlights:
+
+- [Integrate an existing PyTorch script](docs/pytorch-integration.md)
+- [Production deployment](docs/production-deployment.md)
+- [Failure recovery & operator actions](docs/failure-recovery-operations.md)
+- [**Support matrix**](docs/support-matrix.md) (frameworks, storage, schedulers, platforms, limits)
+
+Full list:
+
 - [Quickstart](docs/quickstart.md)
 - [torch.distributed execution](docs/torch-distributed.md)
+- [Data pipeline](docs/data-pipeline.md)
 - [Run lifecycle & failure semantics](docs/run-lifecycle.md)
+- [Admin & operator CLI](docs/admin-cli.md)
+- [Distributed checkpointing](docs/checkpointing-distributed.md)
 - [Kubernetes operator](docs/kubernetes-operator.md)
 - [Scheduler integrations](docs/schedulers.md)
+- [Object-store hardening](docs/storage-hardening.md)
+- [Schema migrations](docs/schema-migrations.md)
+- [Protocol compatibility](docs/protocol-compatibility.md)
 - [Architecture](docs/architecture.md)
 - [Dataset sharding](docs/dataset-sharding.md)
 - [Checkpoint protocol](docs/checkpoint-protocol.md)
 - [Failure recovery](docs/failure-recovery.md)
 - [High availability](docs/high-availability.md)
 - [Security architecture](docs/security-architecture.md)
+- [Authentication & authorization (OIDC/JWT, SPIFFE, RBAC)](docs/security-auth.md)
+- [Secret management & rotation](docs/secret-rotation.md)
+- [Threat model](docs/threat-model.md)
 - [Observability](docs/observability.md)
+- [SLOs & error budgets](docs/slos.md)
+- [On-call runbooks](docs/runbooks-oncall.md)
+- [Ops resilience tests (failover/chaos/soak)](docs/observability-ops-tests.md)
+- [Production deployment](docs/production-deployment.md)
+- [Release process & image signing](docs/RELEASING.md)
 - [Kubernetes local runbook](docs/kubernetes-local.md)
 - [Benchmarks](docs/benchmarks.md)
 - [Troubleshooting](docs/troubleshooting.md)

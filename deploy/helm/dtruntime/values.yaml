@@ -1,0 +1,161 @@
+# Default values for the dtruntime chart. Production overrides live in
+# values-production.yaml. Every value is documented in docs/production-deployment.md.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Coordinator image. Override with your registry/tag for production.
+  repository: ghcr.io/johnaco96/distributed-training-runtime
+  tag: ""              # defaults to .Chart.appVersion when empty
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+coordinator:
+  # 2 replicas = leader + hot standby (HA via PostgreSQL advisory lock). Only
+  # the leader binds the gRPC port; the standby's readiness probe fails until it
+  # acquires the lock. Requires metadataStore.postgres for HA.
+  replicas: 2
+  addr: "0.0.0.0:50051"
+  grpcPort: 50051
+  metricsPort: 9090
+  storageRoot: /var/lib/dtruntime/artifacts
+  maxS3ConcurrentOps: 128
+  extraArgs: []
+  # Persist the local staging area (checkpoint artifacts before S3 upload).
+  persistence:
+    enabled: false
+    size: 20Gi
+    storageClassName: ""
+    accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+  # Hardened pod/container security context (root filesystem read-only; the
+  # storage root is a writable emptyDir/PVC mount).
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Spread the two replicas across nodes so a node failure cannot take both.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: coordinator
+
+# Metadata store. Use postgres in production (enables HA + durable metadata).
+metadataStore:
+  # "sqlite" (single replica, ephemeral) or "postgres" (HA, durable).
+  backend: postgres
+  sqlite:
+    path: /var/lib/dtruntime/meta.db
+  postgres:
+    # Secret providing the DSN. Create it out of band; never inline the DSN.
+    existingSecret: postgres-credentials
+    dsnKey: DATABASE_URL
+
+# Authentication/authorization. See docs/security-auth.md.
+auth:
+  mode: metadata            # "disabled" | "metadata" (enforced)
+  disableHeaderIdentity: true
+  oidc:
+    enabled: false
+    issuer: ""
+    audiences: []
+    roleClaim: roles
+    # Mount a JWKS/secret file for signature verification + rotation.
+    jwksSecret: ""          # Secret name; key "jwks.json"
+    hmacSecret: ""          # Secret name; key "hmac.key"
+  spiffe:
+    enabled: false
+    trustDomain: ""
+    roleMapConfigMap: ""    # ConfigMap with key "roles.map"
+  audit:
+    # SIEM NDJSON audit file path (empty disables the file sink).
+    logFile: ""
+
+tls:
+  enabled: true
+  # Secret with tls.crt/tls.key (e.g. provisioned by cert-manager below).
+  secretName: dtruntime-coordinator-tls
+  # Require client certs (mTLS): CA secret with ca.crt.
+  clientCASecret: ""
+
+certManager:
+  # Render a cert-manager Certificate for the coordinator TLS secret.
+  enabled: false
+  issuerRef:
+    name: dtruntime-ca-issuer
+    kind: ClusterIssuer
+  dnsNames: []
+  duration: 2160h          # 90d
+  renewBefore: 360h        # 15d
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}          # e.g. AWS IRSA / GCP Workload Identity role
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  # Restrict ingress to the coordinator's gRPC/metrics ports.
+  enabled: true
+  # Extra namespace/pod selectors allowed to reach the coordinator.
+  allowedNamespaces: []
+
+# Prometheus Operator integration (ServiceMonitor + PrometheusRule). Requires
+# the Prometheus Operator CRDs to be installed.
+monitoring:
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    labels: {}
+  prometheusRule:
+    enabled: false
+    labels:
+      release: prometheus
+
+# The Kubernetes operator (reconciles TrainingRun CRs). Disabled by default;
+# the coordinator alone is the minimal install.
+operator:
+  enabled: false
+  image:
+    repository: ghcr.io/johnaco96/distributed-training-runtime-operator
+    tag: ""
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "250m"
+      memory: "128Mi"
+  # Install the TrainingRun CRD with the chart. Set false if the CRD is
+  # managed separately (recommended for GitOps / multi-tenant clusters).
+  installCRD: true

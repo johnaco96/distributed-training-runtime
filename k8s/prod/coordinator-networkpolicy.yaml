@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runtime-coordinator
+  namespace: dtruntime
+  labels:
+    app: runtime-coordinator
+    app.kubernetes.io/part-of: dtruntime
+spec:
+  podSelector:
+    matchLabels:
+      app: runtime-coordinator
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow gRPC + metrics from workloads in the dtruntime namespace. Add
+    # namespaceSelector entries for Prometheus / clients in other namespaces.
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 50051
+        - protocol: TCP
+          port: 9090

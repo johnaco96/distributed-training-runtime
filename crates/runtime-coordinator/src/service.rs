@@ -17,7 +17,7 @@ use crate::auth::{AuthorizationError, Authorizer};
 use crate::state::{
     BeginCheckpointError, CommitCheckpointError, CoordinatorState, GetLatestCheckpointError,
     GetShardAssignmentsError, RenewShardLeaseError, ReportCheckpointArtifactError,
-    ReportShardProgressError,
+    ReportShardProgressError, RunActionError,
 };
 use crate::{RuntimeMetrics, RuntimeMetricsSnapshot};
 
@@ -123,23 +123,26 @@ impl CoordinatorServiceImpl {
         request: &Request<T>,
         request_name: &'static str,
     ) -> Result<Option<crate::auth::AuthContext>, Status> {
-        match self.authorizer.context(request.metadata()) {
+        // The verified mTLS leaf certificate, when present, feeds SPIFFE auth.
+        let peer_leaf: Option<Vec<u8>> = request
+            .peer_certs()
+            .and_then(|certs| certs.first().map(|c| c.as_ref().to_vec()));
+        match self
+            .authorizer
+            .authenticate(request.metadata(), peer_leaf.as_deref())
+        {
             Ok(ctx) => {
                 if let Some(c) = &ctx {
-                    let role = match c.role {
-                        crate::auth::AuthRole::Admin => "admin",
-                        crate::auth::AuthRole::Worker => "worker",
-                    };
                     self.audit.emit(AuditEvent {
                         kind: Some(AuditEventKind::AuthMetadataAccepted),
                         outcome: Some(AuditOutcome::Success),
                         subject: Some(c.subject.clone()),
-                        role: Some(role.to_string()),
+                        role: Some(c.role_label().to_string()),
                         worker_id: c.worker_id.clone(),
                         run_id: None,
                         dataset_id: None,
                         checkpoint_id: None,
-                        reason: None,
+                        reason: Some(format!("source={}", c.source.as_str())),
                         request_name: Some(request_name.to_string()),
                     });
                 }
@@ -158,34 +161,81 @@ impl CoordinatorServiceImpl {
                     reason: Some(e.as_str().to_string()),
                     request_name: Some(request_name.to_string()),
                 });
+                self.metrics.inc_auth_denied_total();
                 Err(e.to_status())
             }
         }
     }
 
+    /// Deny with an audited `AuthorizationDenied` event and a denied-metric bump.
+    fn deny(
+        &self,
+        ctx: &crate::auth::AuthContext,
+        reason: &str,
+        request_name: &'static str,
+    ) -> Status {
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::AuthorizationDenied),
+            outcome: Some(AuditOutcome::Rejected),
+            subject: Some(ctx.subject.clone()),
+            role: Some(ctx.role_label().to_string()),
+            worker_id: ctx.worker_id.clone(),
+            run_id: None,
+            dataset_id: None,
+            checkpoint_id: None,
+            reason: Some(reason.to_string()),
+            request_name: Some(request_name.to_string()),
+        });
+        self.metrics.inc_auth_denied_total();
+        AuthorizationError::PermissionDenied.to_status()
+    }
+
+    fn allow(&self) {
+        self.audit.emit(AuditEvent::new(
+            AuditEventKind::AuthorizationAllowed,
+            AuditOutcome::Success,
+        ));
+        self.metrics.inc_auth_allowed_total();
+    }
+
+    /// Require a specific [`Permission`]; used for management/read RPCs.
+    fn require_permission<T>(
+        &self,
+        request: &Request<T>,
+        permission: crate::auth::Permission,
+        request_name: &'static str,
+    ) -> Result<(), Status> {
+        let ctx = self.auth_context(request, request_name)?;
+        if let Some(c) = ctx {
+            if !c.has_permission(permission) {
+                return Err(self.deny(&c, "permission_denied", request_name));
+            }
+            self.allow();
+        }
+        Ok(())
+    }
+
+    /// Management operations (lifecycle, registration, dataset, commit): admin
+    /// or operator roles.
     fn require_admin<T>(
         &self,
         request: &Request<T>,
         request_name: &'static str,
     ) -> Result<(), Status> {
-        let ctx = self.auth_context(request, request_name)?;
-        if let Some(c) = ctx {
-            if c.role != crate::auth::AuthRole::Admin {
-                self.audit.emit(AuditEvent::new(
-                    AuditEventKind::AuthorizationDenied,
-                    AuditOutcome::Rejected,
-                ));
-                return Err(AuthorizationError::PermissionDenied.to_status());
-            }
-            self.audit.emit(AuditEvent::new(
-                AuditEventKind::AuthorizationAllowed,
-                AuditOutcome::Success,
-            ));
-            self.metrics.inc_auth_allowed_total();
-        }
-        Ok(())
+        self.require_permission(request, crate::auth::Permission::Manage, request_name)
     }
 
+    /// Read-only inspection RPCs: admin, operator, or viewer roles.
+    fn require_read<T>(
+        &self,
+        request: &Request<T>,
+        request_name: &'static str,
+    ) -> Result<(), Status> {
+        self.require_permission(request, crate::auth::Permission::Read, request_name)
+    }
+
+    /// Worker-plane self operations require the `worker` role explicitly (an
+    /// admin does not masquerade as a worker for registration/heartbeat).
     fn require_worker_capability<T>(
         &self,
         request: &Request<T>,
@@ -193,30 +243,16 @@ impl CoordinatorServiceImpl {
     ) -> Result<(), Status> {
         let ctx = self.auth_context(request, request_name)?;
         if let Some(c) = ctx {
-            if c.role != crate::auth::AuthRole::Worker {
-                self.audit.emit(AuditEvent {
-                    kind: Some(AuditEventKind::AuthorizationDenied),
-                    outcome: Some(AuditOutcome::Rejected),
-                    subject: Some(c.subject),
-                    role: Some("admin".to_string()),
-                    worker_id: c.worker_id,
-                    run_id: None,
-                    dataset_id: None,
-                    checkpoint_id: None,
-                    reason: Some("permission_denied".to_string()),
-                    request_name: Some(request_name.to_string()),
-                });
-                return Err(AuthorizationError::PermissionDenied.to_status());
+            if !c.is_worker() {
+                return Err(self.deny(&c, "permission_denied", request_name));
             }
-            self.audit.emit(AuditEvent::new(
-                AuditEventKind::AuthorizationAllowed,
-                AuditOutcome::Success,
-            ));
-            self.metrics.inc_auth_allowed_total();
+            self.allow();
         }
         Ok(())
     }
 
+    /// Allow a management-capable caller (admin/operator), or a worker acting on
+    /// its own `worker_id`.
     fn allow_admin_or_worker_self<T>(
         &self,
         request: &Request<T>,
@@ -225,44 +261,37 @@ impl CoordinatorServiceImpl {
     ) -> Result<(), Status> {
         let ctx = self.auth_context(request, request_name)?;
         if let Some(c) = ctx {
-            match c.role {
-                crate::auth::AuthRole::Admin => {
-                    self.audit.emit(AuditEvent::new(
-                        AuditEventKind::AuthorizationAllowed,
-                        AuditOutcome::Success,
-                    ));
-                    Ok(())
-                }
-                crate::auth::AuthRole::Worker => {
-                    let provided = match c.worker_id.clone() {
-                        Some(worker_id) => worker_id,
-                        None => {
-                            self.audit.emit(AuditEvent {
-                                kind: Some(AuditEventKind::AuthorizationDenied),
-                                outcome: Some(AuditOutcome::Rejected),
-                                subject: Some(c.subject),
-                                role: Some("worker".to_string()),
-                                worker_id: None,
-                                run_id: None,
-                                dataset_id: None,
-                                checkpoint_id: None,
-                                reason: Some("missing_identity".to_string()),
-                                request_name: Some(request_name.to_string()),
-                            });
-                            return Err(AuthorizationError::MissingIdentity.to_status());
-                        }
-                    };
-                    if provided == worker_id {
-                        self.audit.emit(AuditEvent::new(
-                            AuditEventKind::AuthorizationAllowed,
-                            AuditOutcome::Success,
-                        ));
-                        Ok(())
-                    } else {
+            if c.has_permission(crate::auth::Permission::Manage) {
+                self.allow();
+                return Ok(());
+            }
+            if c.is_worker() {
+                match c.worker_id.clone() {
+                    None => {
                         self.audit.emit(AuditEvent {
                             kind: Some(AuditEventKind::AuthorizationDenied),
                             outcome: Some(AuditOutcome::Rejected),
-                            subject: Some(c.subject),
+                            subject: Some(c.subject.clone()),
+                            role: Some("worker".to_string()),
+                            worker_id: None,
+                            run_id: None,
+                            dataset_id: None,
+                            checkpoint_id: None,
+                            reason: Some("missing_identity".to_string()),
+                            request_name: Some(request_name.to_string()),
+                        });
+                        self.metrics.inc_auth_denied_total();
+                        return Err(AuthorizationError::MissingIdentity.to_status());
+                    }
+                    Some(provided) if provided == worker_id => {
+                        self.allow();
+                        return Ok(());
+                    }
+                    Some(provided) => {
+                        self.audit.emit(AuditEvent {
+                            kind: Some(AuditEventKind::AuthorizationDenied),
+                            outcome: Some(AuditOutcome::Rejected),
+                            subject: Some(c.subject.clone()),
                             role: Some("worker".to_string()),
                             worker_id: Some(provided),
                             run_id: None,
@@ -271,10 +300,12 @@ impl CoordinatorServiceImpl {
                             reason: Some("worker_identity_mismatch".to_string()),
                             request_name: Some(request_name.to_string()),
                         });
-                        Err(AuthorizationError::WorkerIdentityMismatch.to_status())
+                        self.metrics.inc_auth_denied_total();
+                        return Err(AuthorizationError::WorkerIdentityMismatch.to_status());
                     }
                 }
             }
+            Err(self.deny(&c, "permission_denied", request_name))
         } else {
             Ok(())
         }
@@ -317,6 +348,25 @@ fn already_exists(message: impl Into<String>) -> Status {
     Status::already_exists(message.into())
 }
 
+/// Map an admin run-action failure onto a gRPC status: a missing run is
+/// `NOT_FOUND`, an action invalid from the current lifecycle state is
+/// `FAILED_PRECONDITION` (retrying won't help until the run changes state).
+fn run_action_status(err: RunActionError, run_id: &str) -> Status {
+    match err {
+        RunActionError::RunNotFound => not_found(format!("run {run_id} was not found")),
+        RunActionError::InvalidState { current, action } => {
+            let state = RunState::try_from(current).unwrap_or(RunState::Unspecified);
+            // Friendly label: RUN_STATE_RUNNING -> "running".
+            let label = state
+                .as_str_name()
+                .strip_prefix("RUN_STATE_")
+                .unwrap_or(state.as_str_name())
+                .to_ascii_lowercase();
+            failed_precondition(format!("cannot {action} run {run_id} while it is {label}"))
+        }
+    }
+}
+
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
 const RUNTIME_CAPABILITIES: [&str; 10] = [
     "checkpoint-cleanup-library",
@@ -346,7 +396,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetRuntimeInfoRequest>,
     ) -> Result<Response<GetRuntimeInfoResponse>, Status> {
-        self.require_admin(&request, "admin_request")?;
+        self.require_read(&request, "read_request")?;
         let version = protocol_version();
         let capabilities = RuntimeCapabilities {
             protocol_version: Some(version),
@@ -588,6 +638,9 @@ impl CoordinatorService for CoordinatorServiceImpl {
                 lease_expires_at: Some(assignment.lease_expires_at.into()),
                 progress_offset: assignment.progress_offset,
                 shard_uri: assignment.shard_uri,
+                checksum: assignment.checksum,
+                checksum_algorithm: assignment.checksum_algorithm,
+                size_bytes: assignment.size_bytes,
             })
             .collect();
 
@@ -1164,7 +1217,9 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetLatestCheckpointRequest>,
     ) -> Result<Response<GetLatestCheckpointResponse>, Status> {
-        self.require_admin(&request, "admin_request")?;
+        // Read-only checkpoint metadata: workers need it to restore, admins
+        // to inspect.  Any authenticated principal is accepted.
+        self.auth_context(&request, "checkpoint_read")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -1191,47 +1246,228 @@ impl CoordinatorService for CoordinatorServiceImpl {
 
         self.metrics.inc_latest_checkpoint_reads_total();
 
-        let manifest = CheckpointManifest {
-            run_id: Some(RunId {
-                value: checkpoint.checkpoint.run_id.0,
-            }),
-            checkpoint_id: Some(CheckpointId {
-                value: checkpoint.checkpoint.checkpoint_id.0,
-            }),
-            step: checkpoint.checkpoint.step,
-            state: checkpoint_state_to_proto(checkpoint.checkpoint.state),
-            storage_backend_kind: self
-                .state
-                .get_run(&run_id)
-                .ok_or_else(|| Status::failed_precondition("run metadata missing"))?
-                .storage_backend_kind,
-            artifacts: checkpoint
-                .checkpoint
-                .artifacts
-                .into_iter()
-                .map(|artifact| ArtifactReport {
-                    artifact_name: artifact.artifact_name,
-                    artifact_uri: artifact.storage_key,
-                    size_bytes: artifact.size_bytes as i64,
-                    checksum: artifact.checksum,
-                    checksum_algorithm: artifact.checksum_algorithm,
-                    uploaded_at: Some(millis_to_timestamp(checkpoint.checkpoint.updated_at_millis)),
-                })
-                .collect(),
-            created_at: Some(millis_to_timestamp(checkpoint.checkpoint.created_at_millis)),
-            committed_at: checkpoint.committed_at_millis.map(millis_to_timestamp),
-        };
+        let storage_backend_kind = self
+            .state
+            .get_run(&run_id)
+            .ok_or_else(|| Status::failed_precondition("run metadata missing"))?
+            .storage_backend_kind;
+        let manifest = record_to_manifest(checkpoint, storage_backend_kind);
 
         Ok(Response::new(GetLatestCheckpointResponse {
             manifest: Some(manifest),
         }))
     }
 
+    async fn list_checkpoints(
+        &self,
+        request: Request<ListCheckpointsRequest>,
+    ) -> Result<Response<ListCheckpointsResponse>, Status> {
+        self.auth_context(&request, "checkpoint_read")?;
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let records = self
+            .state
+            .list_checkpoints(
+                &run_id.value,
+                request.committed_only,
+                request.limit as usize,
+            )
+            .map_err(|error| match error {
+                crate::state::ListCheckpointsError::RunNotFound => {
+                    not_found(format!("run {} was not found", run_id.value))
+                }
+                crate::state::ListCheckpointsError::PersistenceUnavailable => {
+                    Status::unavailable("metadata store unavailable; retry")
+                }
+            })?;
+
+        let storage_backend_kind = self
+            .state
+            .get_run(&run_id)
+            .map(|r| r.storage_backend_kind)
+            .unwrap_or_default();
+        Ok(Response::new(ListCheckpointsResponse {
+            checkpoints: records
+                .into_iter()
+                .map(|record| record_to_manifest(record, storage_backend_kind))
+                .collect(),
+        }))
+    }
+
+    async fn report_checkpoint_corrupt(
+        &self,
+        request: Request<ReportCheckpointCorruptRequest>,
+    ) -> Result<Response<ReportCheckpointCorruptResponse>, Status> {
+        let auth_worker_id = request
+            .get_ref()
+            .worker_id
+            .as_ref()
+            .map(|w| w.value.clone())
+            .unwrap_or_default();
+        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("report_checkpoint_corrupt", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let checkpoint_id = request
+            .checkpoint_id
+            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?;
+
+        let fallback = self
+            .state
+            .report_checkpoint_corrupt(&run_id.value, &checkpoint_id.value, &request.reason)
+            .map_err(|error| match error {
+                crate::state::ReportCorruptError::RunNotFound => {
+                    not_found(format!("run {} was not found", run_id.value))
+                }
+                crate::state::ReportCorruptError::CheckpointNotFound => not_found(format!(
+                    "checkpoint {} was not found under run {}",
+                    checkpoint_id.value, run_id.value
+                )),
+                crate::state::ReportCorruptError::PersistenceUnavailable => {
+                    Status::unavailable("metadata store unavailable; retry")
+                }
+            })?;
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::CheckpointCorruptReported),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            checkpoint_id: Some(checkpoint_id.value.clone()),
+            reason: Some(request.reason.clone()),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(ReportCheckpointCorruptResponse {
+            state: CheckpointState::Failed as i32,
+            has_fallback: fallback.is_some(),
+            fallback_checkpoint_id: fallback.map(|value| CheckpointId { value }),
+        }))
+    }
+
+    type FetchCheckpointArtifactStream = std::pin::Pin<
+        Box<
+            dyn futures_core::Stream<Item = Result<FetchCheckpointArtifactChunk, Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    async fn fetch_checkpoint_artifact(
+        &self,
+        request: Request<FetchCheckpointArtifactRequest>,
+    ) -> Result<Response<Self::FetchCheckpointArtifactStream>, Status> {
+        self.auth_context(&request, "checkpoint_read")?;
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?
+            .value;
+        let checkpoint_id = request
+            .checkpoint_id
+            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?
+            .value;
+        let owner_worker_id = request
+            .owner_worker_id
+            .ok_or_else(|| Status::invalid_argument("owner_worker_id is required"))?
+            .value;
+        let artifact_name = request.artifact_name;
+        if artifact_name.trim().is_empty() {
+            return Err(invalid_argument("artifact_name must be non-empty"));
+        }
+
+        let storage_root = self.storage_root.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "coordinator storage root not configured; start with --storage-root <path>",
+            )
+        })?;
+        let artifact_key = runtime_storage::checkpoint_worker_artifact(
+            &run_id,
+            &checkpoint_id,
+            &owner_worker_id,
+            &artifact_name,
+        );
+        let mut artifact_path = storage_root.as_ref().clone();
+        for segment in artifact_key.as_str().split('/') {
+            artifact_path.push(segment);
+        }
+
+        let mut file = tokio::fs::File::open(&artifact_path).await.map_err(|e| {
+            not_found(format!(
+                "artifact {artifact_name} of checkpoint {checkpoint_id} not found in coordinator storage: {e}"
+            ))
+        })?;
+
+        let metrics = self.metrics.clone();
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<FetchCheckpointArtifactChunk, Status>>(8);
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            const CHUNK: usize = 512 * 1024;
+            let mut hasher = Sha256::new();
+            let mut sequence: u64 = 0;
+            let mut total: i64 = 0;
+            let mut buf = vec![0u8; CHUNK];
+            loop {
+                match file.read(&mut buf).await {
+                    Ok(0) => {
+                        let checksum = hex::encode(hasher.finalize());
+                        let _ = tx
+                            .send(Ok(FetchCheckpointArtifactChunk {
+                                data: Vec::new(),
+                                sequence,
+                                last: true,
+                                total_size_bytes: total,
+                                checksum,
+                                checksum_algorithm: "sha256".to_string(),
+                            }))
+                            .await;
+                        metrics.add_storage_bytes_read(total.max(0) as u64);
+                        break;
+                    }
+                    Ok(n) => {
+                        hasher.update(&buf[..n]);
+                        total += n as i64;
+                        if tx
+                            .send(Ok(FetchCheckpointArtifactChunk {
+                                data: buf[..n].to_vec(),
+                                sequence,
+                                last: false,
+                                total_size_bytes: 0,
+                                checksum: String::new(),
+                                checksum_algorithm: String::new(),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break; // client went away
+                        }
+                        sequence += 1;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("artifact read failed: {e}"))))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
+    }
+
     async fn get_run_status(
         &self,
         request: Request<GetRunStatusRequest>,
     ) -> Result<Response<GetRunStatusResponse>, Status> {
-        self.require_admin(&request, "admin_request")?;
+        self.require_read(&request, "read_request")?;
         let request = request.into_inner();
         let run_id = request
             .run_id
@@ -1357,6 +1593,246 @@ impl CoordinatorService for CoordinatorServiceImpl {
         }))
     }
 
+    async fn pause_run(
+        &self,
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("pause_run", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let (state, state_reason) = self
+            .state
+            .pause_run(&run_id.value, &request.reason)
+            .map_err(|e| run_action_status(e, &run_id.value))?;
+        info!(run_id = %run_id.value, reason = %request.reason, "run paused");
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunPaused),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            reason: (!request.reason.is_empty()).then(|| request.reason.clone()),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(RunActionResponse {
+            state,
+            state_reason,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn resume_run(
+        &self,
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("resume_run", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let (state, state_reason) = self
+            .state
+            .resume_run(&run_id.value)
+            .map_err(|e| run_action_status(e, &run_id.value))?;
+        info!(run_id = %run_id.value, "run resumed");
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunResumed),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            reason: (!request.reason.is_empty()).then(|| request.reason.clone()),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(RunActionResponse {
+            state,
+            state_reason,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn retry_run(
+        &self,
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("retry_run", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let (state, state_reason, retry_count) = self
+            .state
+            .retry_run(&run_id.value)
+            .map_err(|e| run_action_status(e, &run_id.value))?;
+        info!(run_id = %run_id.value, retry_count, "run retried");
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunRetried),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            reason: Some(format!("retry #{retry_count}")),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(RunActionResponse {
+            state,
+            state_reason,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn drain_run(
+        &self,
+        request: Request<RunActionRequest>,
+    ) -> Result<Response<RunActionResponse>, Status> {
+        self.require_admin(&request, "admin_request")?;
+        let request = request.into_inner();
+        validate_idempotency_key("drain_run", &request.idempotency_key)?;
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        let (state, state_reason) = self
+            .state
+            .drain_run(&run_id.value, &request.reason)
+            .map_err(|e| run_action_status(e, &run_id.value))?;
+        info!(run_id = %run_id.value, reason = %request.reason, "run draining");
+
+        self.audit.emit(AuditEvent {
+            kind: Some(AuditEventKind::RunDrained),
+            outcome: Some(AuditOutcome::Success),
+            run_id: Some(run_id.value.clone()),
+            reason: (!request.reason.is_empty()).then(|| request.reason.clone()),
+            ..AuditEvent::default()
+        });
+
+        Ok(Response::new(RunActionResponse {
+            state,
+            state_reason,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn list_runs(
+        &self,
+        request: Request<ListRunsRequest>,
+    ) -> Result<Response<ListRunsResponse>, Status> {
+        self.require_read(&request, "read_request")?;
+        let request = request.into_inner();
+        self.state.reconcile_worker_liveness();
+
+        // RUN_STATE_UNSPECIFIED (0) means "all states"; any other value filters.
+        let filter =
+            (request.state_filter != RunState::Unspecified as i32).then_some(request.state_filter);
+
+        let runs = self
+            .state
+            .list_runs(filter)
+            .into_iter()
+            .map(|r| RunSummary {
+                run_id: Some(RunId { value: r.run_id }),
+                run_name: r.run_name,
+                state: r.state,
+                state_reason: r.state_reason,
+                world_size: r.world_size,
+                active_worker_count: r.active_worker_count,
+                latest_checkpoint_id: r.latest_checkpoint_id,
+                latest_checkpoint_state: r.latest_checkpoint_state,
+                retry_count: r.retry_count,
+                registered_at: Some(r.registered_at.into()),
+            })
+            .collect();
+
+        Ok(Response::new(ListRunsResponse {
+            runs,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn list_workers(
+        &self,
+        request: Request<ListWorkersRequest>,
+    ) -> Result<Response<ListWorkersResponse>, Status> {
+        self.require_read(&request, "read_request")?;
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+
+        self.state.reconcile_worker_liveness();
+
+        // WORKER_STATE_UNSPECIFIED (0) means "all states".
+        let filter = (request.state_filter != WorkerState::Unspecified as i32)
+            .then_some(request.state_filter);
+
+        let workers = self
+            .state
+            .list_workers(&run_id.value, filter)
+            .ok_or_else(|| not_found(format!("run {} was not found", run_id.value)))?
+            .into_iter()
+            .map(|w| WorkerInfo {
+                worker_id: Some(WorkerId { value: w.worker_id }),
+                rank: w.rank,
+                host: w.host,
+                state: w.state,
+                sdk_version: w.sdk_version,
+                last_heartbeat_at: Some(w.last_heartbeat_at.into()),
+                next_heartbeat_deadline: Some(w.next_heartbeat_deadline.into()),
+                failure_deadline: Some(w.failure_deadline.into()),
+            })
+            .collect();
+
+        Ok(Response::new(ListWorkersResponse {
+            workers,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
+    async fn list_shard_progress(
+        &self,
+        request: Request<ListShardProgressRequest>,
+    ) -> Result<Response<ListShardProgressResponse>, Status> {
+        self.require_read(&request, "read_request")?;
+        let request = request.into_inner();
+        let run_id = request
+            .run_id
+            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let dataset_filter = request
+            .dataset_id
+            .map(|d| d.value)
+            .filter(|d| !d.is_empty());
+
+        let shards = self
+            .state
+            .list_shard_progress(&run_id.value, dataset_filter.as_deref())
+            .into_iter()
+            .map(|s| ShardProgressInfo {
+                shard_id: Some(ShardId { value: s.shard_id }),
+                dataset_id: Some(DatasetId {
+                    value: s.dataset_id,
+                }),
+                worker_id: Some(WorkerId { value: s.worker_id }),
+                lease_epoch: s.lease_epoch,
+                progress_offset: s.progress_offset,
+                is_complete: s.is_complete,
+                updated_at: Some(s.updated_at.into()),
+            })
+            .collect();
+
+        Ok(Response::new(ListShardProgressResponse {
+            shards,
+            server_time: Some(std::time::SystemTime::now().into()),
+        }))
+    }
+
     async fn join_rendezvous(
         &self,
         request: Request<JoinRendezvousRequest>,
@@ -1466,6 +1942,38 @@ fn rendezvous_snapshot_to_proto(snapshot: crate::rendezvous::RendezvousSnapshot)
         store_addr: snapshot.store_addr,
         store_port: snapshot.store_port,
         server_time: Some(std::time::SystemTime::now().into()),
+    }
+}
+
+fn record_to_manifest(
+    record: crate::state::CoordinatorCheckpointRecord,
+    storage_backend_kind: i32,
+) -> CheckpointManifest {
+    CheckpointManifest {
+        run_id: Some(RunId {
+            value: record.checkpoint.run_id.0,
+        }),
+        checkpoint_id: Some(CheckpointId {
+            value: record.checkpoint.checkpoint_id.0,
+        }),
+        step: record.checkpoint.step,
+        state: checkpoint_state_to_proto(record.checkpoint.state),
+        storage_backend_kind,
+        artifacts: record
+            .checkpoint
+            .artifacts
+            .into_iter()
+            .map(|artifact| ArtifactReport {
+                artifact_name: artifact.artifact_name,
+                artifact_uri: artifact.storage_key,
+                size_bytes: artifact.size_bytes as i64,
+                checksum: artifact.checksum,
+                checksum_algorithm: artifact.checksum_algorithm,
+                uploaded_at: Some(millis_to_timestamp(record.checkpoint.updated_at_millis)),
+            })
+            .collect(),
+        created_at: Some(millis_to_timestamp(record.checkpoint.created_at_millis)),
+        committed_at: record.committed_at_millis.map(millis_to_timestamp),
     }
 }
 
@@ -1615,6 +2123,199 @@ mod tests {
         )
     }
 
+    const JWT_TEST_SECRET: &[u8] = b"service-integration-jwt-secret";
+
+    /// A service whose authenticator validates JWT bearer tokens (HS256) and
+    /// has the dev metadata-header fallback disabled — production posture.
+    fn build_service_with_jwt() -> (CoordinatorServiceImpl, tempfile::TempDir) {
+        use crate::security::jwt::{JwtConfig, JwtValidator};
+        use crate::security::keyset::{KeySource, ReloadableKeySet};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jwt-secret");
+        std::fs::write(&path, JWT_TEST_SECRET).unwrap();
+        let keys = Arc::new(
+            ReloadableKeySet::load(KeySource::HmacSecret {
+                path,
+                algorithm: jsonwebtoken::Algorithm::HS256,
+            })
+            .unwrap(),
+        );
+        let validator = Arc::new(JwtValidator::new(JwtConfig::default(), keys));
+        let authenticator = Authorizer::new(crate::auth::AuthMode::Metadata)
+            .with_jwt(validator)
+            .with_metadata_fallback(false);
+        let service = CoordinatorServiceImpl::with_metrics_authorizer_and_audit(
+            Arc::new(CoordinatorState::default()),
+            Arc::new(RuntimeMetrics::default()),
+            authenticator,
+            AuditLogger::new(Arc::new(crate::audit::InMemoryAuditSink::default())),
+        );
+        (service, dir)
+    }
+
+    fn mint_jwt(roles: serde_json::Value, exp_offset_secs: i64) -> String {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "svc-account",
+                "exp": now + exp_offset_secs,
+                "roles": roles,
+            }),
+            &EncodingKey::from_secret(JWT_TEST_SECRET),
+        )
+        .unwrap()
+    }
+
+    fn request_with_bearer<T>(token: &str, inner: T) -> Request<T> {
+        let mut request = Request::new(inner);
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request
+    }
+
+    fn request_as_role<T>(role: &str, inner: T) -> Request<T> {
+        let mut request = Request::new(inner);
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-subject", "rbac-subject".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert("x-dtruntime-role", role.parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn viewer_can_read_but_not_manage() {
+        let service = build_service_with_metadata_auth();
+        // Viewer may list runs (read) ...
+        service
+            .list_runs(request_as_role(
+                "viewer",
+                ListRunsRequest { state_filter: 0 },
+            ))
+            .await
+            .expect("viewer should read");
+        // ... but not register (manage/register) ...
+        let register_err = service
+            .register_run(request_as_role("viewer", register_request("v-key")))
+            .await
+            .expect_err("viewer must not register runs");
+        assert_permission_denied(register_err);
+        // ... nor cancel (manage).
+        let cancel_err = service
+            .cancel_run(request_as_role(
+                "viewer",
+                CancelRunRequest {
+                    run_id: Some(RunId {
+                        value: "any".to_string(),
+                    }),
+                    reason: String::new(),
+                    idempotency_key: String::new(),
+                },
+            ))
+            .await
+            .expect_err("viewer must not cancel");
+        assert_permission_denied(cancel_err);
+    }
+
+    #[tokio::test]
+    async fn operator_can_manage_runs() {
+        let service = build_service_with_metadata_auth();
+        let run_id = service
+            .register_run(request_as_role("operator", register_request("op-key")))
+            .await
+            .expect("operator should register")
+            .into_inner()
+            .run_id
+            .unwrap();
+        service
+            .pause_run(request_as_role(
+                "operator",
+                RunActionRequest {
+                    run_id: Some(run_id.clone()),
+                    reason: "op maintenance".to_string(),
+                    idempotency_key: String::new(),
+                },
+            ))
+            .await
+            .expect("operator should pause");
+    }
+
+    #[tokio::test]
+    async fn jwt_admin_token_authorizes_management() {
+        let (service, _dir) = build_service_with_jwt();
+        let token = mint_jwt(serde_json::json!(["admin"]), 300);
+        service
+            .register_run(request_with_bearer(&token, register_request("jwt-key")))
+            .await
+            .expect("valid admin JWT should authorize register_run");
+    }
+
+    #[tokio::test]
+    async fn jwt_viewer_token_cannot_manage() {
+        let (service, _dir) = build_service_with_jwt();
+        let token = mint_jwt(serde_json::json!(["viewer"]), 300);
+        // Read is allowed.
+        service
+            .list_runs(request_with_bearer(
+                &token,
+                ListRunsRequest { state_filter: 0 },
+            ))
+            .await
+            .expect("viewer JWT should read");
+        // Management is denied.
+        let err = service
+            .register_run(request_with_bearer(&token, register_request("v2-key")))
+            .await
+            .expect_err("viewer JWT must not register");
+        assert_permission_denied(err);
+    }
+
+    // ── threat-model validation ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn threat_expired_token_is_rejected() {
+        let (service, _dir) = build_service_with_jwt();
+        let token = mint_jwt(serde_json::json!(["admin"]), -300);
+        let err = service
+            .register_run(request_with_bearer(&token, register_request("exp-key")))
+            .await
+            .expect_err("expired token must be rejected");
+        assert_unauthenticated(err);
+    }
+
+    #[tokio::test]
+    async fn threat_forged_token_signature_is_rejected() {
+        let (service, _dir) = build_service_with_jwt();
+        let mut token = mint_jwt(serde_json::json!(["admin"]), 300);
+        // Corrupt the signature segment.
+        let last = token.pop().unwrap();
+        token.push(if last == 'A' { 'B' } else { 'A' });
+        let err = service
+            .register_run(request_with_bearer(&token, register_request("forge-key")))
+            .await
+            .expect_err("forged signature must be rejected");
+        assert_unauthenticated(err);
+    }
+
+    #[tokio::test]
+    async fn threat_header_identity_ignored_when_fallback_disabled() {
+        // With JWT auth and header fallback disabled, a caller cannot escalate
+        // by asserting `x-dtruntime-role: admin` — no bearer, no access.
+        let (service, _dir) = build_service_with_jwt();
+        let err = service
+            .register_run(request_as_role("admin", register_request("spoof-key")))
+            .await
+            .expect_err("spoofed header identity must not authorize");
+        assert_unauthenticated(err);
+    }
+
     fn request_as_admin<T>(inner: T) -> Request<T> {
         let mut request = Request::new(inner);
         request
@@ -1649,9 +2350,10 @@ mod tests {
         request
             .metadata_mut()
             .insert("x-dtruntime-subject", "bad-role-subject".parse().unwrap());
+        // An unrecognized role token — rejected as Unauthenticated (InvalidRole).
         request
             .metadata_mut()
-            .insert("x-dtruntime-role", "viewer".parse().unwrap());
+            .insert("x-dtruntime-role", "superuser".parse().unwrap());
         request
     }
 
@@ -2033,17 +2735,17 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert_permission_denied(
-            service
-                .get_latest_checkpoint(request_as_worker(
-                    &worker_id.value,
-                    GetLatestCheckpointRequest {
-                        run_id: Some(run_id.clone()),
-                    },
-                ))
-                .await
-                .expect_err("worker denied"),
-        );
+        // Checkpoint metadata reads are allowed for workers too: restore runs
+        // under worker identity.
+        service
+            .get_latest_checkpoint(request_as_worker(
+                &worker_id.value,
+                GetLatestCheckpointRequest {
+                    run_id: Some(run_id.clone()),
+                },
+            ))
+            .await
+            .expect("worker may read checkpoint metadata for restore");
 
         service
             .get_runtime_info(request_as_admin(GetRuntimeInfoRequest {}))
@@ -2098,6 +2800,119 @@ mod tests {
         );
         assert_eq!(status.active_worker_count, 0);
         assert!(status.server_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_runs_returns_registered_run_and_filters_by_state() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        // Unfiltered: the newly registered run is visible and PENDING.
+        let all = service
+            .list_runs(Request::new(ListRunsRequest { state_filter: 0 }))
+            .await
+            .expect("list_runs should succeed")
+            .into_inner();
+        assert_eq!(all.runs.len(), 1);
+        assert_eq!(all.runs[0].run_id.as_ref(), Some(&run_id));
+        assert_eq!(all.runs[0].state, RunState::Pending as i32);
+        assert_eq!(all.runs[0].retry_count, 0);
+
+        // Filtering to a state the run is not in returns nothing.
+        let failed = service
+            .list_runs(Request::new(ListRunsRequest {
+                state_filter: RunState::Failed as i32,
+            }))
+            .await
+            .expect("list_runs should succeed")
+            .into_inner();
+        assert!(failed.runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pause_resume_cycle_reports_states() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+
+        let paused = service
+            .pause_run(Request::new(RunActionRequest {
+                run_id: Some(run_id.clone()),
+                reason: "maintenance".to_string(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect("pause_run should succeed")
+            .into_inner();
+        assert_eq!(paused.state, RunState::Paused as i32);
+        assert!(paused.state_reason.contains("maintenance"));
+
+        let resumed = service
+            .resume_run(Request::new(RunActionRequest {
+                run_id: Some(run_id.clone()),
+                reason: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect("resume_run should succeed")
+            .into_inner();
+        // No active workers -> back to PENDING for a fresh launch.
+        assert_eq!(resumed.state, RunState::Pending as i32);
+    }
+
+    #[tokio::test]
+    async fn pause_invalid_state_maps_to_failed_precondition() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let run_id = create_run(&service).await;
+        // Cancel first so the run is terminal and not pausable.
+        service
+            .cancel_run(Request::new(CancelRunRequest {
+                run_id: Some(run_id.clone()),
+                reason: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect("cancel_run should succeed");
+
+        let status = service
+            .pause_run(Request::new(RunActionRequest {
+                run_id: Some(run_id.clone()),
+                reason: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect_err("pause of a cancelled run should fail");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn admin_action_on_unknown_run_is_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let status = service
+            .drain_run(Request::new(RunActionRequest {
+                run_id: Some(RunId {
+                    value: "ghost".to_string(),
+                }),
+                reason: String::new(),
+                idempotency_key: String::new(),
+            }))
+            .await
+            .expect_err("drain of an unknown run should fail");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn list_workers_unknown_run_is_not_found() {
+        let service = CoordinatorServiceImpl::new(Arc::new(CoordinatorState::default()));
+        let status = service
+            .list_workers(Request::new(ListWorkersRequest {
+                run_id: Some(RunId {
+                    value: "ghost".to_string(),
+                }),
+                state_filter: 0,
+            }))
+            .await
+            .expect_err("list_workers for an unknown run should fail");
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -3002,6 +3817,8 @@ mod tests {
             .into_inner();
         assert!(second.accepted);
 
+        // A second *distinct* artifact from the same worker is legitimate:
+        // distributed checkpoint formats write several files per rank.
         let third = service
             .report_checkpoint_artifact(Request::new(artifact_request(
                 run_id.clone(),
@@ -3012,12 +3829,30 @@ mod tests {
                 "artifact-key-2",
             )))
             .await
+            .unwrap()
+            .into_inner();
+        assert!(third.accepted);
+
+        // Re-reporting an existing artifact name with different metadata is a
+        // conflict.
+        let mut conflicting = artifact_request(
+            run_id.clone(),
+            worker_id.clone(),
+            "ckpt-1",
+            "a.bin",
+            "s3://bucket/a.bin",
+            "artifact-key-3",
+        );
+        conflicting.artifact_report.as_mut().unwrap().checksum = "different-sum".to_string();
+        let fourth = service
+            .report_checkpoint_artifact(Request::new(conflicting))
+            .await
             .unwrap_err();
-        assert_eq!(third.code(), tonic::Code::InvalidArgument);
-        assert!(third
+        assert_eq!(fourth.code(), tonic::Code::InvalidArgument);
+        assert!(fourth
             .message()
             .contains("worker already reported conflicting artifact metadata"));
-        assert_eq!(service.metrics_snapshot().storage_bytes_written, 20);
+        assert_eq!(service.metrics_snapshot().storage_bytes_written, 30);
     }
 
     #[tokio::test]

@@ -1,0 +1,119 @@
+# PrometheusRule for the Prometheus Operator. Apply alongside a Prometheus that
+# selects this rule (ruleSelector). The rule bodies mirror
+# observability/prometheus/{recording,alerts}.rules.yml — keep them in sync.
+#
+# If you are NOT running the Prometheus Operator, mount those two files into a
+# self-managed Prometheus via a ConfigMap and reference them from
+# prometheus.yml `rule_files` instead (see observability/prometheus/).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: dtruntime-rules
+  namespace: dtruntime
+  labels:
+    app: dtruntime
+    role: alert-rules
+    # Match this to your Prometheus `ruleSelector`.
+    release: prometheus
+spec:
+  groups:
+    - name: dtruntime.sli.recording
+      interval: 30s
+      rules:
+        - record: job:dtruntime_up:ratio_rate5m
+          expr: avg_over_time(up{job="dtruntime-coordinator"}[5m])
+        - record: job:dtruntime_up:ratio_rate1h
+          expr: avg_over_time(up{job="dtruntime-coordinator"}[1h])
+        - record: dtruntime:checkpoint_failure:ratio_rate5m
+          expr: |
+            sum(rate(dtruntime_checkpoint_failures_total[5m]))
+            /
+            clamp_min(sum(rate(dtruntime_checkpoints_started_total[5m])), 1e-9)
+        - record: dtruntime:workers_unhealthy:ratio
+          expr: |
+            (dtruntime_stale_workers + dtruntime_failed_workers)
+            /
+            clamp_min(
+              dtruntime_active_workers + dtruntime_stale_workers + dtruntime_failed_workers,
+              1
+            )
+
+    - name: dtruntime.availability
+      rules:
+        - alert: CoordinatorDown
+          expr: up{job="dtruntime-coordinator"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Coordinator {{ $labels.instance }} is down"
+            description: "The coordinator has failed /metrics scrapes for >2m."
+            runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#coordinatordown"
+        - alert: CoordinatorAvailabilityFastBurn
+          expr: |
+            (1 - job:dtruntime_up:ratio_rate5m) > (14.4 * 0.001)
+            and
+            (1 - job:dtruntime_up:ratio_rate1h) > (14.4 * 0.001)
+          for: 2m
+          labels:
+            severity: critical
+            slo: availability
+          annotations:
+            summary: "Availability error budget burning fast (14.4x)"
+            runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#availabilityslo"
+
+    - name: dtruntime.checkpoints
+      rules:
+        - alert: CheckpointFailuresElevated
+          expr: dtruntime:checkpoint_failure:ratio_rate5m > 0.01
+          for: 15m
+          labels:
+            severity: critical
+            slo: checkpoint_durability
+          annotations:
+            summary: "Checkpoint failure ratio >1% (5m)"
+            runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#checkpointfailureselevated"
+        - alert: CheckpointCommitStalled
+          expr: |
+            increase(dtruntime_checkpoints_started_total[30m]) > 0
+            and
+            increase(dtruntime_checkpoints_committed_total[30m]) == 0
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Checkpoints starting but none committing"
+            runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#checkpointcommitstalled"
+
+    - name: dtruntime.workers
+      rules:
+        - alert: HighStaleWorkerRatio
+          expr: dtruntime:workers_unhealthy:ratio > 0.25
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "More than 25% of workers are stale/failed"
+            runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#highstaleworkerratio"
+        - alert: WorkersSilentButPresent
+          expr: |
+            sum(rate(dtruntime_heartbeats_total[5m])) == 0
+            and
+            sum(dtruntime_active_workers) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Active workers present but no heartbeats"
+            runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#workerssilentbutpresent"
+
+    - name: dtruntime.security
+      rules:
+        - alert: HighAuthDenialRate
+          expr: sum(rate(dtruntime_auth_denied_total[5m])) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Elevated authorization-denied rate"
+            runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#highauthdenialrate"
