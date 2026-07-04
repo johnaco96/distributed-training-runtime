@@ -1,0 +1,12 @@
+# A 3-worker-node kind cluster so rendezvous, checkpoint restore, and data
+# locality are exercised across *separate* nodes (separate kubelets), not just
+# multiple processes on one host.
+#
+#   kind create cluster --name dtr-multinode --config kind-multinode.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker

@@ -1,0 +1,25 @@
+# Vector: tail the coordinator's NDJSON audit file, parse each line as JSON, and
+# forward to Loki labeled job=dtruntime-audit. This is the standard log-shipper
+# pattern documented in docs/audit-logging.md.
+[sources.audit]
+type = "file"
+include = ["/audit/audit.ndjson"]
+read_from = "beginning"
+
+[transforms.parse]
+type = "remap"
+inputs = ["audit"]
+source = '''
+parsed = parse_json!(.message)
+. = parsed
+.job = "dtruntime-audit"
+'''
+
+[sinks.loki]
+type = "loki"
+inputs = ["parse"]
+endpoint = "http://loki:3100"
+encoding.codec = "json"
+[sinks.loki.labels]
+job = "dtruntime-audit"
+kind = "{{ kind }}"

@@ -1,0 +1,19 @@
+{
+  "item": "audit-siem-ingestion",
+  "date": "2026-07-04",
+  "verdict": "PASS",
+  "stack": "grafana/loki:3.0.0 + timberio/vector:0.39.0 (docker compose)",
+  "flow": "coordinator --audit-log-file (NDJSON) -> Vector file tail + parse -> Loki",
+  "records_ingested": 17,
+  "by_kind": {
+    "TlsEnabled": 2,
+    "RunRegistered": 1,
+    "CoordinatorStarted": 2,
+    "AuthorizationDenied": 3,
+    "AuthorizationAllowed": 2,
+    "AuthModeConfigured": 2,
+    "AuthMetadataAccepted": 5
+  },
+  "logql_query": "{job=\"dtruntime-audit\"}",
+  "note": "All emitted audit events (incl. AuthorizationDenied/Allowed) are ingested into a real log store and queryable \u2014 upgrades SIEM from NDJSON-sink-only to end-to-end proven."
+}

@@ -1,0 +1,14 @@
+{
+  "item": "scheduler-kueue-quota-admission",
+  "date": "2026-07-04",
+  "verdict": "PASS",
+  "kueue": "v0.8.1 (real controller in kind cluster kind-dtr-e2e)",
+  "setup": "ClusterQueue dtruntime-cq nominalQuota cpu=1; LocalQueue dtruntime-lq",
+  "jobs": "two Jobs rendered exactly as the operator KueueBackend does: label kueue.x-k8s.io/queue-name + suspend:true + cpu:1 request",
+  "observed": {
+    "step1": "job-b Workload Admitted=True, job-b unsuspended & running; job-a Workload NOT admitted, job-a stays suspended (quota exhausted)",
+    "step2": "deleted job-b (frees 1 CPU) -> Kueue admitted job-a (Admitted=True, unsuspended, active)"
+  },
+  "note": "Real Kueue admits and gates the operator-rendered Jobs by quota. Upgrades the Kueue scheduler row from documented-to-contract to proven against a live Kueue.",
+  "volcano_note": "Volcano gang-scheduling is only meaningful on a multi-node cluster (minMember trivially satisfiable on 1 node); it is exercised in the multi-node / Tier-2 campaign."
+}

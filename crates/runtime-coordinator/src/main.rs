@@ -100,6 +100,12 @@ struct CoordinatorCliArgs {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The dependency tree enables both rustls crypto providers (ring +
+    // aws-lc-rs), so rustls 0.23 cannot auto-select one and panics when TLS is
+    // built. Install the ring provider explicitly before any TLS is set up.
+    // (install_default errors only if a provider is already installed.)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     init_tracing_from_env();
 
     let args = coordinator_args(std::env::args().skip(1))?;

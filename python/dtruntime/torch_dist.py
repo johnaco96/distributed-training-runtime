@@ -99,7 +99,7 @@ class _HeartbeatThread(threading.Thread):
         self._membership_changed = membership_changed
         self._run_terminated = run_terminated
         self.terminal_run_state = 0
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._joined_round_lock = threading.Lock()
         self._joined_round = 0
 
@@ -109,10 +109,10 @@ class _HeartbeatThread(threading.Thread):
         self._membership_changed.clear()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self) -> None:  # pragma: no cover - exercised via integration test
-        while not self._stop.wait(self._interval):
+        while not self._stop_event.wait(self._interval):
             try:
                 response = self._client.heartbeat(
                     run_id=self._run_id, worker_id=self._worker_id

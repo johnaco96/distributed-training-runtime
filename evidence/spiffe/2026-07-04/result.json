@@ -1,0 +1,15 @@
+{
+  "item": "spiffe-spire-auth",
+  "date": "2026-07-04",
+  "verdict": "PASS",
+  "spire": "ghcr.io/spiffe/spire-server:1.9.6 (real SVIDs minted via x509 mint)",
+  "trust_domain": "dtruntime.example.org",
+  "server_svid_san": "(('DNS', 'localhost'), ('URI', 'spiffe://dtruntime.example.org/coordinator'))",
+  "admin_svid_san": "(('URI', 'spiffe://dtruntime.example.org/ns/dtruntime/sa/admin'),)",
+  "nobody_svid_san": "(('URI', 'spiffe://dtruntime.example.org/ns/other/sa/nobody'),)",
+  "results": {
+    "admin_svid (mapped /ns/dtruntime/sa/admin)": "AUTHORIZED as admin (source=spiffe)",
+    "nobody_svid (unmapped /ns/other/sa/nobody)": "REJECTED UNAUTHENTICATED (NoRolesMapped)"
+  },
+  "bug_found": "TLS/mTLS panicked at startup (rustls 0.23 could not auto-select a CryptoProvider: both ring and aws-lc-rs enabled). Fixed by installing the ring provider at main() startup. TLS was broken for ALL --tls-cert use, not just SPIFFE."
+}

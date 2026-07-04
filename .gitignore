@@ -79,3 +79,8 @@ perf.data.*
 .flamegraph-tmp/
 *.svg.tmp
 tmp/
+
+# evidence harness runtime artifacts (bundles under evidence/ are committed)
+tools/evidence/*/audit/
+tools/evidence/*/.run/
+tools/evidence/spiffe/out/
