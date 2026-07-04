@@ -7,15 +7,35 @@
 # Fail on any crate with a known RUSTSEC advisory or that has been yanked.
 version = 2
 yanked = "deny"
-# Add specific advisory ids here only with a documented justification and a
-# tracking issue to remove them.
-ignore = []
+# Ignored advisories — ONLY transitive deps with no stable fix available yet,
+# each with a justification and a removal trigger. Re-audit and drop these as
+# upstream ships fixes (rustls-webpki 0.104 stable; AWS SDK moving off the old
+# rustls 0.21 chain).
+ignore = [
+    # rustls-pemfile is unmaintained (superseded upstream by rustls-pki-types).
+    # Transitive via the aws-sdk / tonic TLS stack; PEM parsing only, no known
+    # vulnerability. Remove when those deps drop it.
+    { id = "RUSTSEC-2025-0134", reason = "unmaintained transitive PEM parser; no fix, no known vuln; tracked" },
+    # rustls-webpki name-constraint validation issues. The fix is only in the
+    # 0.104 pre-release (0.103.13 is the latest stable, which we pin). Our TLS
+    # trust paths (SPIRE/self-signed/cert-manager for mTLS; public CAs for AWS
+    # S3) do not rely on attacker-controlled name-constrained CAs, so practical
+    # exposure is low. Remove when rustls-webpki 0.104 ships stable.
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki name constraints; no stable fix yet (only 0.104-alpha); low practical exposure; tracked" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki name constraints (wildcard); no stable fix yet; low practical exposure; tracked" },
+    # Reachable panic when parsing a malicious CRL. We do not configure CRLs, so
+    # this path is not reachable in our deployments. Remove when patched.
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parse panic; we do not use CRLs so unreachable; no stable fix yet; tracked" },
+]
 
 [bans]
 # Flag pulling in the same crate at many major versions (bloat / risk surface).
 multiple-versions = "warn"
-# Wildcard ("*") version requirements are forbidden — pin real ranges.
+# Wildcard ("*") version requirements are forbidden for external crates — but
+# internal workspace path dependencies (which legitimately carry no version)
+# are allowed.
 wildcards = "deny"
+allow-wildcard-paths = true
 allow = []
 deny = []
 

@@ -53,7 +53,7 @@ import socket
 import subprocess
 import time
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -680,7 +680,7 @@ def run_multi_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
                         "epoch": epoch,
                         "global_step": global_step,
                         "checkpoint_id": checkpoint_id,
-                        "created_at": datetime.now(UTC).isoformat(),
+                        "created_at": datetime.now(timezone.utc).isoformat(),
                     }, indent=2),
                     encoding="utf-8",
                 )
@@ -937,7 +937,7 @@ def run_single_worker(args: argparse.Namespace, coordinator_addr: str) -> dict:
                         "epoch": epoch,
                         "global_step": global_step,
                         "checkpoint_id": checkpoint_id,
-                        "created_at": datetime.now(UTC).isoformat(),
+                        "created_at": datetime.now(timezone.utc).isoformat(),
                     }, indent=2),
                     encoding="utf-8",
                 )
