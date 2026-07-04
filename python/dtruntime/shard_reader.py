@@ -33,7 +33,9 @@ from pathlib import Path
 from typing import Generator, Iterator, Optional, Tuple
 from urllib.parse import urlparse
 
-import torch
+# torch is imported lazily inside the functions that build/read tensors so this
+# module (and the torch-free shard I/O + `_fetch_shard_bytes` used by
+# dtruntime.data.cache) can be imported without torch installed.
 
 MAGIC = b"DTRS"
 VERSION = 1
@@ -98,6 +100,8 @@ def generate_shard_bytes(
     Uses a seeded RNG so the same (seed, record_count, input_dim) triple always
     produces the same bytes — useful for reproducible benchmarks.
     """
+    import torch
+
     rng = torch.Generator()
     if seed is not None:
         rng.manual_seed(seed)
@@ -259,6 +263,8 @@ class ShardReader:
         return self.header.num_classes
 
     def __iter__(self) -> Iterator[ShardBatch]:
+        import torch
+
         self._load()
         assert self._raw is not None
         h = self._header
@@ -289,6 +295,8 @@ class ShardReader:
 
     def read_all(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Convenience: return (inputs, labels) tensors for the full shard."""
+        import torch
+
         all_inputs = []
         all_labels = []
         for batch in self:

@@ -47,7 +47,10 @@ dtruntime-admin = "dtruntime.admin.cli:main"
 dev = [
     # Pinned so regenerated stubs (scripts/generate_python_proto.py) embed a
     # gencode version compatible with the protobuf runtime floor above.
-    "grpcio-tools~=1.81",
+    # grpcio-tools 1.81 requires Python >= 3.10, so it is only pulled in there;
+    # the SDK itself (and running the tests) works on 3.9. Stub regeneration is
+    # a 3.10+ maintainer task.
+    "grpcio-tools~=1.81; python_version >= '3.10'",
     "pytest",
     # Vulnerability scanning for the SDK's dependency tree (also run in CI).
     "pip-audit",
