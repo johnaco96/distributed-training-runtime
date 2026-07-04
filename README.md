@@ -148,18 +148,32 @@ The coordinator is a single Rust binary. Workers connect over gRPC and interact 
 
 Deploy two replicas. One acquires the PostgreSQL advisory lock and binds the gRPC port; the other polls in standby. The Kubernetes readiness probe (TCP on port 50051) keeps the standby out of the Service endpoints until it takes over.
 
-### Kubernetes
+### Kubernetes — Helm (recommended)
 
 ```bash
-# Install cert-manager, then apply the PKI resources
-kubectl apply -f k8s/prod/cert-manager/cluster-issuer.yaml
-kubectl apply -n dtruntime -f k8s/prod/cert-manager/coordinator-certificate.yaml
+kubectl -n dtruntime create secret generic postgres-credentials \
+  --from-literal=DATABASE_URL='postgres://user:pass@host:5432/dtruntime'
 
-# Deploy the 2-replica coordinator
-kubectl apply -f k8s/prod/coordinator-deployment.yaml
+helm install dtruntime deploy/helm/dtruntime \
+  -n dtruntime --create-namespace \
+  -f deploy/helm/dtruntime/values-production.yaml \
+  --set image.tag=0.1.0
 ```
 
-See [docs/kubernetes-local.md](docs/kubernetes-local.md) for the full local cluster runbook using Docker Desktop or kind.
+The chart deploys the HA coordinator (leader + standby), Service, hardened
+non-root pods, PodDisruptionBudget, NetworkPolicy, and optional cert-manager
+`Certificate`, `ServiceMonitor`, `PrometheusRule`, and the operator.
+
+### Kubernetes — raw manifests (kustomize)
+
+```bash
+kubectl apply -f k8s/prod/cert-manager/     # ClusterIssuer + Certificate
+kubectl apply -k k8s/prod                   # namespace, SA, Service, Deployment, PDB, NetworkPolicy
+```
+
+Two replicas: one acquires the PostgreSQL advisory lock and binds the gRPC port; the other polls in standby. The readiness probe keeps the standby out of the Service endpoints until it takes over.
+
+See [docs/production-deployment.md](docs/production-deployment.md) for the full production guide, [docs/kubernetes-local.md](docs/kubernetes-local.md) for the local cluster runbook, and [docs/RELEASING.md](docs/RELEASING.md) for the release/signing process.
 
 ## Python SDK
 
@@ -244,6 +258,8 @@ cargo run -p runtime-bench -- logical-workers \
 - [SLOs & error budgets](docs/slos.md)
 - [On-call runbooks](docs/runbooks-oncall.md)
 - [Ops resilience tests (failover/chaos/soak)](docs/observability-ops-tests.md)
+- [Production deployment](docs/production-deployment.md)
+- [Release process & image signing](docs/RELEASING.md)
 - [Kubernetes local runbook](docs/kubernetes-local.md)
 - [Benchmarks](docs/benchmarks.md)
 - [Troubleshooting](docs/troubleshooting.md)

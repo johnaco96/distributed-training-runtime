@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dtruntime.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dtruntime.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "dtruntime.coordinator.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.coordinator.grpcPort }}
+      targetPort: grpc
+    - name: metrics
+      port: {{ .Values.coordinator.metricsPort }}
+      targetPort: metrics

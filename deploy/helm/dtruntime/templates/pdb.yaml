@@ -1,0 +1,14 @@
+{{- if and .Values.podDisruptionBudget.enabled (ne .Values.metadataStore.backend "sqlite") }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "dtruntime.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dtruntime.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "dtruntime.coordinator.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -38,6 +38,15 @@ The following capabilities are implemented and locally validated:
   them. Measured control-plane/checkpoint/data-plane benchmark numbers captured
   in `docs/benchmarks.md` (+ raw JSON under `observability/benchmarks/`). See
   `docs/observability-ops-tests.md`.
+- Production install paths: a Helm chart (`deploy/helm/dtruntime`, helm-lint +
+  template validated) and a hardened raw-manifest bundle (`k8s/prod`, kustomize
+  validated) — HA coordinator, PDB, NetworkPolicy, non-root read-only-rootfs
+  securityContext, ServiceMonitor, PrometheusRule, cert-manager. See
+  `docs/production-deployment.md`.
+- Release process: tag-triggered workflow building a `twine check`-clean Python
+  sdist/wheel (locally built), multi-arch container images (cosign keyless
+  signing + SLSA provenance + SBOM), and a packaged Helm chart; `docs/RELEASING.md`,
+  `CHANGELOG.md`. Cross-platform CI matrix (Linux/macOS/Windows + container build).
 - PostgreSQL HA via advisory lock (2-replica coordinator support).
 - SQLite and PostgreSQL metadata persistence backends.
 - Local Kubernetes manifests (`k8s/local/`) and secure local Kubernetes path (`k8s/local-secure/`).

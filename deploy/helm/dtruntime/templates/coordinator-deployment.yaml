@@ -1,0 +1,225 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dtruntime.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dtruntime.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  # With postgres HA, run leader + standby; sqlite is single-replica only.
+  replicas: {{ if eq .Values.metadataStore.backend "sqlite" }}1{{ else }}{{ .Values.coordinator.replicas }}{{ end }}
+  selector:
+    matchLabels:
+      {{- include "dtruntime.coordinator.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "dtruntime.labels" . | nindent 8 }}
+        app.kubernetes.io/component: coordinator
+      annotations:
+        {{- if .Values.monitoring.serviceMonitor.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.coordinator.metricsPort | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "dtruntime.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.coordinator.podSecurityContext | nindent 8 }}
+      {{- with .Values.coordinator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.coordinator.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: coordinator
+          image: {{ include "dtruntime.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.coordinator.securityContext | nindent 12 }}
+          args:
+            - "--addr"
+            - {{ .Values.coordinator.addr | quote }}
+            - "--storage-root"
+            - {{ .Values.coordinator.storageRoot | quote }}
+            - "--metrics-addr"
+            - "0.0.0.0:{{ .Values.coordinator.metricsPort }}"
+            - "--max-s3-concurrent-ops"
+            - {{ .Values.coordinator.maxS3ConcurrentOps | quote }}
+            {{- if eq .Values.metadataStore.backend "postgres" }}
+            - "--metadata-db-url"
+            - "$(DTRUNTIME_METADATA_DB_URL)"
+            {{- else }}
+            - "--metadata-db"
+            - {{ .Values.metadataStore.sqlite.path | quote }}
+            {{- end }}
+            {{- if ne .Values.auth.mode "disabled" }}
+            - "--auth-mode"
+            - {{ .Values.auth.mode | quote }}
+            {{- if .Values.auth.disableHeaderIdentity }}
+            - "--auth-disable-header-identity"
+            {{- end }}
+            {{- if .Values.auth.oidc.enabled }}
+            {{- if .Values.auth.oidc.issuer }}
+            - "--oidc-issuer"
+            - {{ .Values.auth.oidc.issuer | quote }}
+            {{- end }}
+            {{- range .Values.auth.oidc.audiences }}
+            - "--oidc-audience"
+            - {{ . | quote }}
+            {{- end }}
+            - "--oidc-role-claim"
+            - {{ .Values.auth.oidc.roleClaim | quote }}
+            {{- if .Values.auth.oidc.jwksSecret }}
+            - "--oidc-jwks-file"
+            - "/oidc/jwks.json"
+            {{- else if .Values.auth.oidc.hmacSecret }}
+            - "--oidc-hmac-secret-file"
+            - "/oidc/hmac.key"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.auth.spiffe.enabled }}
+            - "--spiffe-trust-domain"
+            - {{ .Values.auth.spiffe.trustDomain | quote }}
+            - "--spiffe-role-map-file"
+            - "/spiffe/roles.map"
+            {{- end }}
+            {{- if .Values.auth.audit.logFile }}
+            - "--audit-log-file"
+            - {{ .Values.auth.audit.logFile | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - "--tls-cert"
+            - "/tls/tls.crt"
+            - "--tls-key"
+            - "/tls/tls.key"
+            {{- if .Values.tls.clientCASecret }}
+            - "--tls-client-ca"
+            - "/tls-ca/ca.crt"
+            {{- end }}
+            {{- end }}
+            {{- with .Values.coordinator.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if eq .Values.metadataStore.backend "postgres" }}
+          env:
+            - name: DTRUNTIME_METADATA_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.metadataStore.postgres.existingSecret }}
+                  key: {{ .Values.metadataStore.postgres.dsnKey }}
+          {{- end }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.coordinator.grpcPort }}
+            - name: metrics
+              containerPort: {{ .Values.coordinator.metricsPort }}
+          readinessProbe:
+            # Only the leader binds the gRPC port (standby waits on the advisory
+            # lock); a failing readiness probe keeps the standby out of the
+            # Service endpoints until it becomes leader.
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # No liveness/startup probe: the standby never binds the gRPC port, so
+          # a TCP liveness probe would kill the hot standby in a restart loop.
+          resources:
+            {{- toYaml .Values.coordinator.resources | nindent 12 }}
+          volumeMounts:
+            - name: storage
+              mountPath: {{ .Values.coordinator.storageRoot }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            {{- if .Values.tls.clientCASecret }}
+            - name: tls-ca
+              mountPath: /tls-ca
+              readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- if and (ne .Values.auth.mode "disabled") .Values.auth.oidc.enabled (or .Values.auth.oidc.jwksSecret .Values.auth.oidc.hmacSecret) }}
+            - name: oidc
+              mountPath: /oidc
+              readOnly: true
+            {{- end }}
+            {{- if and (ne .Values.auth.mode "disabled") .Values.auth.spiffe.enabled }}
+            - name: spiffe
+              mountPath: /spiffe
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: storage
+          {{- if .Values.coordinator.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "dtruntime.fullname" . }}-storage
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.secretName }}
+        {{- if .Values.tls.clientCASecret }}
+        - name: tls-ca
+          secret:
+            secretName: {{ .Values.tls.clientCASecret }}
+        {{- end }}
+        {{- end }}
+        {{- if and (ne .Values.auth.mode "disabled") .Values.auth.oidc.enabled .Values.auth.oidc.jwksSecret }}
+        - name: oidc
+          secret:
+            secretName: {{ .Values.auth.oidc.jwksSecret }}
+        {{- else if and (ne .Values.auth.mode "disabled") .Values.auth.oidc.enabled .Values.auth.oidc.hmacSecret }}
+        - name: oidc
+          secret:
+            secretName: {{ .Values.auth.oidc.hmacSecret }}
+        {{- end }}
+        {{- if and (ne .Values.auth.mode "disabled") .Values.auth.spiffe.enabled }}
+        - name: spiffe
+          configMap:
+            name: {{ .Values.auth.spiffe.roleMapConfigMap }}
+        {{- end }}
+{{- if .Values.coordinator.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "dtruntime.fullname" . }}-storage
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dtruntime.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.coordinator.persistence.accessModes | nindent 4 }}
+  {{- if .Values.coordinator.persistence.storageClassName }}
+  storageClassName: {{ .Values.coordinator.persistence.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.coordinator.persistence.size | quote }}
+{{- end }}

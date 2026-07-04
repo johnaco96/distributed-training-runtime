@@ -1,0 +1,29 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dtruntime.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dtruntime.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dtruntime.coordinator.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Workers/clients in this namespace reach the gRPC + metrics ports.
+    - from:
+        - podSelector: {}
+        {{- range .Values.networkPolicy.allowedNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.coordinator.grpcPort }}
+        - protocol: TCP
+          port: {{ .Values.coordinator.metricsPort }}
+{{- end }}

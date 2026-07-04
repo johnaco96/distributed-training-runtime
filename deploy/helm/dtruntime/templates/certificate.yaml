@@ -1,0 +1,23 @@
+{{- if .Values.certManager.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "dtruntime.fullname" . }}-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dtruntime.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.tls.secretName }}
+  duration: {{ .Values.certManager.duration }}
+  renewBefore: {{ .Values.certManager.renewBefore }}
+  issuerRef:
+    name: {{ .Values.certManager.issuerRef.name }}
+    kind: {{ .Values.certManager.issuerRef.kind }}
+  dnsNames:
+    {{- if .Values.certManager.dnsNames }}
+    {{- toYaml .Values.certManager.dnsNames | nindent 4 }}
+    {{- else }}
+    - {{ include "dtruntime.fullname" . }}.{{ .Release.Namespace }}.svc
+    - {{ include "dtruntime.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+    {{- end }}
+{{- end }}

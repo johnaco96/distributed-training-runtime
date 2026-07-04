@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: runtime-coordinator
+  namespace: dtruntime
+  labels:
+    app: runtime-coordinator
+    app.kubernetes.io/part-of: dtruntime
+spec:
+  type: ClusterIP
+  selector:
+    app: runtime-coordinator
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+    - name: metrics
+      port: 9090
+      targetPort: metrics
