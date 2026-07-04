@@ -28,6 +28,16 @@ The following capabilities are implemented and locally validated:
   optional NDJSON/SIEM sink (`--audit-log-file`) and auth allow/deny counters.
 - Supply-chain scanning in CI: `cargo-deny` (advisories/bans/sources) and
   `pip-audit`, with Dependabot update PRs; `SECURITY.md` policy.
+- Prometheus alerting + SLI recording rules (promtool-validated), a
+  `PrometheusRule` for the Operator, defined SLOs with multiwindow burn-rate
+  alerts, and per-alert on-call runbooks — see `docs/slos.md`,
+  `docs/runbooks-oncall.md`, `observability/prometheus/`.
+- Gated operational resilience tests against the real release binaries:
+  coordinator failover (hard-kill + rehydrate), chaos/preemption (worker-failure
+  injection + recovery), and soak (sustained load); a nightly CI workflow runs
+  them. Measured control-plane/checkpoint/data-plane benchmark numbers captured
+  in `docs/benchmarks.md` (+ raw JSON under `observability/benchmarks/`). See
+  `docs/observability-ops-tests.md`.
 - PostgreSQL HA via advisory lock (2-replica coordinator support).
 - SQLite and PostgreSQL metadata persistence backends.
 - Local Kubernetes manifests (`k8s/local/`) and secure local Kubernetes path (`k8s/local-secure/`).

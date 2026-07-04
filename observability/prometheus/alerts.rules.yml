@@ -1,0 +1,126 @@
+# Alerting rules for the dtruntime coordinator. Each alert links to its
+# response procedure in docs/runbooks-oncall.md via the `runbook_url`
+# annotation. SLO-burn alerts are derived from the recording rules in
+# recording.rules.yml; see docs/slos.md for the objectives.
+groups:
+  # ── Availability / liveness ────────────────────────────────────────────
+  - name: dtruntime.availability
+    rules:
+      - alert: CoordinatorDown
+        expr: up{job="dtruntime-coordinator"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Coordinator {{ $labels.instance }} is down"
+          description: "The coordinator has failed /metrics scrapes for >2m. The control plane is unavailable."
+          runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#coordinatordown"
+
+      - alert: CoordinatorAbsent
+        expr: absent(up{job="dtruntime-coordinator"})
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No coordinator scrape target present"
+          description: "Prometheus has no dtruntime-coordinator target — the deployment or service discovery may be broken."
+          runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#coordinatorabsent"
+
+  # ── Availability SLO — multiwindow, multi-burn-rate ────────────────────
+  # 99.9% availability => 0.1% error budget. Fast burn (14.4x) pages; slow
+  # burn (6x / 1x) is a ticket. See docs/slos.md.
+  - name: dtruntime.slo.availability
+    rules:
+      - alert: CoordinatorAvailabilityFastBurn
+        expr: |
+          (1 - job:dtruntime_up:ratio_rate5m) > (14.4 * 0.001)
+          and
+          (1 - job:dtruntime_up:ratio_rate1h) > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "Availability error budget burning fast (14.4x)"
+          description: "The coordinator is burning the 99.9% availability budget >14.4x — budget exhausts in hours."
+          runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#availabilityslo"
+
+      - alert: CoordinatorAvailabilitySlowBurn
+        expr: |
+          (1 - job:dtruntime_up:ratio_rate30m) > (6 * 0.001)
+          and
+          (1 - job:dtruntime_up:ratio_rate6h) > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "Availability error budget burning (6x)"
+          description: "Sustained availability degradation is eroding the 99.9% budget."
+          runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#availabilityslo"
+
+  # ── Checkpoint durability ──────────────────────────────────────────────
+  - name: dtruntime.checkpoints
+    rules:
+      - alert: CheckpointFailuresElevated
+        expr: dtruntime:checkpoint_failure:ratio_rate5m > 0.01
+        for: 15m
+        labels:
+          severity: critical
+          slo: checkpoint_durability
+        annotations:
+          summary: "Checkpoint failure ratio >1% (5m)"
+          description: "More than 1% of checkpoints are failing to commit. Runs cannot durably persist progress — recovery from a crash will lose work."
+          runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#checkpointfailureselevated"
+
+      - alert: CheckpointCommitStalled
+        expr: |
+          increase(dtruntime_checkpoints_started_total[30m]) > 0
+          and
+          increase(dtruntime_checkpoints_committed_total[30m]) == 0
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Checkpoints starting but none committing"
+          description: "Checkpoints have started in the last 30m but zero have committed — the 2PC commit path or storage backend is stuck."
+          runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#checkpointcommitstalled"
+
+  # ── Worker fleet health ────────────────────────────────────────────────
+  - name: dtruntime.workers
+    rules:
+      - alert: HighStaleWorkerRatio
+        expr: dtruntime:workers_unhealthy:ratio > 0.25
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 25% of workers are stale/failed"
+          description: "A large fraction of the worker fleet is missing heartbeats — network partition, node pressure, or a mass preemption."
+          runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#highstaleworkerratio"
+
+      - alert: WorkersSilentButPresent
+        expr: |
+          sum(rate(dtruntime_heartbeats_total[5m])) == 0
+          and
+          sum(dtruntime_active_workers) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Active workers present but no heartbeats"
+          description: "Workers are registered/active but the coordinator has received no heartbeats for 5m — a run may be stuck (see 'dtruntime-admin doctor')."
+          runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#workerssilentbutpresent"
+
+  # ── Security ───────────────────────────────────────────────────────────
+  - name: dtruntime.security
+    rules:
+      - alert: HighAuthDenialRate
+        expr: sum(rate(dtruntime_auth_denied_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated authorization-denied rate"
+          description: "Sustained >1/s authorization denials — a misconfigured client, an expired credential/key, or a probing attacker."
+          runbook_url: "https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/runbooks-oncall.md#highauthdenialrate"

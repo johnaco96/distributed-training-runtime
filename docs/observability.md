@@ -26,3 +26,24 @@ Probe responses are low-cost plain text and do not include secrets or workload i
 ## Step 4 metrics collection note
 
 `run_k8s_secure_validation.ps1` always captures raw coordinator `/metrics` into `metrics.prom` for pass/fail evidence. Prometheus API queries are optional and should not gate baseline secure validation success.
+
+## Alerting, SLOs, and runbooks
+
+- **Recording rules (SLIs)**: `observability/prometheus/recording.rules.yml`.
+- **Alerting rules**: `observability/prometheus/alerts.rules.yml` — availability
+  (incl. multiwindow SLO burn), checkpoint durability, worker-fleet health, and
+  security (auth-denial rate). Each alert links to its runbook.
+- **Prometheus Operator**: `k8s/observability/prometheus-rules.yaml`
+  (`PrometheusRule`).
+- **SLOs & error budgets**: [slos.md](slos.md).
+- **On-call response**: [runbooks-oncall.md](runbooks-oncall.md).
+- **Resilience tests** (failover / chaos / soak) and measured benchmark
+  results: [observability-ops-tests.md](observability-ops-tests.md),
+  [benchmarks.md](benchmarks.md).
+
+Validate the rules locally with promtool:
+
+```bash
+docker run --rm -v "$PWD/observability/prometheus:/rules" --entrypoint promtool \
+  prom/prometheus:latest check rules /rules/recording.rules.yml /rules/alerts.rules.yml
+```

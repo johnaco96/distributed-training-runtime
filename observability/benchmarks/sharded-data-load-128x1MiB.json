@@ -1,0 +1,30 @@
+{
+  "benchmark": "sharded-data-load",
+  "environment": "local-dev",
+  "surface": "coordinator-rpc+data-read",
+  "mode": "shard-assign-read-report",
+  "caveats": [
+    "real coordinator gRPC shard assignment",
+    "actual filesystem shard reads",
+    "real ReportShardProgress RPCs"
+  ],
+  "timestamp_utc": "2026-07-04T00:02:23.020133800+00:00",
+  "operation_count": 272,
+  "success_count": 144,
+  "failure_count": 128,
+  "failure_rate": 0.47058823529411764,
+  "total_bytes": 134217728,
+  "elapsed_ms": 22.2582,
+  "mb_per_sec": 5750.689633483391,
+  "p50_latency_ms": 1.0441999999999998,
+  "p90_latency_ms": 1.769,
+  "p99_latency_ms": 2.3416,
+  "retry_count": 0,
+  "extra": {
+    "concurrency": 16,
+    "num_shards": 128,
+    "shard_size_bytes": 1048576,
+    "start_coordinator": true,
+    "worker_count": 16
+  }
+}

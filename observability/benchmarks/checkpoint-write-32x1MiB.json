@@ -1,0 +1,26 @@
+{
+  "benchmark": "checkpoint-write",
+  "environment": "local-dev",
+  "surface": "checkpoint",
+  "mode": "write",
+  "caveats": [
+    "local filesystem benchmark"
+  ],
+  "timestamp_utc": "2026-07-04T00:02:23.173356200+00:00",
+  "operation_count": 32,
+  "success_count": 32,
+  "failure_count": 0,
+  "failure_rate": 0.0,
+  "total_bytes": 33554432,
+  "elapsed_ms": 50.8663,
+  "mb_per_sec": 629.1002097656011,
+  "p50_latency_ms": 1.589571875,
+  "p90_latency_ms": 1.589571875,
+  "p99_latency_ms": 1.589571875,
+  "retry_count": 0,
+  "extra": {
+    "artifacts": 32,
+    "concurrency": 16,
+    "payload_bytes": 1048576
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "benchmark": "logical-workers",
+  "environment": "local-dev",
+  "surface": "coordinator-rpc",
+  "mode": "logical-worker-control-plane",
+  "caveats": [
+    "real gRPC coordinator RPCs from logical worker emulation"
+  ],
+  "timestamp_utc": "2026-07-04T00:02:14.024393+00:00",
+  "operation_count": 24515,
+  "success_count": 24509,
+  "failure_count": 6,
+  "failure_rate": 0.0002447481133999592,
+  "total_bytes": 6291456,
+  "elapsed_ms": 30478.1649,
+  "mb_per_sec": 0.19686224612558612,
+  "p50_latency_ms": 0.281,
+  "p90_latency_ms": 0.3678,
+  "p99_latency_ms": 0.482,
+  "retry_count": 0,
+  "extra": {
+    "checkpoint_begin_latency_ms": {
+      "p50_latency_ms": 0.3119,
+      "p90_latency_ms": 0.3276,
+      "p99_latency_ms": 0.3276
+    },
+    "checkpoint_commit_latency_ms": {
+      "p50_latency_ms": 0.2784,
+      "p90_latency_ms": 0.3273,
+      "p99_latency_ms": 0.3273
+    },
+    "checkpoint_report_artifact_latency_ms": {
+      "p50_latency_ms": 0.21760000000000002,
+      "p90_latency_ms": 0.2651,
+      "p99_latency_ms": 0.2651
+    },
+    "heartbeat_latency_ms": {
+      "p50_latency_ms": 0.18560000000000001,
+      "p90_latency_ms": 0.2333,
+      "p99_latency_ms": 0.3221
+    },
+    "logical_worker_count": 500,
+    "register_worker_latency_ms": {
+      "p50_latency_ms": 0.1999,
+      "p90_latency_ms": 0.2693,
+      "p99_latency_ms": 0.3393
+    },
+    "restore_latest_latency_ms": {
+      "p50_latency_ms": 0.2078,
+      "p90_latency_ms": 0.2082,
+      "p99_latency_ms": 0.2082
+    },
+    "shard_assignment_latency_ms": {
+      "p50_latency_ms": 0.3255,
+      "p90_latency_ms": 0.4033,
+      "p99_latency_ms": 0.5096
+    }
+  }
+}
