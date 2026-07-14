@@ -1,0 +1,693 @@
+syntax = "proto3";
+
+package runtime.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// CoordinatorService is the control-plane API used by Python SDK and worker
+// helpers to coordinate runs, workers, shard leases, and checkpoints.
+// Large dataset/checkpoint payload bytes stay on the data plane.
+service CoordinatorService {
+  rpc GetRuntimeInfo(GetRuntimeInfoRequest) returns (GetRuntimeInfoResponse);
+  rpc RegisterRun(RegisterRunRequest) returns (RegisterRunResponse);
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  rpc RegisterDataset(RegisterDatasetRequest) returns (RegisterDatasetResponse);
+  rpc GetShardAssignment(GetShardAssignmentRequest) returns (GetShardAssignmentResponse);
+  rpc RenewShardLease(RenewShardLeaseRequest) returns (RenewShardLeaseResponse);
+  rpc ReportShardProgress(ReportShardProgressRequest) returns (ReportShardProgressResponse);
+
+  rpc BeginCheckpoint(BeginCheckpointRequest) returns (BeginCheckpointResponse);
+  rpc StreamCheckpointArtifact(stream StreamCheckpointArtifactRequest) returns (StreamCheckpointArtifactResponse);
+  rpc ReportCheckpointArtifact(ReportCheckpointArtifactRequest) returns (ReportCheckpointArtifactResponse);
+  rpc CommitCheckpoint(CommitCheckpointRequest) returns (CommitCheckpointResponse);
+  rpc GetLatestCheckpoint(GetLatestCheckpointRequest) returns (GetLatestCheckpointResponse);
+
+  rpc GetRunStatus(GetRunStatusRequest) returns (GetRunStatusResponse);
+
+  // Rendezvous barrier for torch.distributed process-group formation.
+  // Workers join, the coordinator assigns ranks and elects the rank-0 host as
+  // the c10d store endpoint, and workers poll until the round completes.
+  rpc JoinRendezvous(JoinRendezvousRequest) returns (JoinRendezvousResponse);
+  rpc GetRendezvousState(GetRendezvousStateRequest) returns (GetRendezvousStateResponse);
+
+  // Graceful worker departure: completed training, preempted, or erroring
+  // out.  Unlike heartbeat-timeout failure detection this takes effect
+  // immediately (rendezvous membership changes without waiting out the
+  // failure deadline) and feeds the run lifecycle state machine.
+  rpc DeregisterWorker(DeregisterWorkerRequest) returns (DeregisterWorkerResponse);
+
+  // Download a checkpoint artifact through the coordinator's storage backend.
+  // This is the restore data plane for multi-machine training: workers on any
+  // node can read artifacts regardless of whether the coordinator stores them
+  // on its local filesystem or in S3.
+  rpc FetchCheckpointArtifact(FetchCheckpointArtifactRequest) returns (stream FetchCheckpointArtifactChunk);
+
+  // List checkpoints for a run (newest step first), including their states.
+  // Used for corrupt-checkpoint fallback and admin inspection.
+  rpc ListCheckpoints(ListCheckpointsRequest) returns (ListCheckpointsResponse);
+
+  // Report a committed checkpoint as corrupt (checksum mismatch or unreadable
+  // artifacts observed during restore).  The checkpoint is marked FAILED and
+  // the latest-checkpoint pointer falls back to the newest remaining
+  // committed checkpoint.
+  rpc ReportCheckpointCorrupt(ReportCheckpointCorruptRequest) returns (ReportCheckpointCorruptResponse);
+
+  // Cancel a run (admin).  Terminal: workers observe RUN_STATE_CANCELLED on
+  // their next heartbeat and exit; launchers stop restarting workers.
+  rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+
+  // ── admin run lifecycle ────────────────────────────────────────────────
+  // Pause a run: workers keep heartbeating but observe RUN_STATE_PAUSED and
+  // stop advancing training at the next step boundary.
+  rpc PauseRun(RunActionRequest) returns (RunActionResponse);
+  // Resume a paused run back to running.
+  rpc ResumeRun(RunActionRequest) returns (RunActionResponse);
+  // Retry a failed run: reset it to PENDING so workers re-register and resume
+  // from the latest committed checkpoint.  Increments the retry counter.
+  rpc RetryRun(RunActionRequest) returns (RunActionResponse);
+  // Drain a run: workers finish their current work, checkpoint, and exit
+  // gracefully; the run completes when the roster empties.
+  rpc DrainRun(RunActionRequest) returns (RunActionResponse);
+
+  // ── admin inspection ───────────────────────────────────────────────────
+  rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+  rpc ListShardProgress(ListShardProgressRequest) returns (ListShardProgressResponse);
+}
+
+// Durable run lifecycle.  Persisted to the metadata store and rehydrated on
+// coordinator restart.
+//
+//   PENDING ──► RUNNING ◄──► RECOVERING          (rendezvous formed / broken)
+//                  │                │
+//                  ├──► COMPLETED   ├──► FAILED  (all workers done / stuck,
+//                  │                │             restart budget exhausted)
+//                  └──────► CANCELLED ◄──────────(admin, from any live state)
+//
+// COMPLETED, FAILED, and CANCELLED are terminal.
+enum RunState {
+  RUN_STATE_UNSPECIFIED = 0;
+  // Registered; the first rendezvous round has not completed yet.
+  RUN_STATE_PENDING = 1;
+  // A rendezvous round is complete and workers hold ranks.
+  RUN_STATE_RUNNING = 2;
+  // A previously complete round was invalidated (worker died or membership
+  // changed); surviving workers are re-forming the process group.
+  RUN_STATE_RECOVERING = 3;
+  RUN_STATE_COMPLETED = 4;
+  RUN_STATE_FAILED = 5;
+  RUN_STATE_CANCELLED = 6;
+  // Administratively paused; workers keep heartbeating but do not advance
+  // training.  Resumes to RUNNING.  Not terminal.
+  RUN_STATE_PAUSED = 7;
+  // Draining: workers finish current work, checkpoint, and exit; the run
+  // completes when the roster empties.  Not terminal.
+  RUN_STATE_DRAINING = 8;
+}
+
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+}
+
+message RuntimeCapabilities {
+  ProtocolVersion protocol_version = 1;
+  repeated string features = 2;
+}
+
+message GetRuntimeInfoRequest {}
+
+message GetRuntimeInfoResponse {
+  ProtocolVersion protocol_version = 1;
+  RuntimeCapabilities capabilities = 2;
+}
+
+// Identifier wrappers keep message signatures explicit while using MVP string IDs.
+message RunId { string value = 1; }
+message WorkerId { string value = 1; }
+message DatasetId { string value = 1; }
+message ShardId { string value = 1; }
+message CheckpointId { string value = 1; }
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  WORKER_STATE_REGISTERING = 1;
+  WORKER_STATE_ACTIVE = 2;
+  WORKER_STATE_STALE = 3;
+  WORKER_STATE_FAILED = 4;
+  WORKER_STATE_RECOVERING = 5;
+  WORKER_STATE_REMOVED = 6;
+  // Worker deregistered gracefully after finishing its work.
+  WORKER_STATE_COMPLETED = 7;
+}
+
+enum ShardLeaseState {
+  SHARD_LEASE_STATE_UNSPECIFIED = 0;
+  SHARD_LEASE_STATE_AVAILABLE = 1;
+  SHARD_LEASE_STATE_LEASED = 2;
+  SHARD_LEASE_STATE_EXPIRED = 3;
+  SHARD_LEASE_STATE_COMPLETED = 4;
+  SHARD_LEASE_STATE_REVOKED = 5;
+}
+
+enum CheckpointState {
+  CHECKPOINT_STATE_UNSPECIFIED = 0;
+  CHECKPOINT_STATE_INITIATED = 1;
+  CHECKPOINT_STATE_UPLOAD_IN_PROGRESS = 2;
+  CHECKPOINT_STATE_VALIDATING = 3;
+  CHECKPOINT_STATE_COMMITTED = 4;
+  CHECKPOINT_STATE_FAILED = 5;
+  CHECKPOINT_STATE_ABORTED = 6;
+}
+
+enum AssignmentPolicy {
+  ASSIGNMENT_POLICY_UNSPECIFIED = 0;
+  ASSIGNMENT_POLICY_STATIC_RANK = 1;
+  ASSIGNMENT_POLICY_REASSIGN_QUEUE = 2;
+}
+
+enum StorageBackendKind {
+  STORAGE_BACKEND_KIND_UNSPECIFIED = 0;
+  STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM = 1;
+  STORAGE_BACKEND_KIND_S3_COMPATIBLE = 2;
+}
+
+message RegisterRunRequest {
+  string idempotency_key = 1;
+  string run_name = 2;
+  AssignmentPolicy assignment_policy = 3;
+  StorageBackendKind storage_backend_kind = 4;
+  uint32 world_size = 5;
+  string run_version = 6;
+  // Elastic training bounds.  When both are zero the run is fixed-size and a
+  // rendezvous round completes only when exactly `world_size` workers join.
+  // When set (min <= max), a round may complete with any world size in
+  // [min_world_size, max_world_size]: the round completes immediately at max,
+  // or after `rendezvous_settle_timeout_ms` once min is reached.
+  uint32 min_world_size = 7;
+  uint32 max_world_size = 8;
+  // How long the coordinator waits for extra workers after min_world_size is
+  // reached before completing an elastic rendezvous round.  0 = server default.
+  uint32 rendezvous_settle_timeout_ms = 9;
+}
+
+message RegisterRunResponse {
+  RunId run_id = 1;
+  string coordinator_version = 2;
+  google.protobuf.Timestamp registered_at = 3;
+}
+
+message DatasetMetadata {
+  DatasetId dataset_id = 1;
+  string name = 2;
+  string dataset_uri = 3;
+  string format = 4;
+  uint32 shard_count = 5;
+  string dataset_version = 6;
+  map<string, string> labels = 7;
+  google.protobuf.Timestamp registered_at = 8;
+}
+
+message ShardMetadata {
+  ShardId shard_id = 1;
+  DatasetId dataset_id = 2;
+  string shard_uri = 3;
+  int64 byte_range_start = 4;
+  int64 byte_range_end = 5;
+  int64 size_bytes = 6;
+  string checksum = 7;
+  string checksum_algorithm = 8;
+}
+
+message RegisterDatasetRequest {
+  string idempotency_key = 1;
+  RunId run_id = 2;
+  DatasetMetadata dataset = 3;
+  repeated ShardMetadata shards = 4;
+}
+
+message RegisterDatasetResponse {
+  DatasetId dataset_id = 1;
+  uint32 accepted_shard_count = 2;
+  google.protobuf.Timestamp registered_at = 3;
+}
+
+message RegisterWorkerRequest {
+  string idempotency_key = 1;
+  RunId run_id = 2;
+  WorkerId worker_id = 3;
+  uint32 rank = 4;
+  string host = 5;
+  string sdk_version = 6;
+  string protocol_version = 7;
+}
+
+message RegisterWorkerResponse {
+  WorkerId worker_id = 1;
+  WorkerState state = 2;
+  google.protobuf.Timestamp lease_renewal_deadline = 3;
+  google.protobuf.Timestamp server_time = 4;
+}
+
+message HeartbeatRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  string idempotency_key = 3;
+  google.protobuf.Timestamp client_time = 4;
+  repeated ShardId active_shard_ids = 5;
+}
+
+message HeartbeatResponse {
+  WorkerState state = 1;
+  google.protobuf.Timestamp next_heartbeat_deadline = 2;
+  google.protobuf.Timestamp server_time = 3;
+  // Latest rendezvous round for the run (0 when no rendezvous has started).
+  // Workers compare this to the round they joined; a larger value means the
+  // membership changed and the worker must re-join the rendezvous.
+  uint64 rendezvous_round = 4;
+  // Current run lifecycle state.  Workers exit when they observe a terminal
+  // state (most importantly RUN_STATE_CANCELLED).
+  RunState run_state = 5;
+}
+
+message GetShardAssignmentRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  DatasetId dataset_id = 3;
+  string idempotency_key = 4;
+}
+
+message ShardAssignment {
+  RunId run_id = 1;
+  DatasetId dataset_id = 2;
+  ShardId shard_id = 3;
+  WorkerId worker_id = 4;
+  uint64 lease_epoch = 5;
+  ShardLeaseState lease_state = 6;
+  google.protobuf.Timestamp lease_expires_at = 7;
+  int64 progress_offset = 8;
+  string shard_uri = 9;
+  // Integrity metadata carried from registration so the data pipeline can
+  // verify shard bytes on download without a second RPC.
+  string checksum = 10;
+  string checksum_algorithm = 11;
+  int64 size_bytes = 12;
+}
+
+message GetShardAssignmentResponse {
+  repeated ShardAssignment assignments = 1;
+  AssignmentPolicy assignment_policy = 2;
+  google.protobuf.Timestamp server_time = 3;
+}
+
+message RenewShardLeaseRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  ShardId shard_id = 3;
+  uint64 lease_epoch = 4;
+  string idempotency_key = 5;
+}
+
+message RenewShardLeaseResponse {
+  bool accepted = 1;
+  ShardLeaseState lease_state = 2;
+  google.protobuf.Timestamp lease_expires_at = 3;
+  google.protobuf.Timestamp server_time = 4;
+}
+
+message ReportShardProgressRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  DatasetId dataset_id = 3;
+  ShardId shard_id = 4;
+  uint64 lease_epoch = 5;
+  int64 progress_offset = 6;
+  bool is_complete = 7;
+  string idempotency_key = 8;
+}
+
+message ReportShardProgressResponse {
+  bool accepted = 1;
+  int64 stored_progress_offset = 2;
+  ShardLeaseState lease_state = 3;
+}
+
+// StreamCheckpointArtifact messages — coordinator receives bytes from worker and
+// writes them to storage asynchronously using its tokio runtime.
+message StreamCheckpointArtifactMeta {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  string artifact_name = 4;
+  int64 total_size_bytes = 5;
+  string idempotency_key = 6;
+}
+
+message StreamCheckpointArtifactChunk {
+  bytes data = 1;
+  uint64 sequence = 2;
+}
+
+message StreamCheckpointArtifactRequest {
+  oneof payload {
+    StreamCheckpointArtifactMeta meta = 1;
+    StreamCheckpointArtifactChunk chunk = 2;
+  }
+}
+
+message StreamCheckpointArtifactResponse {
+  CheckpointId checkpoint_id = 1;
+  string artifact_uri = 2;
+  int64 bytes_received = 3;
+  string checksum = 4;
+  string checksum_algorithm = 5;
+}
+
+message BeginCheckpointRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  uint64 step = 4;
+  string idempotency_key = 5;
+}
+
+message ArtifactSpec {
+  string artifact_name = 1;
+  WorkerId owner_worker_id = 2;
+  string upload_uri = 3;
+  int64 expected_size_bytes = 4;
+  string expected_checksum = 5;
+  string checksum_algorithm = 6;
+}
+
+message BeginCheckpointResponse {
+  CheckpointId checkpoint_id = 1;
+  CheckpointState state = 2;
+  google.protobuf.Timestamp created_at = 3;
+  repeated ArtifactSpec artifact_specs = 4;
+}
+
+message ArtifactReport {
+  string artifact_name = 1;
+  string artifact_uri = 2;
+  int64 size_bytes = 3;
+  string checksum = 4;
+  string checksum_algorithm = 5;
+  google.protobuf.Timestamp uploaded_at = 6;
+}
+
+message ReportCheckpointArtifactRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  ArtifactReport artifact_report = 4;
+  string idempotency_key = 5;
+}
+
+message ReportCheckpointArtifactResponse {
+  bool accepted = 1;
+  CheckpointState checkpoint_state = 2;
+}
+
+message CommitCheckpointRequest {
+  RunId run_id = 1;
+  CheckpointId checkpoint_id = 2;
+  string idempotency_key = 3;
+  // worker_id identifies the calling worker for distributed 2PC tracking.
+  // Each worker must call CommitCheckpoint with their own worker_id; the
+  // coordinator only performs the global commit once all expected workers
+  // have voted.  Leave empty for legacy single-caller behaviour.
+  WorkerId worker_id = 4;
+}
+
+message CommitCheckpointResponse {
+  CheckpointState state = 1;
+  google.protobuf.Timestamp committed_at = 2;
+  // globally_committed is true when all expected workers have committed and
+  // the checkpoint has been durably recorded.  When false the caller's vote
+  // was recorded but the global commit is still pending other workers.
+  bool globally_committed = 3;
+}
+
+message CheckpointManifest {
+  RunId run_id = 1;
+  CheckpointId checkpoint_id = 2;
+  uint64 step = 3;
+  CheckpointState state = 4;
+  StorageBackendKind storage_backend_kind = 5;
+  repeated ArtifactReport artifacts = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp committed_at = 8;
+}
+
+message GetLatestCheckpointRequest {
+  RunId run_id = 1;
+}
+
+message GetLatestCheckpointResponse {
+  CheckpointManifest manifest = 1;
+}
+
+message GetRunStatusRequest {
+  RunId run_id = 1;
+}
+
+message GetRunStatusResponse {
+  RunId run_id = 1;
+  string run_version = 2;
+  AssignmentPolicy assignment_policy = 3;
+  StorageBackendKind storage_backend_kind = 4;
+  CheckpointId latest_checkpoint_id = 5;
+  CheckpointState latest_checkpoint_state = 6;
+  uint32 active_worker_count = 7;
+  google.protobuf.Timestamp server_time = 8;
+  RunState state = 9;
+  // Human-readable explanation for the current state (failure cause,
+  // cancellation reason, stuck-detection detail).
+  string state_reason = 10;
+}
+
+enum DeregisterReason {
+  DEREGISTER_REASON_UNSPECIFIED = 0;
+  // Training finished successfully on this worker.
+  DEREGISTER_REASON_COMPLETED = 1;
+  // The worker is being evicted (spot reclaim, drain, elastic scale-down).
+  DEREGISTER_REASON_PREEMPTED = 2;
+  // The worker is exiting due to an unrecoverable local error.
+  DEREGISTER_REASON_ERROR = 3;
+}
+
+message DeregisterWorkerRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  DeregisterReason reason = 3;
+  string idempotency_key = 4;
+}
+
+message DeregisterWorkerResponse {
+  WorkerState state = 1;
+  RunState run_state = 2;
+  google.protobuf.Timestamp server_time = 3;
+}
+
+message FetchCheckpointArtifactRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  string artifact_name = 4;
+  // Owner of the artifact (artifacts are stored per uploading worker).
+  WorkerId owner_worker_id = 5;
+}
+
+message FetchCheckpointArtifactChunk {
+  bytes data = 1;
+  uint64 sequence = 2;
+  // Set on the final chunk: total bytes and the artifact checksum for
+  // client-side integrity verification.
+  bool last = 3;
+  int64 total_size_bytes = 4;
+  string checksum = 5;
+  string checksum_algorithm = 6;
+}
+
+message ListCheckpointsRequest {
+  RunId run_id = 1;
+  // Only return checkpoints in COMMITTED state.
+  bool committed_only = 2;
+  // 0 = no limit.
+  uint32 limit = 3;
+}
+
+message ListCheckpointsResponse {
+  // Newest step first.
+  repeated CheckpointManifest checkpoints = 1;
+}
+
+message ReportCheckpointCorruptRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  CheckpointId checkpoint_id = 3;
+  // What was observed (checksum mismatch, missing artifact, ...).
+  string reason = 4;
+  string idempotency_key = 5;
+}
+
+message ReportCheckpointCorruptResponse {
+  // State of the reported checkpoint after the report (FAILED).
+  CheckpointState state = 1;
+  // The new latest committed checkpoint for the run, if any remains.
+  CheckpointId fallback_checkpoint_id = 2;
+  bool has_fallback = 3;
+}
+
+message CancelRunRequest {
+  RunId run_id = 1;
+  string reason = 2;
+  string idempotency_key = 3;
+}
+
+message CancelRunResponse {
+  RunState state = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+// ─── admin lifecycle + inspection ────────────────────────────────────────────
+
+// Shared request/response for pause/resume/retry/drain.
+message RunActionRequest {
+  RunId run_id = 1;
+  string reason = 2;
+  string idempotency_key = 3;
+}
+
+message RunActionResponse {
+  RunState state = 1;
+  string state_reason = 2;
+  google.protobuf.Timestamp server_time = 3;
+}
+
+message RunSummary {
+  RunId run_id = 1;
+  string run_name = 2;
+  RunState state = 3;
+  string state_reason = 4;
+  uint32 world_size = 5;
+  uint32 active_worker_count = 6;
+  CheckpointId latest_checkpoint_id = 7;
+  CheckpointState latest_checkpoint_state = 8;
+  uint32 retry_count = 9;
+  google.protobuf.Timestamp registered_at = 10;
+}
+
+message ListRunsRequest {
+  // Only return runs in this state (RUN_STATE_UNSPECIFIED = all).  Filtering
+  // to RUN_STATE_RUNNING lists active jobs; RUN_STATE_FAILED lists failures.
+  RunState state_filter = 1;
+}
+
+message ListRunsResponse {
+  repeated RunSummary runs = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+message WorkerInfo {
+  WorkerId worker_id = 1;
+  uint32 rank = 2;
+  string host = 3;
+  WorkerState state = 4;
+  string sdk_version = 5;
+  google.protobuf.Timestamp last_heartbeat_at = 6;
+  google.protobuf.Timestamp next_heartbeat_deadline = 7;
+  google.protobuf.Timestamp failure_deadline = 8;
+}
+
+message ListWorkersRequest {
+  RunId run_id = 1;
+  // Only return workers in this state (WORKER_STATE_UNSPECIFIED = all).
+  // Filtering to WORKER_STATE_FAILED lists failed workers.
+  WorkerState state_filter = 2;
+}
+
+message ListWorkersResponse {
+  repeated WorkerInfo workers = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+message ShardProgressInfo {
+  ShardId shard_id = 1;
+  DatasetId dataset_id = 2;
+  WorkerId worker_id = 3;
+  uint64 lease_epoch = 4;
+  int64 progress_offset = 5;
+  bool is_complete = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message ListShardProgressRequest {
+  RunId run_id = 1;
+  // Optional: restrict to one dataset (empty = all datasets for the run).
+  DatasetId dataset_id = 2;
+}
+
+message ListShardProgressResponse {
+  repeated ShardProgressInfo shards = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+// ─── rendezvous ──────────────────────────────────────────────────────────────
+
+enum RendezvousRoundState {
+  RENDEZVOUS_ROUND_STATE_UNSPECIFIED = 0;
+  // Workers are still joining; the round has not reached its target size.
+  RENDEZVOUS_ROUND_STATE_WAITING = 1;
+  // Ranks are assigned and the c10d store endpoint is elected; workers may
+  // call torch.distributed.init_process_group.
+  RENDEZVOUS_ROUND_STATE_COMPLETE = 2;
+}
+
+message JoinRendezvousRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+  // Address other workers can reach this worker's host on.  If this worker is
+  // elected rank 0 it becomes the c10d TCPStore host.
+  string host = 3;
+  // Port this worker will bind the c10d TCPStore to if elected rank 0.
+  // 0 lets the coordinator substitute the conventional default (29500).
+  uint32 store_port = 4;
+  // The round this worker last participated in (0 on first join).  Used to
+  // detect stale re-joins after coordinator failover.
+  uint64 previous_round = 5;
+  string idempotency_key = 6;
+}
+
+message RendezvousInfo {
+  uint64 round = 1;
+  RendezvousRoundState state = 2;
+  // World size of the completed round (or current participant count while
+  // waiting).
+  uint32 world_size = 3;
+  // Rank assigned to the requesting worker.  Only meaningful when state is
+  // COMPLETE and has_rank is true.
+  uint32 rank = 4;
+  bool has_rank = 5;
+  // c10d TCPStore endpoint for torch.distributed.init_process_group.
+  string store_addr = 6;
+  uint32 store_port = 7;
+  google.protobuf.Timestamp server_time = 8;
+}
+
+message JoinRendezvousResponse {
+  RendezvousInfo info = 1;
+}
+
+message GetRendezvousStateRequest {
+  RunId run_id = 1;
+  WorkerId worker_id = 2;
+}
+
+message GetRendezvousStateResponse {
+  RendezvousInfo info = 1;
+}

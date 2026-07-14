@@ -1,0 +1,22 @@
+# Normalize all text files to LF in the repository.
+* text=auto
+
+# Source and config files are always LF (rustfmt and CI check on Linux).
+*.rs text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.proto text eol=lf
+*.sh text eol=lf
+*.sql text eol=lf
+*.json text eol=lf
+
+# Windows scripts keep CRLF.
+*.ps1 text eol=crlf
+
+# Binary artifacts.
+*.tar binary
+*.png binary
+*.svg text eol=lf

@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/runtime-proto",
+    "crates/runtime-coordinator",
+    "crates/runtime-storage",
+    "crates/runtime-checkpoint",
+    "crates/runtime-bench",
+    "crates/runtime-uploader",
+    "crates/dtruntime-native",
+]
+# dtruntime-native is a PyO3 extension module: building it needs a CPython
+# >= 3.11 interpreter (pyo3's build script locates it), so it is excluded
+# from bare `cargo build`/`cargo test` at the workspace root. Build it via
+# `python scripts/build_native.py` (or `cargo build -p dtruntime-native`
+# with PYO3_PYTHON set). For --workspace commands, add
+# `--exclude dtruntime-native`.
+default-members = [
+    "crates/runtime-proto",
+    "crates/runtime-coordinator",
+    "crates/runtime-storage",
+    "crates/runtime-checkpoint",
+    "crates/runtime-bench",
+    "crates/runtime-uploader",
+]
+resolver = "2"
+
+# Profile for performance profiling: release optimizations + DWARF line info.
+# debug = 1 keeps line tables (needed for perf/flamegraph symbol resolution)
+# without the ~10× size penalty of full debug info (debug = 2).
+# strip = "none" prevents cargo from discarding the debug sections.
+[profile.perf]
+inherits  = "release"
+debug     = 1
+strip     = "none"
+# debug = 1 keeps line tables for symbol resolution without full debug overhead.
+# Build with RUSTFLAGS="-C force-frame-pointers=yes" to enable reliable
+# --call-graph fp unwinding under WSL2 / Hyper-V (preferred over DWARF there).
+
+[profile.perf.build-override]
+codegen-units = 1
