@@ -33,7 +33,7 @@ hex = "0.4"
 # JWT/OIDC bearer-token validation (HS256/RS256/ES256, iss/aud/exp/nbf).
 jsonwebtoken = "9"
 # SPIFFE SVID extraction: parse the URI SAN (spiffe://…) from client certs.
-x509-parser = "0.16"
+x509-parser = "0.18"
 # The dep tree enables both rustls crypto providers (ring via jsonwebtoken,
 # aws-lc-rs via others), so rustls 0.23 cannot auto-select one — we install the
 # ring provider explicitly at startup before any TLS is built.
