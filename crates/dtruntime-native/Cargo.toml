@@ -15,5 +15,5 @@ crate-type = ["cdylib"]
 # the SDK's 3.9 floor; this optional accelerator needs 3.11+.
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py311"] }
 runtime-storage = { path = "../runtime-storage", features = ["s3"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"

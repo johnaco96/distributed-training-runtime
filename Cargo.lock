@@ -1114,7 +1114,7 @@ dependencies = [
  "hex",
  "pyo3",
  "runtime-storage",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2635,7 +2635,7 @@ dependencies = [
  "runtime-storage",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2653,7 +2653,7 @@ dependencies = [
  "rusqlite",
  "rustls 0.23.41",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "tempfile",
  "tokio",
