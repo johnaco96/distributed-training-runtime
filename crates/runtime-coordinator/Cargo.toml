@@ -1,0 +1,43 @@
+[package]
+name = "runtime-coordinator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+runtime-checkpoint = { path = "../runtime-checkpoint" }
+runtime-proto = { path = "../runtime-proto" }
+runtime-storage = { path = "../runtime-storage", features = ["s3"] }
+prost-types = "0.13"
+rusqlite = { version = "0.31", features = ["bundled"] }
+# sqlx: async PostgreSQL driver used by PostgresMetadataStore.
+# runtime-tokio enables the tokio async runtime integration.
+# tls-native-tls enables TLS for postgres:// connections.
+# macros is NOT included — we use the runtime-checked query() API so the build
+# does not require a live database connection.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
+tokio-stream = "0.1"
+futures-core = "0.3"
+dashmap = "6"
+tonic = { version = "0.12", default-features = false, features = ["transport", "tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+# JWT/OIDC bearer-token validation (HS256/RS256/ES256, iss/aud/exp/nbf).
+jsonwebtoken = "9"
+# SPIFFE SVID extraction: parse the URI SAN (spiffe://…) from client certs.
+x509-parser = "0.16"
+# The dep tree enables both rustls crypto providers (ring via jsonwebtoken,
+# aws-lc-rs via others), so rustls 0.23 cannot auto-select one — we install the
+# ring provider explicitly at startup before any TLS is built.
+rustls = { version = "0.23", features = ["ring"] }
+
+[dev-dependencies]
+tempfile = "3"
