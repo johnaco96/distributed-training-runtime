@@ -70,7 +70,7 @@ jobs:
       - name: Build release coordinator (used by Python e2e tests)
         run: cargo build --release -p runtime-coordinator
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
