@@ -55,7 +55,7 @@ spec:
               echo "Coordinator is up."
       containers:
         - name: worker
-          image: distributed-training-runtime:dev
+          image: distributed-training-runtime:local
           imagePullPolicy: IfNotPresent
           command:
             - python

@@ -17,4 +17,9 @@ spec:
     - port: metrics
       path: /metrics
       interval: {{ .Values.monitoring.serviceMonitor.interval }}
+      # The alert/recording rules key on job="dtruntime-coordinator"; pin it
+      # so the rules work regardless of release/Service naming.
+      relabelings:
+        - targetLabel: job
+          replacement: dtruntime-coordinator
 {{- end }}

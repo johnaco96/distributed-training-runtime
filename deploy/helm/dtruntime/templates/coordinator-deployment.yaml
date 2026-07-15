@@ -22,11 +22,6 @@ spec:
       labels:
         {{- include "dtruntime.labels" . | nindent 8 }}
         app.kubernetes.io/component: coordinator
-      annotations:
-        {{- if .Values.monitoring.serviceMonitor.enabled }}
-        prometheus.io/scrape: "true"
-        prometheus.io/port: {{ .Values.coordinator.metricsPort | quote }}
-        {{- end }}
     spec:
       serviceAccountName: {{ include "dtruntime.serviceAccountName" . }}
       {{- with .Values.image.pullSecrets }}

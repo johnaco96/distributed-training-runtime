@@ -17,7 +17,8 @@ ignore = [
     # vulnerability. Remove when those deps drop it.
     { id = "RUSTSEC-2025-0134", reason = "unmaintained transitive PEM parser; no fix, no known vuln; tracked" },
     # rustls-webpki name-constraint validation issues. The fix is only in the
-    # 0.104 pre-release (0.103.13 is the latest stable, which we pin). Our TLS
+    # 0.104 pre-release (0.103.13 is the latest stable; the AWS SDK chain also
+    # pulls the older transitive 0.101.x line). Our TLS
     # trust paths (SPIRE/self-signed/cert-manager for mTLS; public CAs for AWS
     # S3) do not rely on attacker-controlled name-constrained CAs, so practical
     # exposure is low. Remove when rustls-webpki 0.104 ships stable.

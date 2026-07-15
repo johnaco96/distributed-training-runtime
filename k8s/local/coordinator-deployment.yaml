@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: coordinator
-          image: distributed-training-runtime:dev
+          image: distributed-training-runtime:local
           imagePullPolicy: IfNotPresent
           args:
             - "--addr"

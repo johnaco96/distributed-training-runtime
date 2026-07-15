@@ -72,7 +72,7 @@ spec:
       containers:
         - name: operator
           # Build with: docker build -f Dockerfile.operator -t <registry>/runtime-operator:<tag> .
-          image: ghcr.io/example/runtime-operator:latest
+          image: ghcr.io/johnaco96/distributed-training-runtime-operator:0.1.0  # replace with your registry/tag
           command: ["runtime-operator"]
           env:
             - name: RUST_LOG

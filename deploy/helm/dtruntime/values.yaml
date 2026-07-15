@@ -156,6 +156,6 @@ operator:
     limits:
       cpu: "250m"
       memory: "128Mi"
-  # Install the TrainingRun CRD with the chart. Set false if the CRD is
-  # managed separately (recommended for GitOps / multi-tenant clusters).
-  installCRD: true
+  # The TrainingRun CRD ships in the chart's crds/ directory and is
+  # installed automatically on `helm install` (use --skip-crds to manage it
+  # separately, e.g. for GitOps / multi-tenant clusters).

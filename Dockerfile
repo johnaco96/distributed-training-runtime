@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cpu
 
 ENV PYTHONPATH=/app/python
-EXPOSE 50051
+EXPOSE 50051 9090
 
 # Default entrypoint is the coordinator.  Override with --entrypoint runtime-bench
 # (or any other binary) to run benchmarks inside the cluster.
