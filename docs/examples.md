@@ -164,7 +164,6 @@ Smoke:
 `PYTHONPATH=python python python/examples/benchmark_pytorch_orchestration.py --runs 1 --epochs 1 --samples 32 --batch-size 8 --workers 2 --shards 4 --out-dir .dtruntime-pytorch-bench-smoke`
 
 Reviewer-oriented demo examples:
-- Demo checklist: [`docs/demo-checklist.md`](demo-checklist.md)
 - Packaging guide: [`docs/project-packaging.md`](project-packaging.md)
 
 ## K) Local Kubernetes demo

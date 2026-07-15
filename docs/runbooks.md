@@ -95,7 +95,6 @@ Scope is intentionally local/dev only (single coordinator replica, no HA/auth/da
 
 ## 8) Demo/release references
 
-- Demo/release checklist: [`docs/demo-checklist.md`](demo-checklist.md)
 - Project packaging guide: [`docs/project-packaging.md`](project-packaging.md)
 - Coordinator-driven PyTorch example: `python/examples/pytorch_coordinator_train.py`
 - Orchestration benchmark: `python/examples/benchmark_pytorch_orchestration.py`

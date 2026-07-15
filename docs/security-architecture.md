@@ -22,7 +22,7 @@ Current state:
 - **Supply-chain scanning** is enforced in CI: `cargo-deny` (RUSTSEC
   advisories, bans, sources) and `pip-audit`, with Dependabot updates.
 - HA coordinator replication/failover is implemented (PostgreSQL advisory lock).
-- Production S3 hardening is implemented (Phase 6).
+- Production S3 hardening is implemented.
 - Dashboard/admin UI is not implemented (the `dtruntime-admin` CLI is the
   operator surface).
 - Checkpoint integrity checks and idempotency protections are useful controls, but they are not a complete security boundary.

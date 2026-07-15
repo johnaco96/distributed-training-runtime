@@ -17,7 +17,7 @@ The harness (`tools/evidence/multinode/`) is complete and runnable:
     formed **across nodes**),
   - checkpoint restore + data-locality assertions from worker logs / metrics.
 
-This mirrors the **Phase 2** kind e2e that already validated cross-pod gloo DDP →
+This mirrors the kind e2e that already validated cross-pod gloo DDP →
 Succeeded (single-host kind). The remaining delta this proves is *separate
 physical nodes* — which the Linode 2-node campaign also covers alongside NCCL
 multi-node training and cross-machine checkpoint restore (one campaign closes

@@ -149,7 +149,7 @@ runs/{run_id}/LATEST
 
 ## Dataset prefetching
 
-`runtime-dataset` includes a bounded prefetch helper for dataset shard objects that reads through the existing `StorageBackend` abstraction. It is backend-neutral, so it works with local storage, memory-backed test storage, and S3-backed storage implementations.
+Dataset shard reads go through the same `StorageBackend` abstraction, so they are backend-neutral: local storage, memory-backed test storage, and S3-backed storage implementations all serve the shard read path.
 
 Highlights:
 - Accepts `DatasetPrefetchItem` inputs containing shard id, storage key, and optional expected size and checksum metadata.

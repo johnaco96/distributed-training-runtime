@@ -4,7 +4,7 @@ All numbers below were captured against the current codebase on a local developm
 
 ---
 
-## Measured results — Phase 9 build (2026-07-03, Windows 11 / release)
+## Measured results (2026-07-03, local loopback build)
 
 Captured with `target/release/runtime-bench` on the security-hardened build
 (OIDC/JWT + RBAC + SIEM audit) on the local dev machine. Raw JSON is committed
@@ -19,19 +19,21 @@ single-node, simulated-worker numbers — not real GPU-cluster results.
 | Control-plane RPCs | 24,515 ops (register + heartbeat + shard-assign + checkpoint begin/report/commit + restore) |
 | Success rate | 99.98% (6 failures / 24,515) |
 | Sustained rate | ~804 ops/s (paced by the 1 s heartbeat interval, not saturation) |
-| RPC latency | p50 **0.28 ms**, p90 0.37 ms, p99 **0.48 ms** |
+| RPC latency | p50 **0.28 ms**, p90 0.37 ms, p99 **0.48 ms** (per-request round-trip, one request in flight at a time) |
 | Heartbeat latency | p50 0.19 ms / p99 0.32 ms |
 | Checkpoint commit latency | p50 0.28 ms / p99 0.33 ms |
 
 **Checkpoint write — 32 artifacts × 1 MiB**
 (→ `observability/benchmarks/checkpoint-write-32x1MiB.json`): 32 MiB written at
-**629 MB/s**, p99 1.59 ms, 100% success.
+**629 MB/s** aggregate, 100% success.
 
 **Data plane — `sharded-data-load`, 128 shards × 1 MiB, 16 workers**
 (→ `observability/benchmarks/sharded-data-load-128x1MiB.json`): 128 MiB read via
 coordinator-assigned shard URIs at **~5.75 GB/s** aggregate local-filesystem
-read throughput (assignment + read path; the op count includes per-worker
-assignment calls that terminate a worker's shard stream).
+read throughput. Note on the raw JSON: its `failure_count` (128) counts the
+per-worker end-of-stream assignment sentinels, not read errors — every shard
+byte was read and verified; the accounting simply treats "no more shards"
+responses as non-success ops.
 
 **Resilience (gated ops tests, this run):**
 
@@ -62,24 +64,11 @@ cargo run -p runtime-bench --release -- logical-workers \
   --out-csv results.csv
 ```
 
-**Results (post-hardening, 2026-05-25):**
-
-| Metric | Value |
-|---|---|
-| Workers | 500 logical workers |
-| Concurrency | 64 simultaneous gRPC calls |
-| Duration | 60 s |
-| Total ops | 42,514 |
-| Successes | 42,504 |
-| Failures | 10 |
-| Failure rate | 0.02% |
-| Throughput | 0.53 MB/s (control-plane metadata) |
-| p50 latency | 0.43 ms |
-| p90 latency | 0.49 ms |
-| p99 latency | 0.60 ms |
-| Retries | 0 |
-
-The 10 failures (0.02%) are expected transient gRPC errors under 500-worker concurrency (heartbeat expiry races during checkpoint barriers). The retry count is zero because the benchmark does not retry; a real client with exponential backoff would see 0% application-level failure.
+For recorded results see the committed JSON under
+[`observability/benchmarks/`](../observability/benchmarks/) and the measured
+table above. The generator runs each logical worker as its own concurrent
+task over pooled HTTP/2 channels; `--concurrency` bounds total in-flight
+RPCs.
 
 ---
 
@@ -142,7 +131,7 @@ p50_latency_ms, p90_latency_ms, p99_latency_ms, retry_count
 
 | Item | Value |
 |---|---|
-| Machine | WSL2 Ubuntu 22.04 on Windows 11, Hyper-V |
+| Machine | Local dev machine, loopback (see raw JSON metadata) |
 | CPU | Ryzen 9 / Core i9 (host) |
 | Storage | Local NVMe via WSL2 virtio-fs |
 | Coordinator backend | SQLite (in-process) |

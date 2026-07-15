@@ -1,228 +1,132 @@
 # Architecture Overview
 
-This document describes how the Distributed Training Runtime is structured **today** and how the main components interact. It is intentionally honest about current MVP limits.
-
-For the current project boundary list and validation posture, see [Status and limitations](status-and-limitations.md).
-
-## High-level system overview
-
-Implemented today:
-- A Rust coordinator exposes a gRPC control plane.
-- A Python SDK and examples call that control plane.
-- Storage backends persist checkpoint artifacts/metadata.
-- Dataset registration and shard assignment flows are available for local/runtime simulations.
-- Optional mTLS via coordinator TLS flags and cert-manager PKI in local-secure Kubernetes path.
-- Role-based authorization via metadata-based identity model.
-- Structured audit logging via `DbAuditSink`.
-- PostgreSQL HA via advisory lock for multi-replica coordinator deployments.
-- Local Kubernetes manifests in `k8s/local/` and secure manifests in `k8s/local-secure/`.
-
-Simulated today:
-- The PyTorch distributed-style flow is a **single-process simulation** with logical workers and FedAvg-style aggregation.
-
-Not implemented yet (future work):
-- Production scheduler integration.
-- Real `torch.distributed` execution.
-- Dashboard/admin UI.
-- Production HA with full failover test coverage.
+How the production-hardening build of the Distributed Training Runtime is
+structured and how the pieces interact. The system splits into a **control
+plane** (the Rust coordinator: decisions and metadata), the **Python SDK**
+(the API training code uses), and the **operations layer** (Kubernetes
+operator, Helm, observability, security).
 
 ## Main components
 
-### Rust coordinator (`runtime-coordinator`)
-Authoritative control-plane service for run registration, worker lifecycle, heartbeat handling, dataset registration, shard assignment/lease flows, and checkpoint lifecycle RPCs.
+### Rust coordinator (`crates/runtime-coordinator`)
+The authoritative control-plane service (tokio + tonic gRPC): run/worker
+registration, heartbeat-based failure detection, round-based rendezvous with
+stable rank assignment, dataset registration and per-rank shard assignment,
+the two-phase checkpoint commit, and durable metadata (SQLite for dev,
+PostgreSQL for HA — rehydrated on restart, with advisory-lock leader
+election for multi-replica deployments). Requests pass through a layered
+authenticator (JWT/OIDC → SPIFFE peer certs → dev metadata headers) with
+role-based authorization and structured audit logging (tracing,
+JSON-lines/SIEM file, and durable DB sinks); TLS/mTLS via flags. A periodic
+reconcile task marks silent workers stale/failed, detects stuck runs, and
+enforces checkpoint retention.
 
-### Protocol contract (`runtime-proto`)
-Shared protobuf/gRPC API definitions used by Rust and Python components (`proto/runtime.proto`). This is the compatibility boundary for control-plane behavior.
+### Protocol contract (`crates/runtime-proto`, `proto/runtime.proto`)
+The protobuf/gRPC API shared by Rust and Python. Backward compatibility is
+enforced by `proto/compat_snapshot.json` + `test_proto_compatibility.py`,
+which fail on field removal/rename/renumber/retype.
 
-### Client layers (`runtime-client` and Python SDK)
-- Rust `runtime-client` supports client-side integration in Rust contexts.
-- Python SDK (`python/dtruntime/client.py`) provides user-facing control-plane operations for examples and integration tests.
+### Storage abstraction (`crates/runtime-storage`)
+Backend-neutral object storage: local filesystem and S3-compatible (aws-sdk,
+MinIO-tested) with multipart upload and abort-on-failure, retry with
+transient/permanent error classification, full-jitter backoff, and SSE-S3 /
+SSE-KMS.
 
-### Storage abstraction (`runtime-storage`)
-Backend-neutral storage interface with local filesystem and optional S3-compatible implementations used by checkpoint/data helpers.
+### Checkpoint machinery (`crates/runtime-checkpoint`)
+The checkpoint domain model (state machine, artifact records with SHA-256
+integrity, JSON manifests, retention policies) plus a `CheckpointStore`
+implementing the manifest/commit protocol directly over object storage,
+validated against real MinIO.
 
-### Checkpoint runtime (`runtime-checkpoint`)
-Checkpoint metadata/state helpers and commit-path helpers, including artifact reporting assumptions and latest-pointer semantics.
+### Kubernetes operator (`crates/runtime-operator`)
+A kube-rs controller for the `TrainingRun` CRD: reconciles a managed
+coordinator Deployment/Service and an Indexed worker Job (server-side apply,
+owner references, status projection), with pluggable scheduler backends —
+plain Kubernetes, Volcano gang scheduling (PodGroup), and Kueue queueing.
+Deployable via the raw manifests in `k8s/operator/` or the Helm chart in
+`deploy/helm/dtruntime/`.
 
-### Dataset runtime (`runtime-dataset`)
-Dataset registration/shard metadata + shard assignment helper logic used by coordinator and simulations.
+### Python SDK (`python/dtruntime`)
+The user-facing API, torch-free at import:
+- `client` — gRPC client wrapper (TLS, auth headers, idempotency keys).
+- `torch_dist` / `strategies` / `rendezvous` — coordinator-backed
+  `torch.distributed` setup, elastic recovery (`run_elastic`),
+  DDP/FSDP/DeepSpeed wrappers.
+- `checkpointing` — PyTorch DCP save/restore with two-phase commit through
+  the coordinator, corruption detection with fallback, and async save.
+- `data` — `DistributedShardDataset` (IterableDataset) with coordinator
+  shard assignment, LRU disk cache, prefetching, deterministic shuffle, and
+  content-addressed dataset versioning.
+- `launch` — torchrun-style multi-worker supervisor.
+- `admin` — the `dtruntime-admin` CLI (inspect/pause/resume/retry/drain
+  runs, verify checkpoints, doctor).
 
-### Benchmark harness (`runtime-bench`)
-Local benchmark and scaling-smoke harness covering control-plane RPC patterns and storage-adjacent benchmark workflows.
-
-### PyTorch examples (`python/examples`)
-- `pytorch_train.py`: single-worker local example with checkpoint save/restore.
-- `pytorch_simulated_distributed.py`: deterministic, single-process simulated distributed-style training (logical workers + shard mapping + FedAvg-style aggregation).
+### Load generator (`crates/runtime-bench`)
+Protocol-level benchmark harness: concurrent logical workers over real gRPC
+(per-worker tasks, pooled HTTP/2 channels, bounded in-flight RPCs), latency
+percentiles per RPC class, failure injection, plus storage and data-plane
+benchmarks. See [benchmarks.md](benchmarks.md).
 
 ## Component diagram
 
 ```mermaid
 flowchart LR
-    subgraph PythonSide[Python Side]
-      SDK[Python SDK
-(dtruntime client)]
-      EX[Examples
-local_demo / pytorch_*]
+    subgraph Worker[Training worker process]
+      SDK[Python SDK<br/>torch_dist / data / checkpointing]
     end
 
-    subgraph RustSide[Rust Runtime]
-      COORD[Coordinator gRPC service
-(runtime-coordinator)]
-      DATASET[Dataset/Sharding
-(runtime-dataset)]
-      CKPT[Checkpoint runtime
-(runtime-checkpoint)]
-      META[Coordinator state + metadata
-(run/worker/checkpoint state)]
-      PROTO[Protocol contract
-(runtime-proto)]
+    subgraph Coordinator[Rust coordinator]
+      COORD[gRPC service<br/>rendezvous, lifecycle, 2PC, auth/audit]
+      META[(SQLite / PostgreSQL<br/>metadata)]
     end
 
-    subgraph Storage[Storage Backends]
-      LOCAL[Local filesystem]
-      S3[S3-compatible backend]
+    subgraph Ops[Operations layer]
+      OP[runtime-operator<br/>TrainingRun CRD]
+      OBS[Prometheus rules<br/>Grafana dashboard]
     end
 
-    BENCH[Benchmark harness
-(runtime-bench)]
+    subgraph Store[Storage]
+      S3[local FS / S3 / MinIO]
+    end
 
-    EX --> SDK
-    SDK -->|gRPC (runtime.v1)| COORD
-    BENCH -->|benchmark RPC calls| COORD
-    COORD --> PROTO
-    COORD --> DATASET
-    COORD --> CKPT
+    SDK -->|gRPC control + artifact streams| COORD
     COORD --> META
-    CKPT --> LOCAL
-    CKPT --> S3
-    DATASET --> LOCAL
+    COORD -->|checkpoint artifacts| S3
+    OP -->|renders coordinator + worker Jobs| Coordinator
+    OBS -.->|scrapes /metrics| COORD
 ```
 
-## Core control-plane flow
+## Core flows
 
-The runtime control-plane flow implemented today is:
-1. `RegisterRun`
-2. `RegisterWorker`
-3. `Heartbeat` (repeated)
-4. `RegisterDataset`
-5. `GetShardAssignment` (+ optional renew/progress updates)
-6. `ReportShardProgress`
-7. `BeginCheckpoint`
-8. `ReportCheckpointArtifact`
-9. `CommitCheckpoint`
-10. `GetLatestCheckpoint` (restore lookup)
+**Control plane:** `RegisterRun` → `RegisterWorker` (rendezvous assigns
+stable ranks) → `Heartbeat` loop (failure detection; responses carry run
+state + rendezvous round) → `RegisterDataset` / `GetShardAssignment` /
+`ReportShardProgress` → checkpoint 2PC (`BeginCheckpoint` →
+`ReportCheckpointArtifact` → `CommitCheckpoint`, committed only when every
+expected worker's vote is in) → `GetLatestCheckpoint` for restore.
 
-```mermaid
-sequenceDiagram
-    participant Py as Python Client/SDK
-    participant C as Rust Coordinator
-    participant H as Storage+Checkpoint Helper
+**Elastic recovery:** a dead worker misses heartbeats → reconciliation marks
+it failed → the rendezvous round is invalidated → survivors (and any
+replacement) observe the new round, re-form the process group through
+`run_elastic`, restore from the latest committed checkpoint, and continue.
 
-    Py->>C: RegisterRun
-    C-->>Py: run_id
+**Checkpointing:** DCP writes sharded artifacts; workers stream them to the
+coordinator, which persists them under `--storage-root` (optionally
+mirroring to S3) and serves restores; corrupt artifacts are detected by
+checksum and fall back to the previous committed checkpoint.
 
-    loop per worker
-      Py->>C: RegisterWorker
-      C-->>Py: worker registered
-    end
-
-    loop runtime loop
-      Py->>C: Heartbeat
-      C-->>Py: next heartbeat deadline
-    end
-
-    Py->>C: RegisterDataset
-    C-->>Py: dataset accepted
-
-    Py->>C: GetShardAssignment
-    C-->>Py: shard leases/assignments
-    Py->>C: ReportShardProgress
-
-    Py->>C: BeginCheckpoint
-    C-->>Py: checkpoint_id + artifact specs
-    Py->>H: write artifact bytes
-    Py->>C: ReportCheckpointArtifact(metadata)
-    Py->>C: CommitCheckpoint
-    C->>H: validate artifacts + finalize metadata
-    C-->>Py: committed
-
-    Py->>C: GetLatestCheckpoint
-    C-->>Py: latest committed manifest
-```
-
-## Data/checkpoint flow
-
-Implemented behavior:
-- Artifact bytes are written to storage paths under run/checkpoint namespaces.
-- Workers/clients report artifact metadata (path, size, checksum metadata) through control-plane RPCs.
-- Commit path validates artifact expectations before finalizing committed checkpoint state.
-- Coordinator maintains the latest committed checkpoint pointer for restore lookup.
-- Cleanup policies/utilities exist for checkpoint lifecycle maintenance.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Initiated: BeginCheckpoint
-    Initiated --> UploadInProgress: artifact plan issued
-    UploadInProgress --> Validating: ReportCheckpointArtifact complete
-    Validating --> Committed: CommitCheckpoint success
-    Committed --> LatestPointerUpdated: update LATEST
-    Validating --> Failed: validation/integrity failure
-    UploadInProgress --> Aborted: explicit cancel/error path
-    Failed --> [*]
-    Aborted --> [*]
-    LatestPointerUpdated --> [*]
-```
-
-## ML integration view (implemented vs simulated)
-
-```mermaid
-flowchart TD
-    SYN[Synthetic dataset generation]
-    SH[Deterministic shard split]
-    W1[Logical worker 0
-local training step]
-    W2[Logical worker 1
-local training step]
-    AGG[FedAvg-style aggregation
-(single process)]
-    CK[Checkpoint save/restore]
-
-    SYN --> SH
-    SH --> W1
-    SH --> W2
-    W1 --> AGG
-    W2 --> AGG
-    AGG --> CK
-    CK --> AGG
-```
-
-Notes:
-- Implemented: deterministic synthetic data, shard assignment logic, worker-local training loops, checkpoint save/restore.
-- Simulated: multi-worker behavior in one process, FedAvg-style aggregation loop.
-- Not implemented: real multi-process/multi-node `torch.distributed` backend.
-
-## Benchmark and observability view
-
-Implemented today:
-- In-process observability foundation: structured logs + runtime metrics counters/gauges.
-- `runtime-bench` benchmark harness for local control-plane and scaling smoke tests.
-- Worker RPC benchmark and scaling-workers benchmark variants (including simulated large logical worker counts).
-- Prometheus/Grafana stack in `observability/` directory.
-
-Not implemented yet:
-- Full distributed multi-node profiling.
+**Run lifecycle:** durable states (pending / running / recovering /
+completed / failed / cancelled) survive coordinator restarts; admin
+operations (cancel/pause/resume/retry/drain) and stuck-run detection drive
+transitions. See [run-lifecycle.md](run-lifecycle.md).
 
 ## Current boundaries
 
-This architecture currently targets local/MVP development workflows:
-- Local/MVP coordinator behavior is the primary scope.
-- PyTorch distributed-style example is simulated, not true distributed runtime execution.
-- No production scheduler integration.
-- No real `torch.distributed` integration yet.
-
-## Security architecture companion docs
-
-For the security target model and trust boundaries, see:
-- [Security architecture](security-architecture.md)
-- [Threat model](threat-model.md)
-- [Production readiness](production-readiness.md)
+- Validated locally and on kind clusters (real cross-pod gloo DDP through
+  the operator); not yet run on a managed-cloud GPU cluster at scale — see
+  [status-and-limitations.md](status-and-limitations.md) for the
+  validated-vs-documented matrix.
+- Benchmark numbers are single-machine loopback measurements
+  ([benchmarks.md](benchmarks.md)).
+- S3 object deletion for checkpoint GC is delegated to bucket lifecycle
+  rules; the coordinator garbage-collects metadata rows and local artifacts.
