@@ -917,6 +917,7 @@ pub fn run_logical_workers(
     duration_secs: u64,
     concurrency: usize,
     heartbeat_interval_ms: u64,
+    channels: usize,
     shards: usize,
     checkpoint_every_secs: u64,
     checkpoint_artifacts_per_checkpoint: usize,
@@ -932,6 +933,7 @@ pub fn run_logical_workers(
         duration_secs,
         concurrency,
         heartbeat_interval_ms,
+        channels,
         shards,
         checkpoint_every_secs,
         checkpoint_artifacts_per_checkpoint,
@@ -947,8 +949,9 @@ async fn run_logical_workers_async(
     target: Option<String>,
     workers: usize,
     duration_secs: u64,
-    _concurrency: usize,
+    concurrency: usize,
     heartbeat_interval_ms: u64,
+    channels: usize,
     shards: usize,
     checkpoint_every_secs: u64,
     checkpoint_artifacts_per_checkpoint: usize,
@@ -971,7 +974,7 @@ async fn run_logical_workers_async(
     } else {
         format!("http://{addr}")
     };
-    let mut client = CoordinatorServiceClient::connect(endpoint)
+    let mut client = CoordinatorServiceClient::connect(endpoint.clone())
         .await
         .map_err(|_| format!("timed out waiting for existing coordinator at {addr}"))?;
     let bench_id = format!(
@@ -979,7 +982,6 @@ async fn run_logical_workers_async(
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
 
-    // let run_t0 = Instant::now();
     let run_resp = client
         .register_run(Request::new(RegisterRunRequest {
             idempotency_key: format!("{bench_id}-run"),
@@ -1073,59 +1075,109 @@ async fn run_logical_workers_async(
         }
     }
 
-    let start = Instant::now();
-    let mut checkpoint_seq = 0_u64;
-    while start.elapsed().as_secs() < duration_secs {
-        for (idx, wid) in worker_ids.iter().enumerate() {
-            if failure_rate > 0.0 && ((idx as f64 / workers as f64) < failure_rate) {
-                continue;
-            }
-            let t = Instant::now();
-            let ok = client
-                .heartbeat(Request::new(HeartbeatRequest {
-                    run_id: Some(run_id.clone()),
-                    worker_id: Some(wid.clone()),
-                    idempotency_key: format!("{bench_id}-hb-{}", idx),
-                    client_time: None,
-                    active_shard_ids: Vec::new(),
-                }))
+    // Channel pool: HTTP/2 multiplexes many concurrent streams per
+    // connection, so a handful of connections carries thousands of logical
+    // workers. Tonic clients clone cheaply and share their channel.
+    let channel_count = if channels == 0 {
+        (workers / 64).clamp(1, 32)
+    } else {
+        channels
+    };
+    let mut channel_pool = Vec::with_capacity(channel_count);
+    for _ in 0..channel_count {
+        channel_pool.push(
+            CoordinatorServiceClient::connect(endpoint.clone())
                 .await
-                .is_ok();
-            let ms = t.elapsed().as_secs_f64() * 1000.0;
-            hb_lat.push(ms);
-            samples.push(BenchmarkSample {
-                latency_ms: ms,
-                bytes: 0,
-                success: ok,
-                retry_count: 0,
-            });
-            let t = Instant::now();
-            let ok = client
-                .get_shard_assignment(Request::new(
-                    runtime_proto::runtime::v1::GetShardAssignmentRequest {
+                .map_err(|e| format!("channel pool connect failed: {e}"))?,
+        );
+    }
+
+    // Each logical worker runs as its own task on a heartbeat cadence;
+    // total in-flight RPCs are bounded by the shared semaphore so
+    // `--concurrency` is the actual offered load, not a no-op.
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let start = Instant::now();
+    let mut worker_tasks = tokio::task::JoinSet::new();
+    for (idx, wid) in worker_ids.iter().enumerate() {
+        // Preserved semantics: the first `failure_rate` fraction of workers
+        // goes silent for the whole run, exercising stale-worker
+        // reconciliation. (`recover_failed_workers` remains summary
+        // metadata, as before this loop became concurrent.)
+        if failure_rate > 0.0 && ((idx as f64 / workers as f64) < failure_rate) {
+            continue;
+        }
+        let mut client = channel_pool[idx % channel_pool.len()].clone();
+        let sem = Arc::clone(&sem);
+        let run_id = run_id.clone();
+        let dataset_id = dataset_id.clone();
+        let wid = wid.clone();
+        let bench_id = bench_id.clone();
+        worker_tasks.spawn(async move {
+            let mut hb = Vec::new();
+            let mut asg = Vec::new();
+            let mut samples = Vec::new();
+            let mut tick =
+                tokio::time::interval(Duration::from_millis(heartbeat_interval_ms.max(1)));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if start.elapsed().as_secs() >= duration_secs {
+                    break;
+                }
+                let _permit = sem.acquire().await.expect("bench semaphore closed");
+                let t = Instant::now();
+                let ok = client
+                    .heartbeat(Request::new(HeartbeatRequest {
                         run_id: Some(run_id.clone()),
                         worker_id: Some(wid.clone()),
-                        dataset_id: Some(dataset_id.clone()),
-                        idempotency_key: format!("{bench_id}-asg-{}", idx),
-                    },
-                ))
-                .await
-                .is_ok();
-            let ms = t.elapsed().as_secs_f64() * 1000.0;
-            assign_lat.push(ms);
-            samples.push(BenchmarkSample {
-                latency_ms: ms,
-                bytes: 0,
-                success: ok,
-                retry_count: 0,
-            });
-        }
-        if checkpoint_every_secs > 0
-            && start
-                .elapsed()
-                .as_secs()
-                .is_multiple_of(checkpoint_every_secs)
-        {
+                        idempotency_key: format!("{bench_id}-hb-{}", idx),
+                        client_time: None,
+                        active_shard_ids: Vec::new(),
+                    }))
+                    .await
+                    .is_ok();
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                hb.push(ms);
+                samples.push(BenchmarkSample {
+                    latency_ms: ms,
+                    bytes: 0,
+                    success: ok,
+                    retry_count: 0,
+                });
+                let t = Instant::now();
+                let ok = client
+                    .get_shard_assignment(Request::new(
+                        runtime_proto::runtime::v1::GetShardAssignmentRequest {
+                            run_id: Some(run_id.clone()),
+                            worker_id: Some(wid.clone()),
+                            dataset_id: Some(dataset_id.clone()),
+                            idempotency_key: format!("{bench_id}-asg-{}", idx),
+                        },
+                    ))
+                    .await
+                    .is_ok();
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                asg.push(ms);
+                samples.push(BenchmarkSample {
+                    latency_ms: ms,
+                    bytes: 0,
+                    success: ok,
+                    retry_count: 0,
+                });
+            }
+            (hb, asg, samples)
+        });
+    }
+
+    // Checkpoint 2PC cadence runs alongside the worker load on its own task
+    // (previously it piggybacked on the sequential worker sweep).
+    let mut checkpoint_seq = 0_u64;
+    while start.elapsed().as_secs() < duration_secs {
+        if checkpoint_every_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(checkpoint_every_secs)).await;
+            if start.elapsed().as_secs() >= duration_secs {
+                break;
+            }
             checkpoint_seq += 1;
             let ckid = runtime_proto::runtime::v1::CheckpointId {
                 value: format!("ckpt-{checkpoint_seq}"),
@@ -1221,8 +1273,19 @@ async fn run_logical_workers_async(
                 success: ok,
                 retry_count: 0,
             });
+        } else {
+            // No checkpoint cadence: idle out the remaining duration while
+            // the worker tasks generate the load.
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        tokio::time::sleep(Duration::from_millis(heartbeat_interval_ms)).await;
+    }
+
+    // Drain the worker tasks and fold their latencies into the run totals.
+    while let Some(res) = worker_tasks.join_next().await {
+        let (hb, asg, s) = res.map_err(|e| format!("logical worker task panicked: {e}"))?;
+        hb_lat.extend(hb);
+        assign_lat.extend(asg);
+        samples.extend(s);
     }
 
     if let Some(mut c) = child.take() {
@@ -1241,97 +1304,6 @@ async fn run_logical_workers_async(
     );
     s.extra = json!({"logical_worker_count":workers,"register_worker_latency_ms":latency_summary(&reg_lat),"heartbeat_latency_ms":latency_summary(&hb_lat),"shard_assignment_latency_ms":latency_summary(&assign_lat),"checkpoint_begin_latency_ms":latency_summary(&cbegin),"checkpoint_report_artifact_latency_ms":latency_summary(&cread),"checkpoint_commit_latency_ms":latency_summary(&ccommit),"restore_latest_latency_ms":latency_summary(&crest)});
     Ok(s)
-}
-
-pub fn run_dataset_prefetch(
-    requested_shards: usize,
-    payload_bytes: usize,
-    concurrency: usize,
-) -> Result<BenchmarkSummary, String> {
-    let samples: Vec<BenchmarkSample> = (0..requested_shards)
-        .map(|_| BenchmarkSample {
-            latency_ms: 1.0,
-            bytes: payload_bytes as u64,
-            success: true,
-            retry_count: 0,
-        })
-        .collect();
-    Ok(BenchmarkSummary::from_samples(
-        "dataset-prefetch",
-        "local-dev",
-        "dataset-prefetch",
-        "prefetch-summary",
-        vec!["synthetic local prefetch summary path".into()],
-        &samples,
-        requested_shards as f64,
-        json!({"requested_shards": requested_shards, "successful_shards": requested_shards, "failed_shards": 0, "bytes_read": requested_shards * payload_bytes, "duration_ms": requested_shards, "concurrency": concurrency, "retry_max_attempts": 0}),
-    ))
-}
-
-pub fn run_cache_aware_placement(
-    workers: usize,
-    shards: usize,
-    hinted_shards: usize,
-) -> Result<Vec<BenchmarkSummary>, String> {
-    let det = BenchmarkSummary::from_samples(
-        "cache-aware-placement",
-        "local-dev",
-        "placement",
-        "deterministic",
-        vec!["synthetic assignment benchmark".into()],
-        &[BenchmarkSample {
-            latency_ms: 1.0,
-            bytes: 0,
-            success: true,
-            retry_count: 0,
-        }],
-        1.0,
-        json!({"workers":workers,"shards":shards,"hinted_shards":hinted_shards,"placement_mode":"deterministic","assignments": shards,"cache_hint_hit_count":0}),
-    );
-    let hit = hinted_shards.min(shards);
-    let ca = BenchmarkSummary::from_samples(
-        "cache-aware-placement",
-        "local-dev",
-        "placement",
-        "cache-aware",
-        vec!["synthetic assignment benchmark".into()],
-        &[BenchmarkSample {
-            latency_ms: 1.0,
-            bytes: 0,
-            success: true,
-            retry_count: 0,
-        }],
-        1.0,
-        json!({"workers":workers,"shards":shards,"hinted_shards":hinted_shards,"placement_mode":"cache-aware","assignments": shards,"cache_hint_hit_count": hit}),
-    );
-    Ok(vec![det, ca])
-}
-
-pub fn run_auth_audit_overhead(iterations: usize) -> Result<Vec<BenchmarkSummary>, String> {
-    let modes = [
-        ("auth-disabled", iterations, 0, 0),
-        ("metadata-allow", iterations, 0, iterations),
-        ("metadata-deny-mismatch", 0, iterations, iterations),
-    ];
-    Ok(modes.into_iter().map(|(mode,allow,deny,audit)| BenchmarkSummary::from_samples("auth-audit-overhead","local-dev","auth-audit",mode.to_string(),vec!["no auth metadata values logged".into()],&[BenchmarkSample{latency_ms:1.0,bytes:0,success:true,retry_count:0}],iterations as f64,json!({"iterations":iterations,"mode":mode,"allowed_count":allow,"denied_count":deny,"audit_event_count":audit,"duration_ms":iterations}))).collect())
-}
-
-pub fn run_status_snapshot() -> Result<BenchmarkSummary, String> {
-    Ok(BenchmarkSummary::from_samples(
-        "status-snapshot",
-        "local-dev",
-        "status",
-        "internal-snapshot",
-        vec!["status smoke without external server".into()],
-        &[BenchmarkSample {
-            latency_ms: 1.0,
-            bytes: 0,
-            success: true,
-            retry_count: 0,
-        }],
-        1.0,
-        json!({"status_fields_present":["uptime","version","service"],"secret_field_scan_passed":true,"duration_ms":1.0}),
-    ))
 }
 
 /// Run the full coordinator→shard-assignment→data-read pipeline with real files.

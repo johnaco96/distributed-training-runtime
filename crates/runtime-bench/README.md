@@ -1,5 +1,22 @@
 # runtime-bench
 
-Benchmark harness support.
+gRPC load generator for the coordinator. Every subcommand does real work —
+real RPCs against a real coordinator, or real file I/O — and reports
+latency percentiles (p50/p90/p99), throughput, and failure counts as a
+one-line summary plus optional `--out-csv` / `--out-json`.
 
-This crate provides the benchmark harness for coordinator control-plane load testing, including logical-worker emulation and latency/throughput measurement.
+| Subcommand | What it measures | Driven by |
+|---|---|---|
+| `logical-workers` | Thousands of concurrent simulated workers running the full protocol (register, heartbeat cadence, shard assignment, optional checkpoint 2PC, failure injection) over pooled HTTP/2 channels | `docs/benchmarks.md`, `docs/scaling-tests.md`, `scripts/run_flamegraph.py`, soak/chaos tests (`python/tests/test_soak.py`, `test_chaos.py`), `k8s/local/scale-test-job.yaml` |
+| `scaling-workers` | The same worker RPC flow swept across a list of worker counts | `docs/scaling-tests.md` |
+| `worker-rpc` | Single-flow worker RPC latency (register + N heartbeats) | `docs/benchmarks.md` |
+| `sharded-data-load` | End-to-end data plane: shard assignment → real file reads → progress reports | `docs/benchmarks.md` |
+| `dataset-read` | Concurrent shard reads through the storage backend | `docs/benchmarks.md` |
+| `checkpoint-write` / `checkpoint-restore` | Artifact write/restore throughput through `runtime-checkpoint` + `runtime-storage` | `docs/benchmarks.md` |
+
+Start with:
+
+```bash
+cargo run --release -p runtime-bench -- logical-workers \
+    --workers 1000 --duration-secs 30 --concurrency 256 --start-coordinator
+```
