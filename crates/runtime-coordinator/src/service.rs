@@ -533,7 +533,13 @@ impl CoordinatorService for CoordinatorServiceImpl {
             run_state: heartbeat.run_state,
         };
         self.metrics.inc_heartbeats_total();
-        self.update_worker_metrics(&run_id);
+        // The active/stale gauges only move when a worker's state flips;
+        // recounting the whole roster on every steady-state heartbeat is
+        // O(workers²) per heartbeat wave. Reconciliation and the flip path
+        // keep the gauges fresh.
+        if heartbeat.state_changed {
+            self.update_worker_metrics(&run_id);
+        }
         // debug: heartbeats arrive continuously from every worker; info-level
         // logging here floods production logs.
         tracing::debug!(run_id = %run_id.value, worker_id = %worker_id.value, "heartbeat accepted");

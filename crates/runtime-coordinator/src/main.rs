@@ -212,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Arc::new(RuntimeMetrics::default());
     let mut service = CoordinatorServiceImpl::with_metrics_authorizer_and_audit(
         state.clone(),
-        metrics,
+        metrics.clone(),
         authenticator,
         audit.clone(),
     )
@@ -302,6 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is polling.
     {
         let reconcile_state = state.clone();
+        let reconcile_metrics = metrics.clone();
         let interval = std::time::Duration::from_secs(args.reconcile_interval_secs.max(1));
         let stuck_after = std::time::Duration::from_secs(args.stuck_after_secs.max(1));
         let retention = std::time::Duration::from_secs(args.terminal_run_retention_secs.max(1));
@@ -320,6 +321,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 ticker.tick().await;
                 reconcile_state.reconcile_worker_liveness();
+                // Heartbeats only refresh the worker gauges on a state flip;
+                // this periodic recount keeps them honest for workers that
+                // died silently and will never heartbeat again.
+                let (active, stale, failed) = reconcile_state.global_worker_counts();
+                reconcile_metrics.set_active_workers(active);
+                reconcile_metrics.set_stale_workers(stale);
+                reconcile_metrics.set_failed_workers(failed);
                 let stuck = reconcile_state.detect_stuck_runs(stuck_after);
                 if stuck > 0 {
                     tracing::warn!(count = stuck, "marked stuck run(s) as failed");

@@ -218,6 +218,11 @@ pub struct WorkerHeartbeat {
     /// Current run lifecycle state, so workers observe cancellation and
     /// other terminal transitions without extra RPCs.
     pub run_state: i32,
+    /// Whether this heartbeat changed the worker's state (e.g. Stale →
+    /// Active). Steady-state heartbeats leave counts untouched, so callers
+    /// can skip the O(workers) recount that would otherwise run on every
+    /// heartbeat of every worker.
+    pub state_changed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1419,6 +1424,29 @@ impl CoordinatorState {
         Some((active, stale))
     }
 
+    /// Active/stale/failed totals across every run, for the periodic
+    /// reconcile task to refresh the worker gauges. Heartbeats only refresh
+    /// the active/stale gauges on a state flip, so without this a worker
+    /// that dies silently would leave the gauges frozen at their last value.
+    pub fn global_worker_counts(&self) -> (u64, u64, u64) {
+        let mut active = 0u64;
+        let mut stale = 0u64;
+        let mut failed = 0u64;
+        for entry in self.workers_by_run.iter() {
+            let workers = entry.value().read().unwrap();
+            for w in workers.values() {
+                if w.state == WorkerState::Active as i32 {
+                    active += 1;
+                } else if w.state == WorkerState::Stale as i32 {
+                    stale += 1;
+                } else if w.state == WorkerState::Failed as i32 {
+                    failed += 1;
+                }
+            }
+        }
+        (active, stale, failed)
+    }
+
     pub fn status_snapshot(&self) -> CoordinatorStatusSnapshot {
         let run_count = self.runs.len();
         let mut worker_count = 0usize;
@@ -2506,6 +2534,7 @@ impl CoordinatorState {
         // A heartbeat re-activates a stale/failed worker, but never resurrects
         // one that already deregistered, and never revives workers of a
         // terminal run — the response tells them to exit instead.
+        let prev_state = worker.state;
         if !run_terminal
             && worker.state != WorkerState::Completed as i32
             && worker.state != WorkerState::Removed as i32
@@ -2513,10 +2542,15 @@ impl CoordinatorState {
             worker.state = WorkerState::Active as i32;
         }
         let state = worker.state;
+        let state_changed = state != prev_state;
         let worker_snapshot = worker.clone();
         drop(workers);
 
-        refresh_active_worker_count(&self.runs, &self.workers_by_run, &run_id.value);
+        // Recounting active workers walks the whole roster; only pay that
+        // when this heartbeat actually flipped the worker's state.
+        if state_changed {
+            refresh_active_worker_count(&self.runs, &self.workers_by_run, &run_id.value);
+        }
         self.persist_worker(&worker_snapshot, world_size);
 
         Some(WorkerHeartbeat {
@@ -2524,6 +2558,7 @@ impl CoordinatorState {
             next_heartbeat_deadline,
             server_time: now,
             run_state,
+            state_changed,
         })
     }
 
