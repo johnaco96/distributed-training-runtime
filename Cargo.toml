@@ -2,10 +2,7 @@
 members = [
     "crates/runtime-proto",
     "crates/runtime-coordinator",
-    "crates/runtime-core",
-    "crates/runtime-client",
     "crates/runtime-storage",
-    "crates/runtime-dataset",
     "crates/runtime-checkpoint",
     "crates/runtime-bench",
     "crates/runtime-operator",

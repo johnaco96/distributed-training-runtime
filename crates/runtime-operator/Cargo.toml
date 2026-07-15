@@ -2,6 +2,7 @@
 name = "runtime-operator"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "Kubernetes operator for TrainingRun resources: schedules coordinator-backed distributed training jobs."
 
 [dependencies]
