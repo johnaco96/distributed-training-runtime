@@ -13,13 +13,13 @@ assigned shards through a ``DistributedShardDataset`` and assert that:
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import time
 import uuid
 from collections import Counter
 from pathlib import Path
 
+import harness
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -32,16 +32,10 @@ def _gate():
     pytest.importorskip("numpy")
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
 def _start_coordinator(log_dir: Path):
     import grpc
 
-    port = _free_port()
+    port = harness.free_tcp_port()
     address = f"127.0.0.1:{port}"
     out = (log_dir / "coord.log").open("w", encoding="utf-8")
     proc = subprocess.Popen(
@@ -75,7 +69,6 @@ def _stop(proc):
 def test_two_rank_streaming_covers_dataset_once(tmp_path: Path) -> None:
     _gate()
     import numpy as np
-
     from dtruntime import connect
     from dtruntime.data import DistributedShardDataset, compute_dataset_version
     from dtruntime.data.versioning import register_versioned_dataset

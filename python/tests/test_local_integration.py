@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import time
 import uuid
 from pathlib import Path
 
+import harness
 import pytest
 
 
@@ -22,7 +22,7 @@ def test_rust_coordinator_and_python_sdk_communicate_over_grpc() -> None:
     from dtruntime.generated import runtime_pb2
 
     repo_root = Path(__file__).resolve().parents[2]
-    port = _free_tcp_port()
+    port = harness.free_tcp_port()
     address = f"127.0.0.1:{port}"
     process = subprocess.Popen(
         ["cargo", "run", "-p", "runtime-coordinator", "--", "--addr", address],
@@ -116,7 +116,6 @@ def test_rust_coordinator_and_python_sdk_communicate_over_grpc() -> None:
         _stop_process(process)
 
 
-
 def test_checkpoint_rpc_flow_over_grpc() -> None:
     if os.environ.get("DTRUNTIME_RUN_LOCAL_INTEGRATION") != "1":
         pytest.skip("set DTRUNTIME_RUN_LOCAL_INTEGRATION=1 to run local gRPC integration test")
@@ -129,7 +128,7 @@ def test_checkpoint_rpc_flow_over_grpc() -> None:
     from dtruntime.generated import runtime_pb2
 
     repo_root = Path(__file__).resolve().parents[2]
-    port = _free_tcp_port()
+    port = harness.free_tcp_port()
     address = f"127.0.0.1:{port}"
     process = subprocess.Popen(
         ["cargo", "run", "-p", "runtime-coordinator", "--", "--addr", address],
@@ -218,11 +217,6 @@ def test_checkpoint_rpc_flow_over_grpc() -> None:
         if client is not None:
             client.close()
         _stop_process(process)
-
-def _free_tcp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _wait_for_grpc_server(grpc: object, address: str, process: subprocess.Popen[str]) -> None:

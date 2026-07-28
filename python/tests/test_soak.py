@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import os
 
+import harness
 import pytest
-
-import ops_common as ops
-
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("DTRUNTIME_RUN_SOAK_TESTS") != "1",
@@ -22,12 +20,12 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_sustained_load_stays_stable(tmp_path):
-    ops.require_binary("runtime-coordinator")
-    bench = ops.require_binary("runtime-bench")
+    harness.require_binary("runtime-coordinator")
+    bench = harness.require_binary("runtime-bench")
     workers = int(os.environ.get("DTRUNTIME_SOAK_WORKERS", "100"))
     duration = int(os.environ.get("DTRUNTIME_SOAK_DURATION_SECS", "60"))
 
-    summary = ops.run_bench_logical_workers(
+    summary = harness.run_bench_logical_workers(
         bench,
         workers=workers,
         duration_secs=duration,

@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import os
 
+import harness
 import pytest
-
-import ops_common as ops
-
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("DTRUNTIME_RUN_FAILOVER_TESTS") != "1",
@@ -25,16 +23,16 @@ def test_coordinator_hard_kill_and_restart_rehydrates_run_state(tmp_path):
     from dtruntime.client import RuntimeClient
     from dtruntime.generated import runtime_pb2 as pb2
 
-    binary = ops.require_binary("runtime-coordinator")
+    binary = harness.require_binary("runtime-coordinator")
     db = tmp_path / "meta.db"
     storage = tmp_path / "storage"
-    address = f"127.0.0.1:{ops.free_tcp_port()}"
+    address = f"127.0.0.1:{harness.free_tcp_port()}"
     extra = ["--metadata-db", str(db), "--storage-root", str(storage)]
 
-    # ── Phase 1: register a run + workers, then confirm state. ──
-    proc = ops.start_coordinator(binary, address, extra)
+    # ── Step 1: register a run + workers, then confirm state. ──
+    proc = harness.start_coordinator(binary, address, extra)
     try:
-        ops.wait_for_grpc(address, proc)
+        harness.wait_for_grpc(address, proc)
         client = RuntimeClient(address)
         reg = client.register_run(
             run_name="failover-run",
@@ -56,12 +54,12 @@ def test_coordinator_hard_kill_and_restart_rehydrates_run_state(tmp_path):
         client.close()
     finally:
         # Hard kill — no graceful shutdown, simulating a crash/OOM.
-        ops.hard_kill(proc)
+        harness.hard_kill(proc)
 
-    # ── Phase 2: restart on the SAME metadata store. ──
-    proc2 = ops.start_coordinator(binary, address, extra)
+    # ── Step 2: restart on the SAME metadata store. ──
+    proc2 = harness.start_coordinator(binary, address, extra)
     try:
-        ops.wait_for_grpc(address, proc2)
+        harness.wait_for_grpc(address, proc2)
         client2 = RuntimeClient(address)
 
         # The run survived the crash: same id, rehydrated state.
@@ -82,4 +80,4 @@ def test_coordinator_hard_kill_and_restart_rehydrates_run_state(tmp_path):
         assert reg2.run_id.value == run_id
         client2.close()
     finally:
-        ops.stop_process(proc2)
+        harness.stop_process(proc2)

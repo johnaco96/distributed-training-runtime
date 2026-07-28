@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import os
 
+import harness
 import pytest
-
-import ops_common as ops
-
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("DTRUNTIME_RUN_CHAOS_TESTS") != "1",
@@ -23,12 +21,12 @@ pytestmark = pytest.mark.skipif(
 def test_worker_preemption_and_recovery_under_load(tmp_path):
     """~30% of workers are killed and recovered mid-run while checkpoints flow.
     The coordinator must survive and keep servicing RPCs to the end."""
-    ops.require_binary("runtime-coordinator")
-    bench = ops.require_binary("runtime-bench")
+    harness.require_binary("runtime-coordinator")
+    bench = harness.require_binary("runtime-bench")
     workers = int(os.environ.get("DTRUNTIME_CHAOS_WORKERS", "40"))
     duration = int(os.environ.get("DTRUNTIME_CHAOS_DURATION_SECS", "20"))
 
-    summary = ops.run_bench_logical_workers(
+    summary = harness.run_bench_logical_workers(
         bench,
         workers=workers,
         duration_secs=duration,
