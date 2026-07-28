@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from unittest.mock import Mock
 
-from dtruntime.client import RuntimeClient
 import pytest
+from dtruntime.client import RuntimeClient
 
 
 @dataclass
@@ -621,6 +621,26 @@ def test_bearer_token_strips_existing_scheme_and_reads_env(monkeypatch):
     ]
 
 
+
+
+def test_for_worker_carries_the_bearer_token(monkeypatch):
+    """A derived client must keep authenticating as the same caller.
+
+    The token proves who is calling; the metadata headers say which identity
+    the call is *for*. Dropping the token made every worker-scoped RPC fail
+    with UNAUTHENTICATED against a coordinator with auth enforced.
+    """
+    _, _, stub, _, _ = install_fake_generated_modules(monkeypatch)
+    monkeypatch.delenv("DTRUNTIME_AUTH_TOKEN", raising=False)
+    admin_client = RuntimeClient("127.0.0.1:50051", auth_token="header.payload.sig")
+
+    worker_client = admin_client.for_worker("worker-0")
+    worker_client.register_worker(run_id="run-1", worker_id="worker-0")
+
+    metadata = stub.RegisterWorker.call_args.kwargs["metadata"]
+    assert ("authorization", "Bearer header.payload.sig") in metadata, (
+        "for_worker dropped the caller's bearer token"
+    )
 
 
 def test_for_worker_builds_worker_identity_metadata(monkeypatch):

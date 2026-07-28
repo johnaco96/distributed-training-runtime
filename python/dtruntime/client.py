@@ -1,4 +1,10 @@
-"""Minimal Python client skeleton for the Distributed Training Runtime coordinator."""
+"""Python gRPC client for the Distributed Training Runtime coordinator.
+
+Covers the full coordinator API — run/worker registration, heartbeats,
+rendezvous, shard leasing, the two-phase checkpoint commit, and the admin
+RPCs — over an optionally TLS/mTLS-secured channel, with bearer-token (OIDC)
+or metadata-header caller identity attached to every call.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class RuntimeClient:
-    """Minimal gRPC client wrapper for the coordinator service.
+    """gRPC client for the coordinator service.
 
     The high-level SDK entry points build on this class: dataset consumption
     lives in ``dtruntime.data`` (``DistributedShardDataset``), checkpointing
@@ -21,10 +27,21 @@ class RuntimeClient:
     low-level use.
     """
 
-    def __init__(self, address: str, tls_ca_cert: str | Path | None = None, tls_client_cert: str | Path | None = None, tls_client_key: str | Path | None = None, auth_subject: str | None = None, auth_role: str | None = None, auth_worker_id: str | None = None, auth_token: str | None = None) -> None:
+    def __init__(
+        self,
+        address: str,
+        tls_ca_cert: str | Path | None = None,
+        tls_client_cert: str | Path | None = None,
+        tls_client_key: str | Path | None = None,
+        auth_subject: str | None = None,
+        auth_role: str | None = None,
+        auth_worker_id: str | None = None,
+        auth_token: str | None = None,
+    ) -> None:
         """Create a client connected to a coordinator gRPC address."""
         try:
             import grpc
+
             from dtruntime.generated import runtime_pb2, runtime_pb2_grpc
         except ImportError as exc:
             raise RuntimeError(
@@ -35,9 +52,6 @@ class RuntimeClient:
 
         self.address = _normalize_grpc_target(address)
         self._runtime_pb2 = runtime_pb2
-        self._tls_ca_cert = tls_ca_cert
-        self._tls_client_cert = tls_client_cert
-        self._tls_client_key = tls_client_key
 
         tls_ca_cert = tls_ca_cert or os.getenv("DTRUNTIME_TLS_CA_CERT")
         tls_client_cert = tls_client_cert or os.getenv("DTRUNTIME_TLS_CLIENT_CERT")
@@ -47,6 +61,15 @@ class RuntimeClient:
         auth_role = auth_role or os.getenv("DTRUNTIME_AUTH_ROLE")
         auth_worker_id = auth_worker_id or os.getenv("DTRUNTIME_AUTH_WORKER_ID")
         auth_token = auth_token or os.getenv("DTRUNTIME_AUTH_TOKEN")
+
+        # Retain the *resolved* connection settings (arguments merged with the
+        # environment), not the raw arguments. `with_auth` replays these into
+        # derived clients, so anything stored before the fallback above would
+        # be silently dropped from every client built by `for_worker`.
+        self._tls_ca_cert = tls_ca_cert
+        self._tls_client_cert = tls_client_cert
+        self._tls_client_key = tls_client_key
+        self._auth_token = auth_token
         self._auth_metadata: list[tuple[str, str]] = []
         # A bearer token (OIDC/JWT) is the strongest credential; when present it
         # is validated server-side and the dev metadata-identity headers are
@@ -89,7 +112,13 @@ class RuntimeClient:
         role: str | None = None,
         worker_id: str | None = None,
     ) -> "RuntimeClient":
-        """Create a new RuntimeClient sharing connection settings with a different identity."""
+        """Create a new RuntimeClient sharing connection settings with a different identity.
+
+        The bearer token carries over: it authenticates the *caller*, while the
+        metadata headers describe which identity the caller is acting for. A
+        derived client that dropped the token would be rejected outright by a
+        coordinator running with auth enforced.
+        """
         return RuntimeClient(
             self.address,
             tls_ca_cert=self._tls_ca_cert,
@@ -98,6 +127,7 @@ class RuntimeClient:
             auth_subject=subject,
             auth_role=role,
             auth_worker_id=worker_id,
+            auth_token=self._auth_token,
         )
 
     def for_worker(
