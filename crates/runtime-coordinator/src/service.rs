@@ -96,6 +96,15 @@ impl CoordinatorServiceImpl {
         Ok(self)
     }
 
+    /// The configured S3 backend, if any.
+    ///
+    /// Handed out (rather than rebuilt) so background tasks such as the
+    /// checkpoint retention sweep share this client's connection pool and
+    /// concurrency limiter instead of competing with it.
+    pub fn s3_backend(&self) -> Option<Arc<S3Storage>> {
+        self.s3_backend.clone()
+    }
+
     pub fn metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
         self.metrics.snapshot()
     }
@@ -235,6 +244,22 @@ impl CoordinatorServiceImpl {
 
     /// Allow a management-capable caller (admin/operator), or a worker acting on
     /// its own `worker_id`.
+    /// Authorize a worker-scoped RPC from the `worker_id` carried in its body.
+    ///
+    /// Every worker-scoped handler opens the same way: read the caller's
+    /// `worker_id` out of the request, reject the request if it is absent, and
+    /// require that the caller is an admin or that same worker. Collapsing it
+    /// into one call keeps the check impossible to omit or vary by accident —
+    /// a handler that forgot it would silently accept any caller.
+    fn authorize_worker_self<T>(
+        &self,
+        request: &Request<T>,
+        worker_id: Option<&WorkerId>,
+    ) -> Result<(), Status> {
+        let worker_id = worker_id.ok_or_else(|| invalid_argument("worker_id is required"))?;
+        self.allow_admin_or_worker_self(request, &worker_id.value, "worker_self_request")
+    }
+
     fn allow_admin_or_worker_self<T>(
         &self,
         request: &Request<T>,
@@ -326,6 +351,24 @@ fn cached_shard_hints(metadata: &tonic::metadata::MetadataMap) -> Option<Vec<Str
 
 fn invalid_argument(message: impl Into<String>) -> Status {
     Status::invalid_argument(message.into())
+}
+
+/// Unwrap a required identifier from a request body.
+///
+/// Proto3 makes every message field optional on the wire, so each handler has
+/// to reject the absent case itself. These keep that rejection — and its error
+/// message — identical across all ~30 sites instead of re-spelling the same
+/// `ok_or_else` chain in each one.
+fn require_run_id(run_id: Option<RunId>) -> Result<RunId, Status> {
+    run_id.ok_or_else(|| invalid_argument("run_id is required"))
+}
+
+fn require_worker_id(worker_id: Option<WorkerId>) -> Result<WorkerId, Status> {
+    worker_id.ok_or_else(|| invalid_argument("worker_id is required"))
+}
+
+fn require_checkpoint_id(checkpoint_id: Option<CheckpointId>) -> Result<CheckpointId, Status> {
+    checkpoint_id.ok_or_else(|| invalid_argument("checkpoint_id is required"))
 }
 
 fn not_found(message: impl Into<String>) -> Status {
@@ -490,21 +533,10 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let auth_worker_id = request
-            .get_ref()
-            .worker_id
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
-            .value
-            .clone();
-        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        self.authorize_worker_self(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let worker_id = request
-            .worker_id
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let worker_id = require_worker_id(request.worker_id)?;
 
         let heartbeat = self
             .state
@@ -578,21 +610,10 @@ impl CoordinatorService for CoordinatorServiceImpl {
         request: Request<GetShardAssignmentRequest>,
     ) -> Result<Response<GetShardAssignmentResponse>, Status> {
         let cached_hints = cached_shard_hints(request.metadata());
-        let auth_worker_id = request
-            .get_ref()
-            .worker_id
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
-            .value
-            .clone();
-        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        self.authorize_worker_self(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let worker_id = request
-            .worker_id
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let worker_id = require_worker_id(request.worker_id)?;
         let dataset_id = request
             .dataset_id
             .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
@@ -659,21 +680,10 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<RenewShardLeaseRequest>,
     ) -> Result<Response<RenewShardLeaseResponse>, Status> {
-        let auth_worker_id = request
-            .get_ref()
-            .worker_id
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
-            .value
-            .clone();
-        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        self.authorize_worker_self(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let worker_id = request
-            .worker_id
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let worker_id = require_worker_id(request.worker_id)?;
         let shard_id = request
             .shard_id
             .ok_or_else(|| Status::invalid_argument("shard_id is required"))?;
@@ -726,21 +736,10 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<ReportShardProgressRequest>,
     ) -> Result<Response<ReportShardProgressResponse>, Status> {
-        let auth_worker_id = request
-            .get_ref()
-            .worker_id
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
-            .value
-            .clone();
-        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        self.authorize_worker_self(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let worker_id = request
-            .worker_id
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let worker_id = require_worker_id(request.worker_id)?;
         let dataset_id = request
             .dataset_id
             .ok_or_else(|| Status::invalid_argument("dataset_id is required"))?;
@@ -806,22 +805,11 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<BeginCheckpointRequest>,
     ) -> Result<Response<BeginCheckpointResponse>, Status> {
-        let auth_worker_id = request
-            .get_ref()
-            .worker_id
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
-            .value
-            .clone();
-        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        self.authorize_worker_self(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
         validate_idempotency_key("begin_checkpoint", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let worker_id = request
-            .worker_id
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let worker_id = require_worker_id(request.worker_id)?;
 
         let checkpoint = self
             .state
@@ -1085,17 +1073,11 @@ impl CoordinatorService for CoordinatorServiceImpl {
     ) -> Result<Response<ReportCheckpointArtifactResponse>, Status> {
         let (metadata, extensions, request) = request.into_parts();
         validate_idempotency_key("report_checkpoint_artifact", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let worker_id = request
-            .worker_id
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let worker_id = require_worker_id(request.worker_id)?;
         let auth_req = Request::from_parts(metadata, extensions, ());
         self.allow_admin_or_worker_self(&auth_req, &worker_id.value, "worker_self_request")?;
-        let checkpoint_id = request
-            .checkpoint_id
-            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?;
+        let checkpoint_id = require_checkpoint_id(request.checkpoint_id)?;
         let artifact_report = request
             .artifact_report
             .ok_or_else(|| Status::invalid_argument("artifact_report is required"))?;
@@ -1145,13 +1127,9 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("commit_checkpoint", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let checkpoint_id = request
-            .checkpoint_id
-            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?;
-        // Gap 2: extract caller's worker_id for 2PC vote tracking.
+        let run_id = require_run_id(request.run_id)?;
+        let checkpoint_id = require_checkpoint_id(request.checkpoint_id)?;
+        // extract caller's worker_id for 2PC vote tracking.
         // Empty string triggers the legacy single-caller path (artifact-count only).
         let worker_id = request.worker_id.map(|w| w.value).unwrap_or_default();
 
@@ -1213,9 +1191,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         // to inspect.  Any authenticated principal is accepted.
         self.auth_context(&request, "checkpoint_read")?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
 
         let checkpoint = self
             .state
@@ -1256,9 +1232,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
     ) -> Result<Response<ListCheckpointsResponse>, Status> {
         self.auth_context(&request, "checkpoint_read")?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
 
         let records = self
             .state
@@ -1302,12 +1276,8 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
         let request = request.into_inner();
         validate_idempotency_key("report_checkpoint_corrupt", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let checkpoint_id = request
-            .checkpoint_id
-            .ok_or_else(|| Status::invalid_argument("checkpoint_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let checkpoint_id = require_checkpoint_id(request.checkpoint_id)?;
 
         let fallback = self
             .state
@@ -1458,9 +1428,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
     ) -> Result<Response<GetRunStatusResponse>, Status> {
         self.require_read(&request, "read_request")?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
 
         self.state.reconcile_worker_liveness();
         self.update_worker_metrics(&run_id);
@@ -1490,22 +1458,11 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<DeregisterWorkerRequest>,
     ) -> Result<Response<DeregisterWorkerResponse>, Status> {
-        let auth_worker_id = request
-            .get_ref()
-            .worker_id
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
-            .value
-            .clone();
-        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        self.authorize_worker_self(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
         validate_idempotency_key("deregister_worker", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let worker_id = request
-            .worker_id
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let worker_id = require_worker_id(request.worker_id)?;
         let reason =
             DeregisterReason::try_from(request.reason).unwrap_or(DeregisterReason::Unspecified);
 
@@ -1552,9 +1509,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("cancel_run", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
 
         let state = self
             .state
@@ -1589,9 +1544,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("pause_run", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
 
         let (state, state_reason) = self
             .state
@@ -1621,9 +1574,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("resume_run", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
 
         let (state, state_reason) = self
             .state
@@ -1653,9 +1604,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("retry_run", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
 
         let (state, state_reason, retry_count) = self
             .state
@@ -1685,9 +1634,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
         self.require_admin(&request, "admin_request")?;
         let request = request.into_inner();
         validate_idempotency_key("drain_run", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
 
         let (state, state_reason) = self
             .state
@@ -1752,9 +1699,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
     ) -> Result<Response<ListWorkersResponse>, Status> {
         self.require_read(&request, "read_request")?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
 
         self.state.reconcile_worker_liveness();
 
@@ -1791,9 +1736,7 @@ impl CoordinatorService for CoordinatorServiceImpl {
     ) -> Result<Response<ListShardProgressResponse>, Status> {
         self.require_read(&request, "read_request")?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
         let dataset_filter = request
             .dataset_id
             .map(|d| d.value)
@@ -1826,22 +1769,11 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<JoinRendezvousRequest>,
     ) -> Result<Response<JoinRendezvousResponse>, Status> {
-        let auth_worker_id = request
-            .get_ref()
-            .worker_id
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
-            .value
-            .clone();
-        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        self.authorize_worker_self(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
         validate_idempotency_key("join_rendezvous", &request.idempotency_key)?;
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let worker_id = request
-            .worker_id
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let worker_id = require_worker_id(request.worker_id)?;
 
         // Reconcile first so a dead worker's stale round is invalidated before
         // this join lands in it.
@@ -1874,21 +1806,10 @@ impl CoordinatorService for CoordinatorServiceImpl {
         &self,
         request: Request<GetRendezvousStateRequest>,
     ) -> Result<Response<GetRendezvousStateResponse>, Status> {
-        let auth_worker_id = request
-            .get_ref()
-            .worker_id
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?
-            .value
-            .clone();
-        self.allow_admin_or_worker_self(&request, &auth_worker_id, "worker_self_request")?;
+        self.authorize_worker_self(&request, request.get_ref().worker_id.as_ref())?;
         let request = request.into_inner();
-        let run_id = request
-            .run_id
-            .ok_or_else(|| Status::invalid_argument("run_id is required"))?;
-        let worker_id = request
-            .worker_id
-            .ok_or_else(|| Status::invalid_argument("worker_id is required"))?;
+        let run_id = require_run_id(request.run_id)?;
+        let worker_id = require_worker_id(request.worker_id)?;
 
         self.state.reconcile_worker_liveness();
 

@@ -4,10 +4,12 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+use clap::{ArgAction, Parser};
 
 use runtime_coordinator::audit::{
     AuditEvent, AuditEventKind, AuditLogger, AuditOutcome, AuditSink, DbAuditSink, FanoutAuditSink,
@@ -22,7 +24,7 @@ use runtime_coordinator::security::jwt::{JwtConfig, JwtValidator};
 use runtime_coordinator::security::keyset::{KeySource, ReloadableKeySet};
 use runtime_coordinator::security::spiffe::SpiffePolicy;
 use runtime_coordinator::service::CoordinatorServiceImpl;
-use runtime_coordinator::state::{CoordinatorState, DatasetPlacementPolicy};
+use runtime_coordinator::state::{CoordinatorState, DatasetPlacementPolicy, ReclaimedCheckpoint};
 use runtime_coordinator::telemetry::render_prometheus_metrics;
 use runtime_coordinator::RuntimeMetrics;
 use runtime_proto::runtime::v1::coordinator_service_server::CoordinatorServiceServer;
@@ -32,73 +34,211 @@ use tracing::info;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:50051";
 
-#[derive(Debug, PartialEq, Eq)]
+/// The Rust control plane for the Distributed Training Runtime: worker
+/// rendezvous, run/worker lifecycle, shard leases, and the two-phase
+/// checkpoint commit, over gRPC.
+///
+/// Every flag has a `DTRUNTIME_*` environment equivalent, so the same binary
+/// is configured identically from a shell, a systemd unit, or a container.
+#[derive(Debug, PartialEq, Eq, Parser)]
+#[command(name = "runtime-coordinator", version, about, long_about = None)]
 struct CoordinatorCliArgs {
+    /// Coordinator gRPC listen address.
+    #[arg(long, default_value = DEFAULT_ADDR, value_name = "ADDR")]
     addr: String,
+
+    /// Enable SQLite metadata persistence at this path (single-node).
+    #[arg(long, value_name = "PATH")]
     metadata_db: Option<String>,
+
+    /// PostgreSQL DSN for HA metadata. Takes precedence over --metadata-db.
+    #[arg(long, env = "DTRUNTIME_METADATA_DB_URL", value_name = "URL")]
     metadata_db_url: Option<String>,
+
+    /// Root directory for checkpoint artifacts written through the coordinator.
+    #[arg(long, value_name = "PATH")]
     storage_root: Option<PathBuf>,
+
+    // ── TLS / mTLS ──
+    /// Server certificate chain (PEM); requires --tls-key.
+    #[arg(long, value_name = "PATH")]
     tls_cert: Option<PathBuf>,
+
+    /// Server private key (PEM); requires --tls-cert.
+    #[arg(long, value_name = "PATH")]
     tls_key: Option<PathBuf>,
+
+    /// Client CA bundle (PEM). Setting it requires mTLS from every client.
+    #[arg(long, value_name = "PATH")]
     tls_client_ca: Option<PathBuf>,
+
+    /// Whether authorization is enforced.
+    #[arg(
+        long,
+        env = "DTRUNTIME_AUTH_MODE",
+        default_value = "disabled",
+        value_parser = parse_auth_mode,
+        value_name = "disabled|metadata"
+    )]
     auth_mode: AuthMode,
+
     // ── OIDC / JWT bearer-token validation ──
     /// Required token issuer (`iss`); recommended for production.
+    #[arg(long, env = "DTRUNTIME_OIDC_ISSUER", value_name = "ISS")]
     oidc_issuer: Option<String>,
-    /// Accepted token audiences (`aud`); repeatable.
+
+    /// Accepted token audience (`aud`). Repeat, or pass a comma-separated list.
+    #[arg(
+        long = "oidc-audience",
+        env = "DTRUNTIME_OIDC_AUDIENCE",
+        value_delimiter = ',',
+        value_name = "AUD"
+    )]
     oidc_audiences: Vec<String>,
+
     /// JWKS document to validate RS/ES/EdDSA (or oct) signatures against.
+    #[arg(long, env = "DTRUNTIME_OIDC_JWKS_FILE", value_name = "PATH")]
     oidc_jwks_file: Option<PathBuf>,
+
     /// Raw HMAC shared-secret file (HS256) — dev/simple deployments.
+    #[arg(long, env = "DTRUNTIME_OIDC_HMAC_SECRET_FILE", value_name = "PATH")]
     oidc_hmac_secret_file: Option<PathBuf>,
+
     /// PEM public key file for a single asymmetric key.
+    #[arg(long, env = "DTRUNTIME_OIDC_PUBLIC_KEY_FILE", value_name = "PATH")]
     oidc_public_key_file: Option<PathBuf>,
-    /// Algorithm for `--oidc-hmac-secret-file`/`--oidc-public-key-file`.
+
+    /// Algorithm for --oidc-hmac-secret-file / --oidc-public-key-file.
+    #[arg(long, env = "DTRUNTIME_OIDC_ALGORITHM", value_name = "ALG")]
     oidc_algorithm: Option<String>,
+
     /// Claim carrying roles/groups (default `roles`).
+    #[arg(long, env = "DTRUNTIME_OIDC_ROLE_CLAIM", value_name = "CLAIM")]
     oidc_role_claim: Option<String>,
+
     // ── SPIFFE / SPIRE workload identity (via mTLS SVID) ──
     /// Required SPIFFE trust domain; enables SPIFFE auth when set.
+    #[arg(long, env = "DTRUNTIME_SPIFFE_TRUST_DOMAIN", value_name = "DOMAIN")]
     spiffe_trust_domain: Option<String>,
+
     /// File mapping SPIFFE paths to roles (`pattern = role[,role]`).
+    #[arg(long, env = "DTRUNTIME_SPIFFE_ROLE_MAP_FILE", value_name = "PATH")]
     spiffe_role_map_file: Option<PathBuf>,
+
     /// Reject dev metadata-header identities (production hardening).
+    #[arg(
+        long = "auth-disable-header-identity",
+        env = "DTRUNTIME_AUTH_DISABLE_HEADER_IDENTITY",
+        action = ArgAction::SetTrue
+    )]
     disable_header_identity: bool,
+
     /// Append structured JSON (NDJSON/SIEM) audit records to this file.
+    #[arg(long, env = "DTRUNTIME_AUDIT_LOG_FILE", value_name = "PATH")]
     audit_log_file: Option<PathBuf>,
+
+    // ── operational endpoints ──
+    /// Serve the JSON /status endpoint on this address.
+    #[arg(long, value_name = "ADDR")]
     status_addr: Option<String>,
+
+    /// Serve Prometheus /metrics, /healthz, and /readyz on this address.
+    #[arg(long, value_name = "ADDR")]
     metrics_addr: Option<String>,
+
+    // ── S3-compatible object storage ──
+    /// S3 endpoint URL (e.g. a MinIO server).
+    #[arg(long, env = "DTRUNTIME_S3_ENDPOINT", value_name = "URL")]
     s3_endpoint: Option<String>,
+
+    /// S3 bucket for checkpoint artifacts.
+    #[arg(long, env = "DTRUNTIME_S3_BUCKET", value_name = "NAME")]
     s3_bucket: Option<String>,
+
+    /// S3 access key id.
+    #[arg(long, env = "DTRUNTIME_S3_ACCESS_KEY", value_name = "KEY")]
     s3_access_key: Option<String>,
+
+    /// S3 secret access key.
+    #[arg(long, env = "DTRUNTIME_S3_SECRET_KEY", value_name = "SECRET")]
     s3_secret_key: Option<String>,
+
+    /// S3 region.
+    #[arg(
+        long,
+        env = "DTRUNTIME_S3_REGION",
+        default_value = "us-east-1",
+        value_name = "REGION"
+    )]
     s3_region: String,
+
+    /// Cap concurrent S3 operations (multipart parts, batch gets).
+    #[arg(long, value_parser = parse_nonzero_usize, value_name = "N")]
     max_s3_concurrent_ops: Option<usize>,
+
     /// Server-side encryption for uploads: `AES256` (SSE-S3) or `aws:kms`.
+    #[arg(long, env = "DTRUNTIME_S3_SSE", value_name = "MODE")]
     s3_sse: Option<String>,
+
     /// KMS key id/ARN for SSE-KMS.
+    #[arg(long, env = "DTRUNTIME_S3_SSE_KMS_KEY_ID", value_name = "ID")]
     s3_sse_kms_key_id: Option<String>,
-    /// Re-read each streamed artifact from disk after write and verify its
-    /// SHA-256 matches the inline checksum.  Defaults to `true`.  Disable
-    /// with `--no-verify-checkpoint-artifacts` for maximum throughput when
-    /// storage reliability is otherwise guaranteed.
+
+    /// Skip re-reading each streamed artifact to verify its SHA-256 after
+    /// write. Verification is on by default; disable it only when storage
+    /// integrity is guaranteed some other way.
+    #[arg(long = "no-verify-checkpoint-artifacts", action = ArgAction::SetFalse)]
     verify_checkpoint_artifacts: bool,
-    /// How often the background reconcile task runs (liveness, stuck-run
-    /// detection, retention cleanup).
+
+    // ── background reconcile loop ──
+    /// How often the reconcile task runs (liveness, stuck-run detection,
+    /// retention cleanup).
+    #[arg(long, default_value_t = 10, value_name = "N")]
     reconcile_interval_secs: u64,
+
     /// A non-terminal run with no worker heartbeat for this long is marked
     /// FAILED ("stuck").
+    #[arg(long, default_value_t = 1800, value_name = "N")]
     stuck_after_secs: u64,
+
     /// How long terminal runs keep their in-memory state before cleanup
     /// (durable rows are retained).
+    #[arg(long, default_value_t = 24 * 60 * 60, value_name = "N")]
     terminal_run_retention_secs: u64,
-    /// Checkpoint retention: keep the newest N committed checkpoints per run
-    /// and garbage-collect the rest (records + local artifacts).  0 disables.
+
+    /// Keep the newest N committed checkpoints per run and garbage-collect the
+    /// rest (records + local artifacts). 0 disables.
+    #[arg(long, default_value_t = 0, value_name = "N")]
     checkpoint_keep_last: usize,
-    /// Reorder each worker's shard assignments to prefer shards it reports
-    /// as locally cached (the `x-dtruntime-cached-shards` gRPC header).
+
+    /// Reorder each worker's shard assignments to prefer shards it reports as
+    /// locally cached (the `x-dtruntime-cached-shards` gRPC header).
+    #[arg(long, action = ArgAction::SetTrue)]
     cache_aware_placement: bool,
-    show_help: bool,
+}
+
+fn parse_auth_mode(value: &str) -> Result<AuthMode, String> {
+    value.parse()
+}
+
+fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be greater than zero".to_string()),
+        Ok(n) => Ok(n),
+        Err(_) => Err("must be a positive integer".to_string()),
+    }
+}
+
+/// Parse coordinator arguments, excluding the program name.
+///
+/// Split out from [`CoordinatorCliArgs::parse`] so tests can drive parsing
+/// with an explicit argument vector.
+fn coordinator_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<CoordinatorCliArgs, clap::Error> {
+    CoordinatorCliArgs::try_parse_from(
+        std::iter::once("runtime-coordinator".to_string()).chain(args),
+    )
 }
 
 #[tokio::main]
@@ -111,11 +251,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     init_tracing_from_env();
 
-    let args = coordinator_args(std::env::args().skip(1))?;
-    if args.show_help {
-        print_usage();
-        return Ok(());
-    }
+    // Same parse path the tests drive; `exit` renders clap's --help/--version
+    // and usage errors and terminates with the conventional exit code.
+    let args = coordinator_args(std::env::args().skip(1)).unwrap_or_else(|e| e.exit());
 
     // Collect audit sinks; the durable DB sink is appended once the metadata
     // store is initialised below, and the JSON/SIEM sink when --audit-log-file
@@ -148,7 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("failed to init postgres schema: {e}"))?;
 
-        // Gap 3: PostgreSQL advisory lock for coordinator HA.
+        // PostgreSQL advisory lock for coordinator HA.
         // Only one replica holds the lock at a time.  The standby polls until
         // the leader releases it (process exit / connection drop), then takes over.
         // While in standby the gRPC port is not bound so the k8s readiness probe
@@ -170,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let store: Arc<dyn MetadataStore> = Arc::new(store);
-        // Gap 5: wire the durable DB audit sink now that the store is ready.
+        // wire the durable DB audit sink now that the store is ready.
         audit_sinks.push(Arc::new(DbAuditSink::new(Arc::clone(&store))));
         CoordinatorState::with_metadata_store(store)
     } else if let Some(ref path) = args.metadata_db {
@@ -179,7 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = SqliteMetadataStore::open(path)?;
         store.init_schema()?;
         let store: Arc<dyn MetadataStore> = Arc::new(store);
-        // Gap 5: wire the durable DB audit sink.
+        // wire the durable DB audit sink.
         audit_sinks.push(Arc::new(DbAuditSink::new(Arc::clone(&store))));
         CoordinatorState::with_metadata_store(store)
     } else {
@@ -279,15 +417,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let status_audit = audit.clone();
         let status_addr = status_addr.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve_status_endpoint(
-                status_addr,
-                status_state,
-                status_audit,
-                auth_mode,
-                tls_enabled,
-                mtls_enabled,
-                started_at,
-            ) {
+            let result = serve_operational_endpoint(status_addr, "status", |req| {
+                build_status_http_response(
+                    req,
+                    &status_state,
+                    &status_audit,
+                    auth_mode,
+                    tls_enabled,
+                    mtls_enabled,
+                    started_at,
+                )
+            });
+            if let Err(e) = result {
                 tracing::warn!(error = %e, "status endpoint stopped");
             }
         });
@@ -299,9 +440,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let metrics_addr = metrics_addr.clone();
         let metrics_ready = coordinator_ready.clone();
         std::thread::spawn(move || {
-            if let Err(e) =
-                serve_metrics_endpoint(metrics_addr, metrics_service, metrics_audit, metrics_ready)
-            {
+            let result = serve_operational_endpoint(metrics_addr, "metrics", |req| {
+                build_metrics_http_response(
+                    req,
+                    &metrics_service,
+                    &metrics_audit,
+                    metrics_ready.load(Ordering::Acquire),
+                )
+            });
+            if let Err(e) = result {
                 tracing::warn!(error = %e, "metrics endpoint stopped");
             }
         });
@@ -319,6 +466,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let retention = std::time::Duration::from_secs(args.terminal_run_retention_secs.max(1));
         let checkpoint_keep_last = args.checkpoint_keep_last;
         let gc_storage_root = args.storage_root.clone();
+        // Share the service's S3 client rather than building a second one, so
+        // the sweep reuses its connection pool and concurrency limiter.
+        let gc_s3 = metrics_service.s3_backend();
         info!(
             interval_secs = interval.as_secs(),
             stuck_after_secs = stuck_after.as_secs(),
@@ -346,29 +496,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reconcile_state.cleanup_terminal_runs(retention);
 
                 // Checkpoint retention: drop records beyond keep-last, then
-                // delete the reclaimed artifacts from local storage.  (S3
-                // objects are expected to be covered by bucket lifecycle
-                // rules until Phase 6 S3 hardening adds delete support.)
+                // reclaim their bytes. Retention only deletes metadata, so
+                // whatever is not deleted here leaks permanently — after the
+                // records are gone nothing knows the artifacts exist.
                 if checkpoint_keep_last > 0 {
-                    let removed =
-                        reconcile_state.enforce_checkpoint_retention(checkpoint_keep_last);
-                    if let Some(root) = &gc_storage_root {
-                        for (run_id, checkpoint_id) in removed {
-                            let mut dir = root.clone();
-                            dir.push("runs");
-                            dir.push(&run_id);
-                            dir.push("checkpoints");
-                            dir.push(&checkpoint_id);
-                            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-                                if e.kind() != std::io::ErrorKind::NotFound {
-                                    tracing::warn!(
-                                        path = %dir.display(),
-                                        error = %e,
-                                        "checkpoint retention: artifact directory removal failed"
-                                    );
-                                }
-                            }
-                        }
+                    for reclaimed in
+                        reconcile_state.enforce_checkpoint_retention(checkpoint_keep_last)
+                    {
+                        reclaim_checkpoint_artifacts(
+                            &reclaimed,
+                            gc_storage_root.as_ref(),
+                            gc_s3.as_deref(),
+                        )
+                        .await;
                     }
                 }
             }
@@ -544,270 +684,226 @@ fn build_authenticator(
     Ok(auth)
 }
 
-fn print_usage() {
-    println!("Usage: runtime-coordinator [--addr <ADDR>] [--metadata-db <PATH>] [--metadata-db-url <URL>] [--storage-root <PATH>] [--auth-mode <disabled|metadata>] [--oidc-issuer <ISS> --oidc-audience <AUD> --oidc-jwks-file <PATH>] [--spiffe-trust-domain <DOMAIN> --spiffe-role-map-file <PATH>] [--auth-disable-header-identity] [--audit-log-file <PATH>] [--tls-cert <PATH> --tls-key <PATH> [--tls-client-ca <PATH>]] [--status-addr <ADDR>] [--metrics-addr <ADDR>] [--s3-endpoint <URL>] [--s3-bucket <NAME>] [--s3-access-key <KEY>] [--s3-secret-key <SECRET>] [--s3-region <REGION>] [--s3-sse <MODE>] [--s3-sse-kms-key-id <ID>] [--max-s3-concurrent-ops <N>] [--reconcile-interval-secs <N>] [--stuck-after-secs <N>] [--terminal-run-retention-secs <N>] [--checkpoint-keep-last <N>] [--cache-aware-placement] [--no-verify-checkpoint-artifacts] [--help|-h]");
-    println!("\nOptions:");
-    println!("  --addr <ADDR>              Coordinator listen address (default: {DEFAULT_ADDR})");
-    println!(
-        "  --metadata-db <PATH>       Enable SQLite metadata persistence at PATH (single-node)"
-    );
-    println!("  --metadata-db-url <URL>    PostgreSQL DSN for HA metadata (env: DTRUNTIME_METADATA_DB_URL)");
-    println!("                             Example: postgres://user:pass@host:5432/dtruntime");
-    println!(
-        "  --storage-root <PATH>      Local staging area for StreamCheckpointArtifact (required)"
-    );
-    println!("  --auth-mode <MODE>         Authorization mode: disabled|metadata (env: DTRUNTIME_AUTH_MODE)");
-    println!("  --oidc-issuer <ISS>        Required JWT issuer (env: DTRUNTIME_OIDC_ISSUER)");
-    println!("  --oidc-audience <AUD>      Accepted JWT audience; repeatable (env: DTRUNTIME_OIDC_AUDIENCE)");
-    println!(
-        "  --oidc-jwks-file <PATH>    JWKS document for RS/ES/EdDSA/oct signature verification"
-    );
-    println!("  --oidc-hmac-secret-file P  HMAC (HS256) shared-secret file for JWT validation");
-    println!("  --oidc-public-key-file P   PEM public key for a single asymmetric JWT key");
-    println!("  --oidc-algorithm <ALG>     Algorithm for the HMAC/PEM key (default HS256/RS256)");
-    println!("  --oidc-role-claim <CLAIM>  JWT claim carrying roles/groups (default: roles)");
-    println!("  --spiffe-trust-domain <D>  Enable SPIFFE mTLS identity for this trust domain");
-    println!("  --spiffe-role-map-file P   SPIFFE path->role map (requires --spiffe-trust-domain)");
-    println!(
-        "  --auth-disable-header-identity  Reject dev metadata-header identities (prod hardening)"
-    );
-    println!(
-        "  --audit-log-file <PATH>    Append structured JSON/NDJSON (SIEM) audit records to PATH"
-    );
-    println!("  --tls-cert <PATH>          Enable TLS with certificate chain PEM at PATH (requires --tls-key)");
-    println!(
-        "  --tls-key <PATH>           Enable TLS with private key PEM at PATH (requires --tls-cert)"
-    );
-    println!("  --tls-client-ca <PATH>     Require mTLS client certs signed by CA PEM at PATH");
-    println!("  --metrics-addr <ADDR>      Enable Prometheus /metrics endpoint at ADDR");
-    println!("  --s3-endpoint <URL>        S3/MinIO endpoint URL (env: DTRUNTIME_S3_ENDPOINT)");
-    println!("  --s3-bucket <NAME>         S3 bucket for checkpoint artifact upload (env: DTRUNTIME_S3_BUCKET)");
-    println!("  --s3-access-key <KEY>      S3 access key ID (env: DTRUNTIME_S3_ACCESS_KEY)");
-    println!("  --s3-secret-key <SECRET>   S3 secret access key (env: DTRUNTIME_S3_SECRET_KEY)");
-    println!(
-        "  --s3-region <REGION>       S3 region (default: us-east-1, env: DTRUNTIME_S3_REGION)"
-    );
-    println!("  --s3-sse <MODE>            Server-side encryption: AES256 or aws:kms (env: DTRUNTIME_S3_SSE)");
-    println!("  --s3-sse-kms-key-id <ID>   KMS key id/ARN for aws:kms SSE (env: DTRUNTIME_S3_SSE_KMS_KEY_ID)");
-    println!("  --max-s3-concurrent-ops N  Max concurrent S3 operations (default: 64).");
-    println!("                             Set >= world_size to avoid semaphore stalls at scale.");
-    println!("  --status-addr <ADDR>       Enable the JSON status endpoint at ADDR");
-    println!("  --checkpoint-keep-last N   Keep the newest N committed checkpoints per run,");
-    println!("                             GC the rest (default: 0 = retention disabled)");
-    println!("  --cache-aware-placement    Reorder each worker's shard assignments to prefer");
-    println!("                             shards it reports as locally cached");
-    println!("  --no-verify-checkpoint-artifacts");
-    println!("                             Disable post-write SHA-256 re-read of checkpoint");
-    println!("                             artifacts (default: verification on).");
-    println!("  --help, -h                 Show this help message");
-}
-
-fn coordinator_args(
-    args: impl IntoIterator<Item = String>,
-) -> Result<CoordinatorCliArgs, Box<dyn std::error::Error>> {
-    let mut args = args.into_iter();
-    let mut parsed = CoordinatorCliArgs {
-        addr: String::from(DEFAULT_ADDR),
-        metadata_db: None,
-        metadata_db_url: std::env::var("DTRUNTIME_METADATA_DB_URL").ok(),
-        storage_root: None,
-        tls_cert: None,
-        tls_key: None,
-        tls_client_ca: None,
-        auth_mode: std::env::var("DTRUNTIME_AUTH_MODE")
-            .ok()
-            .as_deref()
-            .unwrap_or("disabled")
-            .parse()
-            .map_err(|e: String| format!("invalid DTRUNTIME_AUTH_MODE: {e}"))?,
-        oidc_issuer: std::env::var("DTRUNTIME_OIDC_ISSUER").ok(),
-        oidc_audiences: std::env::var("DTRUNTIME_OIDC_AUDIENCE")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        oidc_jwks_file: std::env::var("DTRUNTIME_OIDC_JWKS_FILE")
-            .ok()
-            .map(PathBuf::from),
-        oidc_hmac_secret_file: std::env::var("DTRUNTIME_OIDC_HMAC_SECRET_FILE")
-            .ok()
-            .map(PathBuf::from),
-        oidc_public_key_file: std::env::var("DTRUNTIME_OIDC_PUBLIC_KEY_FILE")
-            .ok()
-            .map(PathBuf::from),
-        oidc_algorithm: std::env::var("DTRUNTIME_OIDC_ALGORITHM").ok(),
-        oidc_role_claim: std::env::var("DTRUNTIME_OIDC_ROLE_CLAIM").ok(),
-        spiffe_trust_domain: std::env::var("DTRUNTIME_SPIFFE_TRUST_DOMAIN").ok(),
-        spiffe_role_map_file: std::env::var("DTRUNTIME_SPIFFE_ROLE_MAP_FILE")
-            .ok()
-            .map(PathBuf::from),
-        disable_header_identity: std::env::var("DTRUNTIME_AUTH_DISABLE_HEADER_IDENTITY")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false),
-        audit_log_file: std::env::var("DTRUNTIME_AUDIT_LOG_FILE")
-            .ok()
-            .map(PathBuf::from),
-        status_addr: None,
-        metrics_addr: None,
-        s3_endpoint: std::env::var("DTRUNTIME_S3_ENDPOINT").ok(),
-        s3_bucket: std::env::var("DTRUNTIME_S3_BUCKET").ok(),
-        s3_access_key: std::env::var("DTRUNTIME_S3_ACCESS_KEY").ok(),
-        s3_secret_key: std::env::var("DTRUNTIME_S3_SECRET_KEY").ok(),
-        s3_region: std::env::var("DTRUNTIME_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-        max_s3_concurrent_ops: None,
-        s3_sse: std::env::var("DTRUNTIME_S3_SSE").ok(),
-        s3_sse_kms_key_id: std::env::var("DTRUNTIME_S3_SSE_KMS_KEY_ID").ok(),
-        verify_checkpoint_artifacts: true,
-        reconcile_interval_secs: 10,
-        stuck_after_secs: 1800,
-        terminal_run_retention_secs: 24 * 60 * 60,
-        checkpoint_keep_last: 0,
-        cache_aware_placement: false,
-        show_help: false,
-    };
-
-    while let Some(arg) = args.next() {
-        if arg == "--addr" {
-            parsed.addr = args.next().ok_or("--addr requires an address")?;
-        } else if arg == "--metadata-db" {
-            parsed.metadata_db = Some(args.next().ok_or("--metadata-db requires a path")?);
-        } else if arg == "--storage-root" {
-            parsed.storage_root = Some(PathBuf::from(
-                args.next().ok_or("--storage-root requires a path")?,
-            ));
-        } else if arg == "--auth-mode" {
-            parsed.auth_mode = args
-                .next()
-                .ok_or("--auth-mode requires a value")?
-                .parse()
-                .map_err(|e: String| format!("invalid --auth-mode value: {e}"))?;
-        } else if arg == "--oidc-issuer" {
-            parsed.oidc_issuer = Some(args.next().ok_or("--oidc-issuer requires a value")?);
-        } else if arg == "--oidc-audience" {
-            parsed
-                .oidc_audiences
-                .push(args.next().ok_or("--oidc-audience requires a value")?);
-        } else if arg == "--oidc-jwks-file" {
-            parsed.oidc_jwks_file = Some(PathBuf::from(
-                args.next().ok_or("--oidc-jwks-file requires a path")?,
-            ));
-        } else if arg == "--oidc-hmac-secret-file" {
-            parsed.oidc_hmac_secret_file = Some(PathBuf::from(
-                args.next()
-                    .ok_or("--oidc-hmac-secret-file requires a path")?,
-            ));
-        } else if arg == "--oidc-public-key-file" {
-            parsed.oidc_public_key_file = Some(PathBuf::from(
-                args.next()
-                    .ok_or("--oidc-public-key-file requires a path")?,
-            ));
-        } else if arg == "--oidc-algorithm" {
-            parsed.oidc_algorithm = Some(args.next().ok_or("--oidc-algorithm requires a value")?);
-        } else if arg == "--oidc-role-claim" {
-            parsed.oidc_role_claim = Some(args.next().ok_or("--oidc-role-claim requires a value")?);
-        } else if arg == "--spiffe-trust-domain" {
-            parsed.spiffe_trust_domain = Some(
-                args.next()
-                    .ok_or("--spiffe-trust-domain requires a value")?,
-            );
-        } else if arg == "--spiffe-role-map-file" {
-            parsed.spiffe_role_map_file = Some(PathBuf::from(
-                args.next()
-                    .ok_or("--spiffe-role-map-file requires a path")?,
-            ));
-        } else if arg == "--auth-disable-header-identity" {
-            parsed.disable_header_identity = true;
-        } else if arg == "--audit-log-file" {
-            parsed.audit_log_file = Some(PathBuf::from(
-                args.next().ok_or("--audit-log-file requires a path")?,
-            ));
-        } else if arg == "--tls-cert" {
-            parsed.tls_cert = Some(PathBuf::from(
-                args.next().ok_or("--tls-cert requires a path")?,
-            ));
-        } else if arg == "--tls-key" {
-            parsed.tls_key = Some(PathBuf::from(
-                args.next().ok_or("--tls-key requires a path")?,
-            ));
-        } else if arg == "--tls-client-ca" {
-            parsed.tls_client_ca = Some(PathBuf::from(
-                args.next().ok_or("--tls-client-ca requires a path")?,
-            ));
-        } else if arg == "--status-addr" {
-            parsed.status_addr = Some(args.next().ok_or("--status-addr requires an address")?);
-        } else if arg == "--metrics-addr" {
-            parsed.metrics_addr = Some(args.next().ok_or("--metrics-addr requires an address")?);
-        } else if arg == "--s3-endpoint" {
-            parsed.s3_endpoint = Some(args.next().ok_or("--s3-endpoint requires a URL")?);
-        } else if arg == "--s3-bucket" {
-            parsed.s3_bucket = Some(args.next().ok_or("--s3-bucket requires a name")?);
-        } else if arg == "--s3-access-key" {
-            parsed.s3_access_key = Some(args.next().ok_or("--s3-access-key requires a value")?);
-        } else if arg == "--s3-secret-key" {
-            parsed.s3_secret_key = Some(args.next().ok_or("--s3-secret-key requires a value")?);
-        } else if arg == "--s3-region" {
-            parsed.s3_region = args.next().ok_or("--s3-region requires a value")?;
-        } else if arg == "--s3-sse" {
-            parsed.s3_sse = Some(
-                args.next()
-                    .ok_or("--s3-sse requires a value (AES256|aws:kms)")?,
-            );
-        } else if arg == "--s3-sse-kms-key-id" {
-            parsed.s3_sse_kms_key_id =
-                Some(args.next().ok_or("--s3-sse-kms-key-id requires a value")?);
-        } else if arg == "--reconcile-interval-secs" {
-            parsed.reconcile_interval_secs = args
-                .next()
-                .ok_or("--reconcile-interval-secs requires a value")?
-                .parse()
-                .map_err(|_| "--reconcile-interval-secs must be a positive integer")?;
-        } else if arg == "--stuck-after-secs" {
-            parsed.stuck_after_secs = args
-                .next()
-                .ok_or("--stuck-after-secs requires a value")?
-                .parse()
-                .map_err(|_| "--stuck-after-secs must be a positive integer")?;
-        } else if arg == "--terminal-run-retention-secs" {
-            parsed.terminal_run_retention_secs = args
-                .next()
-                .ok_or("--terminal-run-retention-secs requires a value")?
-                .parse()
-                .map_err(|_| "--terminal-run-retention-secs must be a positive integer")?;
-        } else if arg == "--checkpoint-keep-last" {
-            parsed.checkpoint_keep_last = args
-                .next()
-                .ok_or("--checkpoint-keep-last requires a value")?
-                .parse()
-                .map_err(|_| "--checkpoint-keep-last must be a non-negative integer")?;
-        } else if arg == "--max-s3-concurrent-ops" {
-            let raw = args
-                .next()
-                .ok_or("--max-s3-concurrent-ops requires a value")?;
-            let n: usize = raw
-                .parse()
-                .map_err(|_| "--max-s3-concurrent-ops must be a positive integer")?;
-            if n == 0 {
-                return Err("--max-s3-concurrent-ops must be greater than zero".into());
+/// Delete the bytes behind a checkpoint the retention sweep just dropped.
+///
+/// Artifacts reach three different places depending on how they were written,
+/// so each URI is routed by scheme:
+///
+/// * `s3://…` — the worker-direct path, deleted through the coordinator's S3
+///   client. Without this the objects would leak forever: retention has
+///   already removed the only records naming them.
+/// * `file://…` or a bare absolute path — a worker-direct write to a shared
+///   filesystem.
+/// * anything else — a coordinator-relative storage key, covered by removing
+///   the run's checkpoint directory below.
+///
+/// Failures are logged, never fatal: the sweep is periodic and idempotent, so
+/// a transient S3 error simply retries on the next tick. Deleting an object
+/// that is already gone is not an error.
+async fn reclaim_checkpoint_artifacts(
+    reclaimed: &ReclaimedCheckpoint,
+    storage_root: Option<&PathBuf>,
+    s3: Option<&runtime_storage::S3Storage>,
+) {
+    for uri in &reclaimed.artifact_uris {
+        if uri.starts_with("s3://") {
+            let Some(s3) = s3 else {
+                tracing::warn!(
+                    run_id = %reclaimed.run_id,
+                    checkpoint_id = %reclaimed.checkpoint_id,
+                    %uri,
+                    "checkpoint retention: S3 artifact cannot be reclaimed — no S3 backend \
+                     is configured on this coordinator; delete it via a bucket lifecycle rule"
+                );
+                continue;
+            };
+            // The key is addressed through the configured client, so its
+            // bucket (and any key prefix) applies.
+            let key = runtime_storage::uri::parse_s3_uri(uri)
+                .map_err(|e| e.to_string())
+                .and_then(|(_bucket, key)| {
+                    runtime_storage::StorageKey::new(&key).map_err(|e| e.to_string())
+                });
+            match key {
+                Ok(key) => {
+                    if let Err(e) = s3.delete_async(&key).await {
+                        tracing::warn!(
+                            run_id = %reclaimed.run_id,
+                            checkpoint_id = %reclaimed.checkpoint_id,
+                            %uri,
+                            error = %e,
+                            "checkpoint retention: S3 artifact delete failed (retries next sweep)"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    run_id = %reclaimed.run_id, %uri, error = %e,
+                    "checkpoint retention: unusable S3 artifact URI, skipping"
+                ),
             }
-            parsed.max_s3_concurrent_ops = Some(n);
-        } else if arg == "--metadata-db-url" {
-            parsed.metadata_db_url = Some(args.next().ok_or("--metadata-db-url requires a URL")?);
-        } else if arg == "--no-verify-checkpoint-artifacts" {
-            parsed.verify_checkpoint_artifacts = false;
-        } else if arg == "--cache-aware-placement" {
-            parsed.cache_aware_placement = true;
-        } else if arg == "--help" || arg == "-h" {
-            parsed.show_help = true;
-        } else {
-            return Err(format!("unexpected argument: {arg}").into());
+        } else if uri.starts_with("file://") || Path::new(uri).is_absolute() {
+            let path = runtime_storage::uri::uri_to_local_path(uri);
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        run_id = %reclaimed.run_id,
+                        path = %path.display(),
+                        error = %e,
+                        "checkpoint retention: artifact file removal failed"
+                    );
+                }
+            }
         }
     }
 
-    Ok(parsed)
+    // Artifacts streamed through the coordinator live under its storage root,
+    // one directory per checkpoint.
+    if let Some(root) = storage_root {
+        let mut dir = root.clone();
+        dir.push("runs");
+        dir.push(&reclaimed.run_id);
+        dir.push("checkpoints");
+        dir.push(&reclaimed.checkpoint_id);
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "checkpoint retention: artifact directory removal failed"
+                );
+            }
+        }
+    }
+}
+
+/// Strip credentials from a PostgreSQL DSN before emitting it to logs.
+fn redact_pg_url(url: &str) -> String {
+    if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.rfind('@')) {
+        let scheme = &url[..scheme_end + 3];
+        let host_onwards = &url[at_pos..];
+        format!("{scheme}***{host_onwards}")
+    } else {
+        url.to_string()
+    }
+}
+
+/// How long a client has to send its request line before we drop it.
+///
+/// Without this a single client that opens a socket and never writes would
+/// block the accept loop forever, taking `/healthz` and `/readyz` down with
+/// it — which a Kubernetes liveness probe would (correctly) read as a dead
+/// coordinator. These endpoints serve short, self-contained GETs, so a couple
+/// of seconds is generous.
+const STATUS_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Minimal blocking HTTP/1.1 server for the operational endpoints.
+///
+/// Deliberately hand-rolled and single-threaded rather than another async
+/// stack: these serve infrequent, tiny, unauthenticated GETs (Prometheus
+/// scrapes and kubelet probes) on a separate port from the gRPC API, and
+/// keeping them off the tokio runtime means a wedged scrape can never
+/// interfere with worker RPCs. `handler` maps a raw request head to a
+/// complete response.
+fn serve_operational_endpoint(
+    addr: String,
+    label: &'static str,
+    handler: impl Fn(&str) -> String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(&addr)?;
+    info!(endpoint = label, %addr, "runtime-coordinator operational endpoint enabled");
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Both directions are bounded: a client that connects and stalls, or
+        // one that stops reading mid-response, is dropped instead of parking
+        // the loop.
+        let _ = stream.set_read_timeout(Some(STATUS_IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(STATUS_IO_TIMEOUT));
+
+        let mut buf = [0_u8; 1024];
+        let read = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => continue, // timed out or reset — nothing to reply to
+        };
+        let response = handler(&String::from_utf8_lossy(&buf[..read]));
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+    Ok(())
+}
+
+/// Frame a complete HTTP/1.1 response. `Connection: close` because every
+/// handler here serves one request per connection.
+fn http_response(status: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
+
+fn build_status_http_response(
+    request: &str,
+    state: &CoordinatorState,
+    audit: &AuditLogger,
+    auth_mode: AuthMode,
+    tls_enabled: bool,
+    mtls_enabled: bool,
+    started_at: SystemTime,
+) -> String {
+    if !request.starts_with("GET ") {
+        return http_response("405 Method Not Allowed", TEXT_PLAIN, "method not allowed");
+    }
+    if !request.starts_with("GET /status ") {
+        return http_response("404 Not Found", TEXT_PLAIN, "not found");
+    }
+
+    let snapshot = state.status_snapshot();
+    let uptime_secs = started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    let body = serde_json::to_string(&serde_json::json!({
+        "health": "ok",
+        "auth_mode": format!("{:?}", auth_mode).to_ascii_lowercase(),
+        "tls_enabled": tls_enabled,
+        "mtls_enabled": mtls_enabled,
+        "run_count": snapshot.run_count,
+        "worker_count": snapshot.worker_count,
+        "active_worker_count": snapshot.active_worker_count,
+        "checkpoint_count": snapshot.checkpoint_count,
+        "latest_checkpoint_id": snapshot.latest_checkpoint_id,
+        "audit_event_count": audit.emitted_count(),
+        "uptime_secs": uptime_secs
+    }))
+    .unwrap_or_else(|_| String::from("{\"health\":\"error\"}"));
+    http_response("200 OK", "application/json", &body)
+}
+
+fn build_metrics_http_response(
+    request: &str,
+    service: &CoordinatorServiceImpl,
+    audit: &AuditLogger,
+    ready: bool,
+) -> String {
+    if request.starts_with("GET /healthz ") {
+        return http_response("200 OK", TEXT_PLAIN, "ok\n");
+    }
+    if request.starts_with("GET /readyz ") {
+        return if ready {
+            http_response("200 OK", TEXT_PLAIN, "ok\n")
+        } else {
+            http_response("503 Service Unavailable", TEXT_PLAIN, "not ready\n")
+        };
+    }
+    if request.starts_with("GET /metrics ") {
+        let body = render_prometheus_metrics(&service.metrics_snapshot(), audit.emitted_count());
+        return http_response("200 OK", "text/plain; version=0.0.4; charset=utf-8", &body);
+    }
+    if request.starts_with("GET ") {
+        return http_response("404 Not Found", TEXT_PLAIN, "not found");
+    }
+    http_response("405 Method Not Allowed", TEXT_PLAIN, "method not allowed")
 }
 
 #[cfg(test)]
@@ -881,7 +977,6 @@ mod tests {
                 terminal_run_retention_secs: 24 * 60 * 60,
                 checkpoint_keep_last: 0,
                 cache_aware_placement: false,
-                show_help: false,
             }
         );
         let audit = AuditLogger::tracing();
@@ -897,7 +992,6 @@ mod tests {
             .expect("custom addr should parse");
         assert_eq!(parsed.addr, "127.0.0.1:60000");
         assert_eq!(parsed.metadata_db, None);
-        assert!(!parsed.show_help);
     }
 
     #[test]
@@ -962,9 +1056,28 @@ mod tests {
     }
 
     #[test]
-    fn help_flag() {
-        let parsed = coordinator_args(vec!["--help".to_string()]).expect("help should parse");
-        assert!(parsed.show_help);
+    fn help_flag_renders_usage_for_every_option() {
+        let err = coordinator_args(vec!["--help".to_string()]).expect_err("--help short-circuits");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+
+        // The help text is generated from the struct, so it cannot drift out of
+        // sync with the flags the way the previous hand-written usage could.
+        let help = err.to_string();
+        for flag in [
+            "--addr",
+            "--metadata-db",
+            "--metadata-db-url",
+            "--auth-mode",
+            "--oidc-issuer",
+            "--spiffe-trust-domain",
+            "--tls-cert",
+            "--metrics-addr",
+            "--s3-bucket",
+            "--checkpoint-keep-last",
+            "--no-verify-checkpoint-artifacts",
+        ] {
+            assert!(help.contains(flag), "help text is missing {flag}");
+        }
     }
 
     #[test]
@@ -973,10 +1086,63 @@ mod tests {
             .expect("auth mode should parse");
         assert_eq!(parsed.auth_mode, AuthMode::Metadata);
     }
+
+    #[test]
+    fn invalid_auth_mode_is_rejected() {
+        let err = coordinator_args(vec!["--auth-mode".to_string(), "banana".to_string()])
+            .expect_err("should error");
+        assert!(
+            err.to_string().contains("unsupported auth mode"),
+            "unhelpful error: {err}"
+        );
+    }
+
     #[test]
     fn unknown_arg_errors() {
         let err = coordinator_args(vec!["--wat".to_string()]).expect_err("should error");
-        assert_eq!(err.to_string(), "unexpected argument: --wat");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--wat"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn missing_flag_value_errors() {
+        let err = coordinator_args(vec!["--addr".to_string()]).expect_err("should error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn no_verify_flag_clears_the_default() {
+        let on = coordinator_args(Vec::new()).expect("defaults");
+        assert!(
+            on.verify_checkpoint_artifacts,
+            "verification is on by default"
+        );
+
+        let off = coordinator_args(vec!["--no-verify-checkpoint-artifacts".to_string()])
+            .expect("flag should parse");
+        assert!(!off.verify_checkpoint_artifacts);
+    }
+
+    #[test]
+    fn oidc_audience_repeats_and_splits() {
+        let parsed = coordinator_args(vec![
+            "--oidc-audience".to_string(),
+            "api".to_string(),
+            "--oidc-audience".to_string(),
+            "cli,web".to_string(),
+        ])
+        .expect("audiences should parse");
+        assert_eq!(parsed.oidc_audiences, vec!["api", "cli", "web"]);
+    }
+
+    #[test]
+    fn max_s3_concurrent_ops_rejects_zero() {
+        let err = coordinator_args(vec!["--max-s3-concurrent-ops".to_string(), "0".to_string()])
+            .expect_err("zero should be rejected");
+        assert!(
+            err.to_string().contains("greater than zero"),
+            "unhelpful error: {err}"
+        );
     }
 }
 
@@ -1017,141 +1183,99 @@ mod ha_lock_tests {
     }
 }
 
-/// Strip credentials from a PostgreSQL DSN before emitting it to logs.
-fn redact_pg_url(url: &str) -> String {
-    if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.rfind('@')) {
-        let scheme = &url[..scheme_end + 3];
-        let host_onwards = &url[at_pos..];
-        format!("{scheme}***{host_onwards}")
-    } else {
-        url.to_string()
-    }
-}
+#[cfg(test)]
+mod retention_gc_tests {
+    use super::*;
 
-fn serve_status_endpoint(
-    addr: String,
-    state: Arc<CoordinatorState>,
-    audit: AuditLogger,
-    auth_mode: AuthMode,
-    tls_enabled: bool,
-    mtls_enabled: bool,
-    started_at: SystemTime,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(&addr)?;
-    info!(status_addr = %addr, "runtime-coordinator status endpoint enabled");
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let mut buf = [0_u8; 1024];
-        let read = stream.read(&mut buf).unwrap_or(0);
-        let req = String::from_utf8_lossy(&buf[..read]);
-        let is_get_status = req.starts_with("GET /status ");
-        let response = if is_get_status {
-            let snapshot = state.status_snapshot();
-            let uptime_secs = started_at.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-            serde_json::to_string(&serde_json::json!({
-                "health": "ok",
-                "auth_mode": format!("{:?}", auth_mode).to_ascii_lowercase(),
-                "tls_enabled": tls_enabled,
-                "mtls_enabled": mtls_enabled,
-                "run_count": snapshot.run_count,
-                "worker_count": snapshot.worker_count,
-                "active_worker_count": snapshot.active_worker_count,
-                "checkpoint_count": snapshot.checkpoint_count,
-                "latest_checkpoint_id": snapshot.latest_checkpoint_id,
-                "audit_event_count": audit.emitted_count(),
-                "uptime_secs": uptime_secs
-            }))
-            .unwrap_or_else(|_| String::from("{\"health\":\"error\"}"))
-        } else {
-            String::from("method not allowed")
-        };
-        let header = if is_get_status {
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                response.len()
-            )
-        } else {
-            format!(
-                "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                response.len()
-            )
-        };
-        let _ = stream.write_all(header.as_bytes());
-        let _ = stream.write_all(response.as_bytes());
-    }
-    Ok(())
-}
-
-fn serve_metrics_endpoint(
-    addr: String,
-    service: CoordinatorServiceImpl,
-    audit: AuditLogger,
-    ready: Arc<AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(&addr)?;
-    info!(metrics_addr = %addr, "runtime-coordinator metrics endpoint enabled");
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let mut buf = [0_u8; 1024];
-        let read = stream.read(&mut buf).unwrap_or(0);
-        let req = String::from_utf8_lossy(&buf[..read]);
-        let response =
-            build_metrics_http_response(&req, &service, &audit, ready.load(Ordering::Acquire));
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
-    }
-    Ok(())
-}
-
-fn build_metrics_http_response(
-    request: &str,
-    service: &CoordinatorServiceImpl,
-    audit: &AuditLogger,
-    ready: bool,
-) -> String {
-    let is_get_metrics = request.starts_with("GET /metrics ");
-    let (status, content_type, body) = if request.starts_with("GET /healthz ") {
-        ("200 OK", "text/plain; charset=utf-8", String::from("ok\n"))
-    } else if request.starts_with("GET /readyz ") {
-        if ready {
-            ("200 OK", "text/plain; charset=utf-8", String::from("ok\n"))
-        } else {
-            (
-                "503 Service Unavailable",
-                "text/plain; charset=utf-8",
-                String::from("not ready\n"),
-            )
+    fn reclaimed(uris: &[&str]) -> ReclaimedCheckpoint {
+        ReclaimedCheckpoint {
+            run_id: "run-1".to_string(),
+            checkpoint_id: "ckpt-1".to_string(),
+            artifact_uris: uris.iter().map(|s| s.to_string()).collect(),
         }
-    } else if is_get_metrics {
-        (
-            "200 OK",
-            "text/plain; version=0.0.4; charset=utf-8",
-            render_prometheus_metrics(&service.metrics_snapshot(), audit.emitted_count()),
-        )
-    } else if request.starts_with("GET ") {
-        (
-            "404 Not Found",
-            "text/plain; charset=utf-8",
-            String::from("not found"),
-        )
-    } else {
-        (
-            "405 Method Not Allowed",
-            "text/plain; charset=utf-8",
-            String::from("method not allowed"),
-        )
-    };
+    }
 
-    format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
+    #[tokio::test]
+    async fn reclaims_worker_direct_files_and_the_coordinator_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // A worker-direct artifact written to a shared filesystem.
+        let direct = root.join("direct-artifact.bin");
+        std::fs::write(&direct, b"bytes").unwrap();
+
+        // An artifact streamed through the coordinator lives under its root.
+        let coord_dir = root
+            .join("runs")
+            .join("run-1")
+            .join("checkpoints")
+            .join("ckpt-1");
+        std::fs::create_dir_all(&coord_dir).unwrap();
+        std::fs::write(coord_dir.join("model.bin"), b"bytes").unwrap();
+
+        // A sibling checkpoint that must be left alone.
+        let keep = root
+            .join("runs")
+            .join("run-1")
+            .join("checkpoints")
+            .join("ckpt-2");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::write(keep.join("model.bin"), b"bytes").unwrap();
+
+        let uri = format!(
+            "file:///{}",
+            direct.display().to_string().replace('\\', "/")
+        );
+        reclaim_checkpoint_artifacts(&reclaimed(&[&uri]), Some(&root), None).await;
+
+        assert!(!direct.exists(), "worker-direct file was not reclaimed");
+        assert!(
+            !coord_dir.exists(),
+            "coordinator artifact dir was not reclaimed"
+        );
+        assert!(keep.exists(), "retention must not touch other checkpoints");
+    }
+
+    /// The sweep runs every reconcile tick; a re-run after a partial failure
+    /// must converge rather than error.
+    #[tokio::test]
+    async fn reclaiming_already_deleted_artifacts_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let missing = root.join("gone.bin");
+        let uri = format!(
+            "file:///{}",
+            missing.display().to_string().replace('\\', "/")
+        );
+
+        for _ in 0..2 {
+            reclaim_checkpoint_artifacts(&reclaimed(&[&uri]), Some(&root), None).await;
+        }
+    }
+
+    /// Without a configured S3 backend the objects cannot be deleted. That must
+    /// warn and continue — never panic, and never block the rest of the sweep.
+    #[tokio::test]
+    async fn s3_artifact_without_backend_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let local = root.join("local.bin");
+        std::fs::write(&local, b"bytes").unwrap();
+        let local_uri = format!("file:///{}", local.display().to_string().replace('\\', "/"));
+
+        reclaim_checkpoint_artifacts(
+            &reclaimed(&["s3://bucket/runs/r/ckpt-1/model.bin", &local_uri]),
+            Some(&root),
+            None,
+        )
+        .await;
+
+        // The unreclaimable S3 entry must not stop the local one being cleaned.
+        assert!(
+            !local.exists(),
+            "a skipped S3 URI aborted the rest of the sweep"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1264,5 +1388,110 @@ mod metrics_http_tests {
                 "health body leaked marker: {marker}"
             );
         }
+    }
+
+    // ── status endpoint ──────────────────────────────────────────────────────
+
+    fn status_response(request: &str) -> String {
+        build_status_http_response(
+            request,
+            &CoordinatorState::default(),
+            &AuditLogger::tracing(),
+            AuthMode::Disabled,
+            false,
+            false,
+            SystemTime::now(),
+        )
+    }
+
+    #[test]
+    fn status_returns_json_snapshot() {
+        let response = status_response("GET /status HTTP/1.1\r\n\r\n");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.contains("Connection: close\r\n"));
+
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("status body is JSON");
+        assert_eq!(parsed["health"], "ok");
+        assert_eq!(parsed["auth_mode"], "disabled");
+        assert_eq!(parsed["run_count"], 0);
+    }
+
+    #[test]
+    fn status_unknown_path_returns_404_and_non_get_returns_405() {
+        assert!(status_response("GET /nope HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 404 Not Found"));
+        assert!(status_response("POST /status HTTP/1.1\r\n\r\n")
+            .starts_with("HTTP/1.1 405 Method Not Allowed"));
+    }
+
+    #[test]
+    fn status_content_length_matches_body_for_every_route() {
+        for request in [
+            "GET /status HTTP/1.1\r\n\r\n",
+            "GET /nope HTTP/1.1\r\n\r\n",
+            "POST /status HTTP/1.1\r\n\r\n",
+        ] {
+            let response = status_response(request);
+            let (head, body) = response.split_once("\r\n\r\n").expect("framed response");
+            let declared: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .expect("Content-Length header")
+                .parse()
+                .expect("numeric Content-Length");
+            assert_eq!(declared, body.len(), "bad framing for {request:?}");
+        }
+    }
+
+    /// A client that connects and never sends must not wedge the accept loop:
+    /// before the read timeout existed, this hung forever and took `/healthz`
+    /// and `/readyz` down with it.
+    #[test]
+    fn silent_client_does_not_block_later_requests() {
+        use std::io::BufRead;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener); // hand the port to the server thread
+
+        std::thread::spawn(move || {
+            let _ = serve_operational_endpoint(addr.to_string(), "test", |_| {
+                http_response("200 OK", TEXT_PLAIN, "ok\n")
+            });
+        });
+
+        // Wait for the listener to come up.
+        let stall = loop {
+            match std::net::TcpStream::connect(addr) {
+                Ok(s) => break s,
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        // `stall` is connected but deliberately sends nothing, and is held
+        // open for the rest of the test.
+
+        // A well-behaved client must still be served, without waiting out the
+        // full read timeout on the stalled one.
+        let started = std::time::Instant::now();
+        let mut good = std::net::TcpStream::connect(addr).expect("second connect");
+        good.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        good.write_all(b"GET /healthz HTTP/1.1\r\n\r\n")
+            .expect("write");
+        let mut line = String::new();
+        std::io::BufReader::new(&good)
+            .read_line(&mut line)
+            .expect("read status line");
+
+        assert!(
+            line.starts_with("HTTP/1.1 200 OK"),
+            "unexpected status line: {line:?}"
+        );
+        assert!(
+            started.elapsed() < STATUS_IO_TIMEOUT * 3,
+            "second request waited {:?} — the stalled client blocked the loop",
+            started.elapsed()
+        );
+        drop(stall);
     }
 }

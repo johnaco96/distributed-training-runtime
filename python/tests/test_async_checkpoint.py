@@ -9,12 +9,10 @@ commit vote → restore.
 from __future__ import annotations
 
 import os
-import socket
-import subprocess
 import time
 import uuid
-from pathlib import Path
 
+import harness
 import pytest
 
 grpc = pytest.importorskip("grpc")
@@ -23,49 +21,12 @@ torch = pytest.importorskip("torch")
 from dtruntime import AsyncCheckpointer, CheckpointError, connect
 from dtruntime.generated import runtime_pb2
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-EXE = ".exe" if os.name == "nt" else ""
-COORDINATOR_BIN = REPO_ROOT / "target" / "release" / f"runtime-coordinator{EXE}"
-
-
-def _free_tcp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
 
 @pytest.fixture(scope="module")
 def coordinator_addr(tmp_path_factory: pytest.TempPathFactory) -> str:
-    if not COORDINATOR_BIN.is_file():
-        pytest.skip(
-            f"release coordinator not built at {COORDINATOR_BIN}; "
-            "run: cargo build --release -p runtime-coordinator"
-        )
-    addr = f"127.0.0.1:{_free_tcp_port()}"
     storage = tmp_path_factory.mktemp("coordinator-storage")
-    proc = subprocess.Popen(
-        [str(COORDINATOR_BIN), "--addr", addr, "--storage-root", str(storage)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    deadline = time.time() + 30
-    with connect(addr) as probe:
-        while time.time() < deadline:
-            try:
-                probe.restore_latest("warmup")
-                break
-            except grpc.RpcError as exc:
-                if exc.code() is not grpc.StatusCode.UNAVAILABLE:
-                    break  # server answered — ready
-                if proc.poll() is not None:
-                    raise RuntimeError("coordinator exited during startup")
-                time.sleep(0.2)
-        else:
-            proc.terminate()
-            raise RuntimeError(f"coordinator not ready at {addr}")
-    yield addr
-    proc.terminate()
-    proc.wait(timeout=10)
+    with harness.running_coordinator(["--storage-root", str(storage)]) as addr:
+        yield addr
 
 
 def _register_run_and_workers(client, world_size: int) -> tuple[str, list[str]]:
@@ -190,7 +151,10 @@ def test_restore_falls_back_to_remote_copy(coordinator_addr, tmp_path):
 # DTRUNTIME_S3_ACCESS_KEY / DTRUNTIME_S3_SECRET_KEY, with MinIO running and
 # the runtime-uploader binary built (cargo build --release -p runtime-uploader).
 
-UPLOADER_BIN = REPO_ROOT / "target" / "release" / f"runtime-uploader{EXE}"
+# Located via the harness so the platform suffix and target/release layout are
+# defined in exactly one place. (The coordinator binary is resolved inside
+# harness.running_coordinator, which also handles the skip.)
+UPLOADER_BIN = harness.release_binary("runtime-uploader")
 
 minio_gated = pytest.mark.skipif(
     os.environ.get("DTRUNTIME_RUN_MINIO_TESTS") != "1",
@@ -228,8 +192,8 @@ def test_s3_restore_survives_total_loss_of_local_staging(
     Rust uploader, its node "dies" (staging dir wiped), and a fresh restore
     pulls the artifact back from S3 — through the Rust downloader — with the
     checksum verified against the committed manifest."""
-    if not UPLOADER_BIN.is_file():
-        pytest.skip(f"runtime-uploader not built at {UPLOADER_BIN}")
+    if UPLOADER_BIN is None:
+        pytest.skip("runtime-uploader not built")
     import shutil
 
     with connect(coordinator_addr) as client:
@@ -270,8 +234,8 @@ def test_s3_restore_survives_total_loss_of_local_staging(
 def test_s3_restore_detects_tampered_artifact(coordinator_addr, tmp_path, s3_bucket):
     """Corrupt the object in S3 after commit: restore must fail the manifest
     checksum check, not hand back bad state."""
-    if not UPLOADER_BIN.is_file():
-        pytest.skip(f"runtime-uploader not built at {UPLOADER_BIN}")
+    if UPLOADER_BIN is None:
+        pytest.skip("runtime-uploader not built")
     import shutil
 
     boto3 = pytest.importorskip("boto3")
@@ -297,6 +261,87 @@ def test_s3_restore_detects_tampered_artifact(coordinator_addr, tmp_path, s3_buc
         with AsyncCheckpointer(client, run_id, worker_id, staging, dest=dest) as fresh:
             with pytest.raises(CheckpointError, match="checksum mismatch"):
                 fresh.restore_latest()
+
+
+@pytest.fixture
+def retention_coordinator(tmp_path_factory, s3_bucket) -> str:
+    """A coordinator wired to S3 with aggressive checkpoint retention.
+
+    Separate from the module-scoped fixture because retention is a background
+    sweep: it needs its own short reconcile interval and its own run history so
+    the GC assertions cannot be perturbed by other tests' checkpoints. Depends
+    on `s3_bucket` so the coordinator and the test address the same bucket.
+    """
+    storage = tmp_path_factory.mktemp("retention-storage")
+    with harness.running_coordinator([
+        "--storage-root", str(storage),
+        "--metadata-db", str(storage / "meta.db"),
+        "--checkpoint-keep-last", "1",
+        "--reconcile-interval-secs", "1",
+        "--s3-endpoint", os.environ["DTRUNTIME_S3_ENDPOINT"],
+        "--s3-bucket", s3_bucket,
+        "--s3-access-key", os.environ.get("DTRUNTIME_S3_ACCESS_KEY", ""),
+        "--s3-secret-key", os.environ.get("DTRUNTIME_S3_SECRET_KEY", ""),
+        "--s3-region", os.environ.get("DTRUNTIME_S3_REGION", "us-east-1"),
+    ]) as addr:
+        yield addr
+
+
+@minio_gated
+def test_retention_reclaims_superseded_s3_artifacts(
+    retention_coordinator, tmp_path, s3_bucket, monkeypatch
+):
+    """Checkpoint retention must delete the S3 objects it orphans.
+
+    Retention removes the coordinator's records; if the bytes are not deleted
+    with them, nothing afterwards knows the objects exist and a long-running
+    job leaks its entire checkpoint history into the bucket.
+    """
+    if UPLOADER_BIN is None:
+        pytest.skip("runtime-uploader not built")
+    boto3 = pytest.importorskip("boto3")
+
+    with connect(retention_coordinator) as client:
+        run_id, (worker_id,) = _register_run_and_workers(client, world_size=1)
+        dest = f"s3://{s3_bucket}/runs/{run_id}"
+        uris = []
+        with AsyncCheckpointer(
+            client, run_id, worker_id, tmp_path / "staging", dest=dest
+        ) as ckptr:
+            for step in (1, 2, 3):
+                handle = ckptr.save(_make_state(), step=step)
+                handle.wait(timeout=60)
+                assert handle.globally_committed
+                uris.append(handle.uri)
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.environ["DTRUNTIME_S3_ENDPOINT"],
+        region_name=os.environ.get("DTRUNTIME_S3_REGION", "us-east-1"),
+        aws_access_key_id=os.environ.get("DTRUNTIME_S3_ACCESS_KEY"),
+        aws_secret_access_key=os.environ.get("DTRUNTIME_S3_SECRET_KEY"),
+    )
+
+    def key_of(uri: str) -> str:
+        return uri[len(f"s3://{s3_bucket}/") :]
+
+    def exists(uri: str) -> bool:
+        try:
+            s3.head_object(Bucket=s3_bucket, Key=key_of(uri))
+            return True
+        except Exception:
+            return False
+
+    # The sweep is periodic; poll rather than sleeping a fixed interval.
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if not exists(uris[0]) and not exists(uris[1]):
+            break
+        time.sleep(1)
+
+    assert not exists(uris[0]), "step-1 artifact leaked in S3 after retention"
+    assert not exists(uris[1]), "step-2 artifact leaked in S3 after retention"
+    assert exists(uris[2]), "retention deleted the checkpoint it was told to keep"
 
 
 def test_upload_failure_surfaces_as_checkpoint_error(coordinator_addr, tmp_path):

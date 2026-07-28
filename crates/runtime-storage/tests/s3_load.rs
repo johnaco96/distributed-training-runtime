@@ -190,4 +190,54 @@ mod tests {
         storage.delete(&key).expect("delete");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// `delete_async` is what the coordinator's checkpoint retention sweep
+    /// calls. It has to work from inside a Tokio runtime (the synchronous
+    /// `StorageBackend::delete` drives its own runtime and cannot), and it has
+    /// to be idempotent so a re-run after a partial sweep converges instead of
+    /// erroring.
+    #[test]
+    fn delete_async_removes_the_object_and_is_idempotent() {
+        let Some(storage) = maybe_storage(None, None) else {
+            return;
+        };
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let key = StorageKey::new("gc/retention-artifact.bin").unwrap();
+
+        let dir = std::env::temp_dir().join(format!("dtr-gc-{}", unique()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.bin");
+
+        // Existence is probed with the async getter on purpose: the sync
+        // `StorageBackend` methods drive their own runtime and would panic
+        // here, which is exactly why `delete_async` had to exist.
+        rt.block_on(async {
+            storage
+                .put_async(&key, b"checkpoint bytes".to_vec())
+                .await
+                .expect("put");
+            storage
+                .get_to_file_async(&key, &probe)
+                .await
+                .expect("object should exist before deletion");
+
+            storage.delete_async(&key).await.expect("delete_async");
+
+            let err = storage
+                .get_to_file_async(&key, &probe)
+                .await
+                .expect_err("delete_async did not remove the object — retention would leak it");
+            assert!(
+                matches!(err, runtime_storage::StorageError::NotFound(_)),
+                "expected NotFound after delete, got: {err:?}"
+            );
+
+            // Second sweep over an already-reclaimed checkpoint must not error.
+            storage
+                .delete_async(&key)
+                .await
+                .expect("deleting an absent key must be a no-op");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

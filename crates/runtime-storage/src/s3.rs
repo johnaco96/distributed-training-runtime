@@ -341,6 +341,34 @@ impl S3Storage {
         .await
     }
 
+    /// Delete an object natively async.
+    ///
+    /// The async counterpart to [`StorageBackend::delete`], for callers already
+    /// inside a Tokio runtime — the synchronous method drives its own runtime
+    /// via `block_on` and would panic if called from one.
+    ///
+    /// Deleting an absent key is **not** an error: S3 `DeleteObject` is
+    /// idempotent, which is what a retention sweep wants (a re-run after a
+    /// partial failure must converge rather than fail).
+    pub async fn delete_async(&self, key: &StorageKey) -> Result<(), StorageError> {
+        let object_key = self.object_key_for(key)?;
+        run_with_timeout_retry(&self.policy, "s3-delete", || {
+            let object_key = object_key.clone();
+            async move {
+                let _permit = self.acquire().await?;
+                self.client
+                    .delete_object()
+                    .bucket(&self.bucket)
+                    .key(object_key)
+                    .send()
+                    .await
+                    .map_err(|err| classify_s3_error("s3-delete", Some(key), &err))?;
+                Ok(())
+            }
+        })
+        .await
+    }
+
     /// Stream a file to S3 without buffering it in memory.
     ///
     /// The body is read from disk by the SDK as the request is sent, so
