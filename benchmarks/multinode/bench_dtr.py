@@ -33,7 +33,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 import torch  # noqa: E402
-
 from dtruntime import AsyncCheckpointer, connect  # noqa: E402
 from dtruntime.generated import runtime_pb2  # noqa: E402
 

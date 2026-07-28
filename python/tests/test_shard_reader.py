@@ -19,7 +19,6 @@ from dtruntime.shard_reader import (
     write_shard_header,
 )
 
-
 # ── Header round-trip ─────────────────────────────────────────────────────────
 
 def test_header_write_read_roundtrip():

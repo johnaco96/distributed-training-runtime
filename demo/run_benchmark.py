@@ -21,7 +21,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
+import urllib.request
 from pathlib import Path
 
 from _common import _c, banner, coordinator_binary, free_port, wait_grpc
@@ -44,8 +46,6 @@ CRASH_RANK = "1"
 def ensure_cifar10() -> None:
     """Fetch real CIFAR-10 (PNG images, class-per-folder) from a fast mirror and
     extract it once. Skips if already present."""
-    import tarfile
-    import urllib.request
     train_dir = DATA_DIR / "cifar10" / "train"
     if train_dir.is_dir() and any(train_dir.iterdir()):
         print("      dataset already present (cached)")

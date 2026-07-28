@@ -7,7 +7,6 @@ import types
 from pathlib import Path
 
 import pytest
-
 from dtruntime import torch_dist
 from dtruntime.launch import LaunchConfig, WorkerSupervisor
 

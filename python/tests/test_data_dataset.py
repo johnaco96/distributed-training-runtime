@@ -9,7 +9,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
 from dtruntime.data.cache import ShardCache
 from dtruntime.data.dataset import DistributedShardDataset
 from dtruntime.data.formats import NpzFormat
@@ -195,9 +194,8 @@ def test_dataset_splits_shards_across_dataloader_workers(tmp_path, monkeypatch) 
 
 def test_dataset_works_through_torch_dataloader(tmp_path: Path) -> None:
     torch = pytest.importorskip("torch")
-    from torch.utils.data import DataLoader
-
     from dtruntime.data.formats import features_label_transform
+    from torch.utils.data import DataLoader
 
     assignments = []
     for s in range(4):

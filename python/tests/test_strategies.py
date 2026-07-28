@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from dtruntime.strategies import SUPPORTED_STRATEGIES, StrategyError, wrap_model
 
 

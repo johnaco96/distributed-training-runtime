@@ -31,9 +31,8 @@ import torch
 import torch.nn as nn
 import torchvision
 import torchvision.transforms as T
-from torch.utils.data import DataLoader, DistributedSampler
-
 from dtruntime import torch_dist
+from torch.utils.data import DataLoader, DistributedSampler
 
 
 def build_model() -> nn.Module:

@@ -74,6 +74,12 @@ s3 = [
 # Machine-generated gRPC/protobuf stubs are not held to lint standards.
 extend-exclude = ["python/dtruntime/generated"]
 
+[tool.ruff.lint]
+# Beyond the defaults (pyflakes + core pycodestyle): "I" sorts and groups
+# imports, so import placement is enforced by the linter rather than left to
+# reviewers to notice.
+extend-select = ["I"]
+
 [tool.ruff.lint.per-file-ignores]
 # Tests import after pytest.importorskip()/sys.path setup by design.
 "python/tests/*" = ["E402"]

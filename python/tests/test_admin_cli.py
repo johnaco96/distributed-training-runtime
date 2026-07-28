@@ -10,10 +10,9 @@ from __future__ import annotations
 import json
 
 import pytest
-from google.protobuf.timestamp_pb2 import Timestamp
-
 from dtruntime.admin import cli, errors
 from dtruntime.generated import runtime_pb2 as pb2
+from google.protobuf.timestamp_pb2 import Timestamp
 
 
 def _ts(seconds: int) -> Timestamp:
