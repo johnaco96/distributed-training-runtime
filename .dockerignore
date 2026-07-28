@@ -1,0 +1,36 @@
+# Keep the build context small: without this, `docker build` uploads the
+# multi-gigabyte Cargo target/ directory and the local virtualenv on every
+# build, and any stale host-built artifact could shadow a stage's own output.
+target/
+.venv/
+venv/
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+.git/
+.github/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local scratch and run output — never wanted inside an image.
+.dtruntime-*/
+tools/
+docs/
+benchmarks/
+perf.data*
+*.log
+
+# Credentials must never enter the build context.
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials/
+aws_credentials
