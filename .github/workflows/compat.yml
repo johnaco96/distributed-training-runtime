@@ -47,11 +47,10 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Python unit tests
-        # Cross-platform UNIT portability. Exclude the coordinator-spawning
-        # benchmark (it needs the prebuilt release binary + time; ci.yml covers
-        # it). torch-dependent tests skip automatically (torch is not installed
-        # here) — that is intended.
-        run: python -m pytest python/tests -q --ignore=python/tests/test_linux_scaling_benchmark.py
+        # Cross-platform UNIT portability. torch-dependent tests skip
+        # automatically (torch is not installed here) — that is intended, and
+        # ci.yml runs the full integration suite on Linux.
+        run: python -m pytest python/tests -q
 
   container-build:
     name: Container image build
