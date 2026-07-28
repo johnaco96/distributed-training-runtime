@@ -54,7 +54,7 @@ def run_demo(address: str) -> None:
         run_response = client.stub.RegisterRun(
             runtime_pb2.RegisterRunRequest(
                 idempotency_key=f"demo-register-run-{suffix}",
-                run_name=f"phase10-local-demo-{suffix}",
+                run_name=f"local-demo-{suffix}",
                 assignment_policy=runtime_pb2.ASSIGNMENT_POLICY_STATIC_RANK,
                 storage_backend_kind=runtime_pb2.STORAGE_BACKEND_KIND_LOCAL_FILESYSTEM,
                 world_size=2,
@@ -98,7 +98,7 @@ def run_demo(address: str) -> None:
         dataset_response = client.register_dataset(
             run_id=run_id,
             dataset_id=dataset_id,
-            name="phase10-demo-dataset",
+            name="local-demo-dataset",
             uri=_path_to_file_uri(dataset_root),
             format="jsonl",
             dataset_version="v1",

@@ -2,8 +2,8 @@ name: Ops resilience tests
 
 # Failover / chaos / soak against the real release binaries. Kept out of the
 # per-PR CI (they build release binaries and run for minutes); run on demand.
-# Nightly schedule stays disabled until the Phase 1 scale baseline proves the
-# suite green on hosted runners:
+# Nightly schedule stays disabled until the suite is proven green on hosted
+# runners (it is currently validated locally):
 #   schedule:
 #     - cron: "0 4 * * *"
 on:
