@@ -1,4 +1,4 @@
-# Phase 1 — Coordinator scale baseline (measured)
+# Coordinator scale baseline (measured)
 
 **Environment:** WSL2 Ubuntu 26.04 on Windows 11, 24 logical CPUs, 7 GB RAM for the VM,
 repo + benchmarks on the WSL2 ext4 filesystem, loopback networking. All numbers are

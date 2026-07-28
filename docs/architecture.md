@@ -70,7 +70,7 @@ The user-facing API, torch-free at import:
 Protocol-level benchmark harness: thousands of concurrent logical workers
 over real gRPC (per-worker tasks, pooled HTTP/2 channels, bounded in-flight
 RPCs), latency percentiles per RPC class, failure injection. Used for the
-measured baseline in [benchmarks/phase1-baseline.md](benchmarks/phase1-baseline.md).
+measured baseline in [benchmarks/control-plane-scale.md](benchmarks/control-plane-scale.md).
 
 ## Component diagram
 
@@ -155,7 +155,7 @@ decode through `_native` when built (one GIL-released pass, zero-copy
 tensors) or pure Python otherwise → records stream to the training loop with
 bounded-queue backpressure. Progress is reported back so a restarted worker
 resumes mid-shard. Measured A/B numbers:
-[benchmarks/phase3-dataplane.md](benchmarks/phase3-dataplane.md).
+[benchmarks/data-plane-throughput.md](benchmarks/data-plane-throughput.md).
 
 ## Current boundaries
 

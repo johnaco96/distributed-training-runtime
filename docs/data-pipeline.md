@@ -8,7 +8,7 @@ progress is reported for resume. The shard-assignment RPCs it builds on are
 defined in [proto/runtime.proto](../proto/runtime.proto); when the Rust
 accelerator is built (`python scripts/build_native.py`), DTRS shards decode
 through `dtruntime._native` with measured numbers in
-[benchmarks/phase3-dataplane.md](benchmarks/phase3-dataplane.md).
+[benchmarks/data-plane-throughput.md](benchmarks/data-plane-throughput.md).
 
 ## Quick start
 
