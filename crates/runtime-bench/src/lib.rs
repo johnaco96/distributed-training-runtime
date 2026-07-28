@@ -504,203 +504,6 @@ pub fn write_outputs(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn percentile_empty() {
-        assert_eq!(percentile_ms(&[], 0.5), 0.0);
-    }
-    #[test]
-    fn percentile_single() {
-        assert_eq!(percentile_ms(&[2.0], 0.9), 2.0);
-    }
-    #[test]
-    fn percentile_unsorted() {
-        let v = [9.0, 1.0, 5.0, 3.0];
-        assert_eq!(percentile_ms(&v, 0.5), 5.0);
-    }
-    #[test]
-    fn percentile_known() {
-        let v = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-        assert_eq!(percentile_ms(&v, 0.5), 6.0);
-        assert_eq!(percentile_ms(&v, 0.9), 10.0);
-        assert_eq!(percentile_ms(&v, 0.99), 10.0);
-    }
-    #[test]
-    fn summary_calc() {
-        let s = BenchmarkSummary::from_samples(
-            "x",
-            "local-dev",
-            "unit",
-            "test",
-            vec![],
-            &[
-                BenchmarkSample {
-                    latency_ms: 1.0,
-                    bytes: 100,
-                    success: true,
-                    retry_count: 0,
-                },
-                BenchmarkSample {
-                    latency_ms: 2.0,
-                    bytes: 0,
-                    success: false,
-                    retry_count: 0,
-                },
-            ],
-            10.0,
-            json!({}),
-        );
-        assert_eq!(s.operation_count, 2);
-        assert_eq!(s.failure_count, 1);
-    }
-    #[test]
-    fn csv_has_headers() {
-        let header = BenchmarkSummary::csv_header();
-        assert!(header.starts_with(
-            "benchmark,environment,surface,mode,caveats,timestamp_utc,operation_count"
-        ));
-    }
-    #[test]
-    fn dataset_small() {
-        let s = run_dataset_read(4, 64, 2, None, false).unwrap();
-        assert_eq!(s.operation_count, 4);
-    }
-    #[test]
-    fn checkpoint_write_small() {
-        let s = run_checkpoint_write(2, 128, 2, None, false).unwrap();
-        assert_eq!(s.success_count, 2);
-    }
-    #[test]
-    fn checkpoint_restore_small() {
-        let s = run_checkpoint_restore(3, 2, 128, 2, None, false).unwrap();
-        assert_eq!(s.operation_count, 3);
-    }
-
-    #[test]
-    fn parse_workers_list_ok() {
-        assert_eq!(
-            parse_workers_list("1,2,4,8,16").unwrap(),
-            vec![1, 2, 4, 8, 16]
-        );
-    }
-
-    #[test]
-    fn parse_workers_list_rejects_invalid() {
-        assert!(parse_workers_list("").is_err());
-        assert!(parse_workers_list("0").is_err());
-        assert!(parse_workers_list("-1").is_err());
-        assert!(parse_workers_list("abc").is_err());
-        assert!(parse_workers_list("1,,2").is_err());
-    }
-
-    #[test]
-    fn write_outputs_many_writes_multiple_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let csv_path = dir.path().join("bench.csv");
-        let json_path = dir.path().join("bench.json");
-        let summaries = vec![
-            BenchmarkSummary::from_samples(
-                "simulated-worker-rpc-1-workers",
-                "local-dev",
-                "coordinator-rpc",
-                "simulated",
-                vec![],
-                &[],
-                1.0,
-                json!({}),
-            ),
-            BenchmarkSummary::from_samples(
-                "simulated-worker-rpc-2-workers",
-                "local-dev",
-                "coordinator-rpc",
-                "simulated",
-                vec![],
-                &[],
-                2.0,
-                json!({}),
-            ),
-        ];
-        write_outputs_many(&summaries, Some(&csv_path), Some(&json_path)).unwrap();
-        let csv = fs::read_to_string(csv_path).unwrap();
-        assert!(csv.contains("simulated-worker-rpc-1-workers"));
-        assert!(csv.contains("simulated-worker-rpc-2-workers"));
-        let json: serde_json::Value =
-            serde_json::from_slice(&fs::read(json_path).unwrap()).unwrap();
-        assert_eq!(json.as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn scaling_summary_name() {
-        assert_eq!(scaling_benchmark_name(16, false), "worker-rpc-16-workers");
-        assert_eq!(
-            scaling_benchmark_name(64, true),
-            "simulated-worker-rpc-64-workers"
-        );
-    }
-
-    #[test]
-    fn validate_worker_count_guardrail() {
-        assert!(
-            validate_worker_counts(&[1, 100, 1_000, 2_000, MAX_WORKER_COUNT_GUARDRAIL]).is_ok()
-        );
-        assert!(validate_worker_counts(&[0]).is_err());
-        assert!(validate_worker_counts(&[MAX_WORKER_COUNT_GUARDRAIL + 1]).is_err());
-    }
-
-    #[test]
-    fn worker_rpc_summary_name() {
-        let s = BenchmarkSummary::from_samples(
-            "worker-rpc",
-            "local-dev",
-            "coordinator-rpc",
-            "unit",
-            vec![],
-            &[],
-            0.0,
-            json!({}),
-        );
-        assert_eq!(s.benchmark, "worker-rpc");
-    }
-
-    #[test]
-    fn logical_workers_with_target_and_no_start_coordinator_uses_external_mode() {
-        let mode =
-            resolve_logical_workers_coordinator_mode(Some("http://127.0.0.1:50051".into()), false)
-                .expect("external mode should resolve");
-        assert_eq!(
-            mode,
-            LogicalWorkersCoordinatorMode::External {
-                target: "http://127.0.0.1:50051".into()
-            }
-        );
-    }
-
-    #[test]
-    fn logical_workers_start_coordinator_uses_spawned_mode() {
-        let mode = resolve_logical_workers_coordinator_mode(Some("127.0.0.1:50051".into()), true)
-            .expect("spawned mode should resolve");
-        assert_eq!(
-            mode,
-            LogicalWorkersCoordinatorMode::Spawned {
-                target: "127.0.0.1:50051".into()
-            }
-        );
-    }
-
-    #[test]
-    fn logical_workers_missing_target_without_start_coordinator_fails_clearly() {
-        let err = resolve_logical_workers_coordinator_mode(None, false)
-            .expect_err("missing target should fail");
-        assert_eq!(
-            err,
-            "--target is required unless --start-coordinator is used"
-        );
-        assert!(!err.contains("runtime-coordinator exited before benchmark client connected"));
-    }
-}
-
 pub fn run_worker_rpc(
     workers: usize,
     heartbeats: usize,
@@ -910,24 +713,43 @@ fn resolve_logical_workers_coordinator_mode(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run_logical_workers(
-    target: Option<String>,
-    workers: usize,
-    duration_secs: u64,
-    concurrency: usize,
-    heartbeat_interval_ms: u64,
-    channels: usize,
-    shards: usize,
-    checkpoint_every_secs: u64,
-    checkpoint_artifacts_per_checkpoint: usize,
-    checkpoint_bytes: usize,
-    failure_rate: f64,
-    recover_failed_workers: bool,
-    start_coordinator: bool,
-) -> Result<BenchmarkSummary, String> {
+/// Everything `logical-workers` needs to run one benchmark.
+///
+/// Grouped into a struct rather than passed as thirteen positional arguments:
+/// the sync entry point, the async body, and the CLI all named the same list,
+/// so any change meant editing it in three places, and call sites were an
+/// unreadable wall of bare values.
+#[derive(Clone, Debug)]
+pub struct LogicalWorkersConfig {
+    /// Address of an already-running coordinator; `None` with
+    /// `start_coordinator` spawns a private one.
+    pub target: Option<String>,
+    pub workers: usize,
+    pub duration_secs: u64,
+    /// Upper bound on in-flight RPCs across all workers.
+    pub concurrency: usize,
+    pub heartbeat_interval_ms: u64,
+    /// Pooled HTTP/2 channels the worker tasks are spread across.
+    pub channels: usize,
+    pub shards: usize,
+    pub checkpoint_every_secs: u64,
+    pub checkpoint_artifacts_per_checkpoint: usize,
+    pub checkpoint_bytes: usize,
+    /// Fraction of workers to kill mid-run, for chaos coverage.
+    pub failure_rate: f64,
+    pub recover_failed_workers: bool,
+    pub start_coordinator: bool,
+}
+
+pub fn run_logical_workers(config: LogicalWorkersConfig) -> Result<BenchmarkSummary, String> {
     let runtime = Runtime::new().map_err(|e| e.to_string())?;
-    runtime.block_on(run_logical_workers_async(
+    runtime.block_on(run_logical_workers_async(config))
+}
+
+async fn run_logical_workers_async(
+    config: LogicalWorkersConfig,
+) -> Result<BenchmarkSummary, String> {
+    let LogicalWorkersConfig {
         target,
         workers,
         duration_secs,
@@ -941,25 +763,8 @@ pub fn run_logical_workers(
         failure_rate,
         recover_failed_workers,
         start_coordinator,
-    ))
-}
+    } = config;
 
-#[allow(clippy::too_many_arguments)]
-async fn run_logical_workers_async(
-    target: Option<String>,
-    workers: usize,
-    duration_secs: u64,
-    concurrency: usize,
-    heartbeat_interval_ms: u64,
-    channels: usize,
-    shards: usize,
-    checkpoint_every_secs: u64,
-    checkpoint_artifacts_per_checkpoint: usize,
-    checkpoint_bytes: usize,
-    failure_rate: f64,
-    recover_failed_workers: bool,
-    start_coordinator: bool,
-) -> Result<BenchmarkSummary, String> {
     validate_worker_counts(&[workers])?;
     let mode = resolve_logical_workers_coordinator_mode(target, start_coordinator)?;
     let (addr, mut child) = match mode {
@@ -1617,4 +1422,201 @@ async fn run_sharded_data_load_async(
             "start_coordinator": start_coordinator,
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn percentile_empty() {
+        assert_eq!(percentile_ms(&[], 0.5), 0.0);
+    }
+    #[test]
+    fn percentile_single() {
+        assert_eq!(percentile_ms(&[2.0], 0.9), 2.0);
+    }
+    #[test]
+    fn percentile_unsorted() {
+        let v = [9.0, 1.0, 5.0, 3.0];
+        assert_eq!(percentile_ms(&v, 0.5), 5.0);
+    }
+    #[test]
+    fn percentile_known() {
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        assert_eq!(percentile_ms(&v, 0.5), 6.0);
+        assert_eq!(percentile_ms(&v, 0.9), 10.0);
+        assert_eq!(percentile_ms(&v, 0.99), 10.0);
+    }
+    #[test]
+    fn summary_calc() {
+        let s = BenchmarkSummary::from_samples(
+            "x",
+            "local-dev",
+            "unit",
+            "test",
+            vec![],
+            &[
+                BenchmarkSample {
+                    latency_ms: 1.0,
+                    bytes: 100,
+                    success: true,
+                    retry_count: 0,
+                },
+                BenchmarkSample {
+                    latency_ms: 2.0,
+                    bytes: 0,
+                    success: false,
+                    retry_count: 0,
+                },
+            ],
+            10.0,
+            json!({}),
+        );
+        assert_eq!(s.operation_count, 2);
+        assert_eq!(s.failure_count, 1);
+    }
+    #[test]
+    fn csv_has_headers() {
+        let header = BenchmarkSummary::csv_header();
+        assert!(header.starts_with(
+            "benchmark,environment,surface,mode,caveats,timestamp_utc,operation_count"
+        ));
+    }
+    #[test]
+    fn dataset_small() {
+        let s = run_dataset_read(4, 64, 2, None, false).unwrap();
+        assert_eq!(s.operation_count, 4);
+    }
+    #[test]
+    fn checkpoint_write_small() {
+        let s = run_checkpoint_write(2, 128, 2, None, false).unwrap();
+        assert_eq!(s.success_count, 2);
+    }
+    #[test]
+    fn checkpoint_restore_small() {
+        let s = run_checkpoint_restore(3, 2, 128, 2, None, false).unwrap();
+        assert_eq!(s.operation_count, 3);
+    }
+
+    #[test]
+    fn parse_workers_list_ok() {
+        assert_eq!(
+            parse_workers_list("1,2,4,8,16").unwrap(),
+            vec![1, 2, 4, 8, 16]
+        );
+    }
+
+    #[test]
+    fn parse_workers_list_rejects_invalid() {
+        assert!(parse_workers_list("").is_err());
+        assert!(parse_workers_list("0").is_err());
+        assert!(parse_workers_list("-1").is_err());
+        assert!(parse_workers_list("abc").is_err());
+        assert!(parse_workers_list("1,,2").is_err());
+    }
+
+    #[test]
+    fn write_outputs_many_writes_multiple_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("bench.csv");
+        let json_path = dir.path().join("bench.json");
+        let summaries = vec![
+            BenchmarkSummary::from_samples(
+                "simulated-worker-rpc-1-workers",
+                "local-dev",
+                "coordinator-rpc",
+                "simulated",
+                vec![],
+                &[],
+                1.0,
+                json!({}),
+            ),
+            BenchmarkSummary::from_samples(
+                "simulated-worker-rpc-2-workers",
+                "local-dev",
+                "coordinator-rpc",
+                "simulated",
+                vec![],
+                &[],
+                2.0,
+                json!({}),
+            ),
+        ];
+        write_outputs_many(&summaries, Some(&csv_path), Some(&json_path)).unwrap();
+        let csv = fs::read_to_string(csv_path).unwrap();
+        assert!(csv.contains("simulated-worker-rpc-1-workers"));
+        assert!(csv.contains("simulated-worker-rpc-2-workers"));
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(json_path).unwrap()).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn scaling_summary_name() {
+        assert_eq!(scaling_benchmark_name(16, false), "worker-rpc-16-workers");
+        assert_eq!(
+            scaling_benchmark_name(64, true),
+            "simulated-worker-rpc-64-workers"
+        );
+    }
+
+    #[test]
+    fn validate_worker_count_guardrail() {
+        assert!(
+            validate_worker_counts(&[1, 100, 1_000, 2_000, MAX_WORKER_COUNT_GUARDRAIL]).is_ok()
+        );
+        assert!(validate_worker_counts(&[0]).is_err());
+        assert!(validate_worker_counts(&[MAX_WORKER_COUNT_GUARDRAIL + 1]).is_err());
+    }
+
+    #[test]
+    fn worker_rpc_summary_name() {
+        let s = BenchmarkSummary::from_samples(
+            "worker-rpc",
+            "local-dev",
+            "coordinator-rpc",
+            "unit",
+            vec![],
+            &[],
+            0.0,
+            json!({}),
+        );
+        assert_eq!(s.benchmark, "worker-rpc");
+    }
+
+    #[test]
+    fn logical_workers_with_target_and_no_start_coordinator_uses_external_mode() {
+        let mode =
+            resolve_logical_workers_coordinator_mode(Some("http://127.0.0.1:50051".into()), false)
+                .expect("external mode should resolve");
+        assert_eq!(
+            mode,
+            LogicalWorkersCoordinatorMode::External {
+                target: "http://127.0.0.1:50051".into()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_workers_start_coordinator_uses_spawned_mode() {
+        let mode = resolve_logical_workers_coordinator_mode(Some("127.0.0.1:50051".into()), true)
+            .expect("spawned mode should resolve");
+        assert_eq!(
+            mode,
+            LogicalWorkersCoordinatorMode::Spawned {
+                target: "127.0.0.1:50051".into()
+            }
+        );
+    }
+
+    #[test]
+    fn logical_workers_missing_target_without_start_coordinator_fails_clearly() {
+        let err = resolve_logical_workers_coordinator_mode(None, false)
+            .expect_err("missing target should fail");
+        assert_eq!(
+            err,
+            "--target is required unless --start-coordinator is used"
+        );
+        assert!(!err.contains("runtime-coordinator exited before benchmark client connected"));
+    }
 }

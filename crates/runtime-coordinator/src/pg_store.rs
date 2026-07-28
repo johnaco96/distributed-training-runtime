@@ -82,8 +82,9 @@ CREATE TABLE IF NOT EXISTS runs (
   idempotency_key      TEXT
 );
 
--- Run lifecycle columns (idempotent for databases created before they existed;
--- a real migration framework lands with the Phase 6 storage work).
+-- Run lifecycle columns.  Idempotent so a database created before these
+-- columns existed converges on the baseline; the versioned ledger below then
+-- records it as v1.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS run_state INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS state_reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS world_size INTEGER NOT NULL DEFAULT 0;
@@ -160,7 +161,7 @@ CREATE TABLE IF NOT EXISTS latest_checkpoints (
   committed_at_millis  BIGINT NOT NULL
 );
 
--- Gap 1: shard progress — enables resume-from-mid-shard across coordinator restarts
+-- shard progress — enables resume-from-mid-shard across coordinator restarts
 CREATE TABLE IF NOT EXISTS shard_progress (
   run_id             TEXT NOT NULL,
   dataset_id         TEXT NOT NULL,
@@ -173,9 +174,9 @@ CREATE TABLE IF NOT EXISTS shard_progress (
   PRIMARY KEY (run_id, dataset_id, shard_id)
 );
 
--- Gap 2: per-worker checkpoint commit votes (distributed 2PC)
--- Full-hydration columns (idempotent for databases created before they
--- existed; a real migration framework lands with the Phase 6 storage work).
+-- Full-hydration columns.  Idempotent so a database created before these
+-- columns existed converges on the baseline; the versioned ledger below then
+-- records it as v1.
 ALTER TABLE workers ADD COLUMN IF NOT EXISTS host TEXT NOT NULL DEFAULT '';
 ALTER TABLE workers ADD COLUMN IF NOT EXISTS sdk_version TEXT NOT NULL DEFAULT '';
 ALTER TABLE workers ADD COLUMN IF NOT EXISTS protocol_version TEXT NOT NULL DEFAULT '';
@@ -201,6 +202,7 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   PRIMARY KEY (scope, key)
 );
 
+-- per-worker checkpoint commit votes (distributed 2PC)
 CREATE TABLE IF NOT EXISTS checkpoint_commits (
   run_id              TEXT NOT NULL,
   checkpoint_id       TEXT NOT NULL,
@@ -209,7 +211,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_commits (
   PRIMARY KEY (run_id, checkpoint_id, worker_id)
 );
 
--- Gap 5: durable audit log
+-- durable audit log
 CREATE TABLE IF NOT EXISTS audit_events (
   id                 BIGSERIAL PRIMARY KEY,
   occurred_at_millis BIGINT NOT NULL,
@@ -229,8 +231,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
         .execute(&self.pool)
         .await?;
 
-        // Versioned migration ledger (parallels the SQLite store; see
-        // docs/schema-migrations.md).  The baseline DDL above is idempotent
+        // Versioned migration ledger, parallelling the SQLite store's
+        // SQLITE_MIGRATIONS in persistence.rs.  The baseline DDL above is idempotent
         // (CREATE ... IF NOT EXISTS / ADD COLUMN IF NOT EXISTS), so recording
         // v1 after it converges both fresh and pre-ledger databases.
         sqlx::raw_sql(
@@ -270,6 +272,41 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
             .fetch_one(&self.pool)
             .await?;
         Ok(row.0)
+    }
+
+    /// Load a checkpoint's artifacts, ordered deterministically.
+    ///
+    /// Shared by `load_latest_checkpoint` and `load_checkpoints_for_run`; the
+    /// stable `(worker_id, artifact_name)` ordering is part of the contract,
+    /// since callers derive `expected_worker_ids` from this list.
+    async fn load_artifacts(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<Vec<ArtifactRecord>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows: Vec<(String, String, String, i64, String, String)> = sqlx::query_as(
+            "SELECT worker_id, artifact_name, artifact_uri, size_bytes, checksum, checksum_algorithm \
+             FROM checkpoint_artifacts \
+             WHERE run_id = $1 AND checkpoint_id = $2 \
+             ORDER BY worker_id, artifact_name",
+        )
+        .bind(run_id)
+        .bind(checkpoint_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(wid, name, uri, size, cksum, algo)| ArtifactRecord {
+                worker_id: DomainWorkerId(wid),
+                artifact_name: name,
+                storage_key: uri,
+                size_bytes: size as u64,
+                checksum: cksum,
+                checksum_algorithm: algo,
+            })
+            .collect())
     }
 
     /// Helper: run an async closure synchronously inside a Tokio worker thread.
@@ -680,31 +717,7 @@ ON CONFLICT (run_id) DO UPDATE SET
                 return Ok(None);
             };
 
-            // Load artifacts.
-            let artifact_rows: Vec<(String, String, String, i64, String, String)> =
-                sqlx::query_as(
-                    "SELECT worker_id, artifact_name, artifact_uri, size_bytes, checksum, checksum_algorithm \
-                     FROM checkpoint_artifacts \
-                     WHERE run_id = $1 AND checkpoint_id = $2 \
-                     ORDER BY worker_id, artifact_name",
-                )
-                .bind(run_id)
-                .bind(&checkpoint_id)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-            let artifacts: Vec<ArtifactRecord> = artifact_rows
-                .into_iter()
-                .map(|(wid, name, uri, size, cksum, algo)| ArtifactRecord {
-                    worker_id: DomainWorkerId(wid),
-                    artifact_name: name,
-                    storage_key: uri,
-                    size_bytes: size as u64,
-                    checksum: cksum,
-                    checksum_algorithm: algo,
-                })
-                .collect();
+            let artifacts = self.load_artifacts(run_id, &checkpoint_id).await?;
 
             let expected_worker_ids = artifacts
                 .iter()
@@ -747,28 +760,7 @@ ON CONFLICT (run_id) DO UPDATE SET
 
             let mut records = Vec::with_capacity(rows.len());
             for (checkpoint_id, step, state, created, updated, committed_at, initiator) in rows {
-                let artifact_rows: Vec<(String, String, String, i64, String, String)> =
-                    sqlx::query_as(
-                        "SELECT worker_id, artifact_name, artifact_uri, size_bytes, checksum, checksum_algorithm \
-                         FROM checkpoint_artifacts WHERE run_id = $1 AND checkpoint_id = $2 \
-                         ORDER BY worker_id, artifact_name",
-                    )
-                    .bind(run_id)
-                    .bind(&checkpoint_id)
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-                let artifacts: Vec<ArtifactRecord> = artifact_rows
-                    .into_iter()
-                    .map(|(wid, name, uri, size, cksum, algo)| ArtifactRecord {
-                        worker_id: DomainWorkerId(wid),
-                        artifact_name: name,
-                        storage_key: uri,
-                        size_bytes: size as u64,
-                        checksum: cksum,
-                        checksum_algorithm: algo,
-                    })
-                    .collect();
+                let artifacts = self.load_artifacts(run_id, &checkpoint_id).await?;
                 let expected_worker_ids: Vec<String> =
                     artifacts.iter().map(|a| a.worker_id.0.clone()).collect();
                 records.push(CoordinatorCheckpointRecord {
@@ -857,7 +849,7 @@ ON CONFLICT (run_id) DO UPDATE SET
         })
     }
 
-    // ── Gap 1: shard progress ────────────────────────────────────────────────
+    // ── shard progress ───────────────────────────────────────────────────────
 
     fn save_shard_progress(&self, p: &ShardProgressEntry) -> PersistResult<()> {
         self.block(async {
@@ -922,7 +914,7 @@ ON CONFLICT (run_id, dataset_id, shard_id) DO UPDATE SET
         })
     }
 
-    // ── Gap 2: checkpoint commit votes ───────────────────────────────────────
+    // ── checkpoint commit votes ──────────────────────────────────────────────
 
     fn record_checkpoint_commit(
         &self,
@@ -963,7 +955,7 @@ ON CONFLICT (run_id, checkpoint_id, worker_id) DO NOTHING
         })
     }
 
-    // ── Gap 5: durable audit log ─────────────────────────────────────────────
+    // ── durable audit log ────────────────────────────────────────────────────
 
     fn save_idempotency_key(&self, scope: &str, key: &str, value: &str) -> PersistResult<()> {
         self.block(async {

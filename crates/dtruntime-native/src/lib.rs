@@ -142,6 +142,12 @@ unsafe fn fill_buffer(
     Ok(())
 }
 
+// F32Buffer and I32Buffer below are deliberately near-identical: `#[pyclass]`
+// cannot be generic, so each element type needs its own concrete class. All the
+// unsafe work lives once in `fill_buffer` — what repeats is only the typed
+// wrapper (element size and format code). A macro for two instantiations would
+// cost more readability than the duplication does.
+
 /// Contiguous little-endian f32 array exported via the buffer protocol.
 #[pyclass(frozen, module = "dtruntime._native")]
 struct F32Buffer {
