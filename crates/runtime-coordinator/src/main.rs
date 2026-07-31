@@ -18,8 +18,8 @@ use runtime_coordinator::audit::{
 use runtime_coordinator::auth::{AuthMode, Authenticator};
 use runtime_coordinator::ha_lock::CoordinatorLockGuard;
 use runtime_coordinator::init_tracing_from_env;
+use runtime_coordinator::persistence::PostgresMetadataStore;
 use runtime_coordinator::persistence::{MetadataStore, SqliteMetadataStore};
-use runtime_coordinator::pg_store::PostgresMetadataStore;
 use runtime_coordinator::security::jwt::{JwtConfig, JwtValidator};
 use runtime_coordinator::security::keyset::{KeySource, ReloadableKeySet};
 use runtime_coordinator::security::spiffe::SpiffePolicy;

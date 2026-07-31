@@ -97,7 +97,7 @@ pub struct CoordinatorState {
 
     placement_policy: DatasetPlacementPolicy,
     /// Optional persistence back-end.  Either [`SqliteMetadataStore`] (single-
-    /// node) or [`crate::pg_store::PostgresMetadataStore`] (distributed HA).
+    /// node) or [`crate::persistence::PostgresMetadataStore`] (distributed HA).
     /// Wrapped in Arc so it can be shared with the audit sink.
     metadata_store: Option<Arc<dyn MetadataStore>>,
     next_run_id: AtomicU64,

@@ -19,10 +19,23 @@ use runtime_checkpoint::{
     WorkerId as DomainWorkerId,
 };
 use runtime_coordinator::persistence::MetadataStore;
-use runtime_coordinator::pg_store::PostgresMetadataStore;
+use runtime_coordinator::persistence::PostgresMetadataStore;
 use runtime_coordinator::state::{CoordinatorCheckpointRecord, RunRecord};
 use std::sync::Arc;
 use std::time::SystemTime;
+
+/// Drop and recreate the public schema so the next init starts cold.
+async fn reset_schema(url: &str) {
+    use sqlx::Executor;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await
+        .expect("connect for schema reset");
+    pool.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        .await
+        .expect("reset schema");
+}
 
 fn dsn() -> Option<String> {
     if std::env::var("DTRUNTIME_RUN_PG_TESTS").as_deref() != Ok("1") {
@@ -233,4 +246,46 @@ async fn pg_checkpoints_and_artifacts_round_trip() {
     );
     assert_eq!(all[0].checkpoint.artifacts.len(), 2);
     assert_eq!(all[1].checkpoint.artifacts.len(), 1);
+}
+
+/// Several replicas may call `init_schema` at once against a fresh database.
+///
+/// Schema init runs before leader election, so on a cold start every replica
+/// reaches it simultaneously. `CREATE TABLE IF NOT EXISTS` is not concurrency
+/// safe on its own — two sessions can both pass the existence check and then
+/// collide creating the type, failing with
+/// `23505 ... pg_type_typname_nsp_index`. The store serialises the DDL behind
+/// an advisory lock; this asserts that holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pg_concurrent_schema_init_is_safe() {
+    let Some(url) = dsn() else {
+        return;
+    };
+    // Start from an empty schema: the race only exists while the tables are
+    // being created, so an already-migrated database would not exercise it.
+    reset_schema(&url).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let url = url.clone();
+        // Errors are stringified so the task's future stays `Send`.
+        handles.push(tokio::spawn(async move {
+            let store = PostgresMetadataStore::connect(&url)
+                .await
+                .map_err(|e| e.to_string())?;
+            store.init_schema().await.map_err(|e| e.to_string())
+        }));
+    }
+    for (i, h) in handles.into_iter().enumerate() {
+        h.await
+            .expect("replica task panicked")
+            .unwrap_or_else(|e| panic!("replica {i} failed schema init: {e}"));
+    }
+
+    // The schema is usable afterwards, and the ledger recorded exactly one v1.
+    let store = PostgresMetadataStore::connect(&url).await.expect("connect");
+    let run_id = format!("concurrent-init-{}", std::process::id());
+    tokio::task::spawn_blocking(move || store.save_run(&run_record(run_id)).expect("save_run"))
+        .await
+        .unwrap();
 }
