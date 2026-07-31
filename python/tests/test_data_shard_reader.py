@@ -1,4 +1,4 @@
-"""Unit tests for dtruntime.shard_reader — no live coordinator or S3 required."""
+"""Unit tests for dtruntime.data.shard_reader — no live coordinator or S3 required."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pytest
 
 torch = pytest.importorskip("torch")  # this module exercises tensor I/O
 
-from dtruntime.shard_reader import (
+from dtruntime.data.shard_reader import (
     HEADER_SIZE,
     ShardBatch,
     ShardHeader,

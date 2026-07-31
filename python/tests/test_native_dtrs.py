@@ -22,7 +22,7 @@ _native = pytest.importorskip(
 )
 
 from dtruntime.data.formats import get_format
-from dtruntime.shard_reader import ShardReader, generate_shard_bytes, native_module
+from dtruntime.data.shard_reader import ShardReader, generate_shard_bytes, native_module
 
 
 @pytest.fixture()

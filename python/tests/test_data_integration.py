@@ -71,9 +71,9 @@ def test_two_rank_streaming_covers_dataset_once(tmp_path: Path) -> None:
     import numpy as np
     from dtruntime import connect
     from dtruntime.data import DistributedShardDataset, compute_dataset_version
+    from dtruntime.data.shard_writer import build_and_write_shards
     from dtruntime.data.versioning import register_versioned_dataset
     from dtruntime.generated import runtime_pb2
-    from dtruntime.shard_loader import build_and_write_shards
 
     proc, address = _start_coordinator(tmp_path)
     client = None

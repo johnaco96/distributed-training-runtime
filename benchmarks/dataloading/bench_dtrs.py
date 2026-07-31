@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
 from dtruntime.data.formats import get_format  # noqa: E402
-from dtruntime.shard_reader import (  # noqa: E402
+from dtruntime.data.shard_reader import (  # noqa: E402
     ShardReader,
     generate_shard_bytes,
     native_module,

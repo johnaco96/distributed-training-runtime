@@ -13,7 +13,7 @@
 //!   client, file:// or plain path), SHA-256-verified, and decoded
 //!   concurrently on Rust threads while Python consumes the current one.
 //!
-//! The DTRS v1 layout (spec: `python/dtruntime/shard_reader.py`):
+//! The DTRS v1 layout (spec: `python/dtruntime/data/shard_reader.py`):
 //! 32-byte header (`DTRS` magic, u32 version=1, u32 record_count,
 //! u32 input_dim, u32 num_classes, 12 reserved bytes), then fixed-stride
 //! records of `input_dim` little-endian f32 features + one i32 label.

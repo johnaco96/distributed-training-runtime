@@ -13,8 +13,8 @@ dict into whatever the training loop wants (usually tensors); a default
 Built-in formats
 ----------------
 * ``npz``        — numpy ``.npz`` with ``features`` (2-D) + ``labels`` (1-D);
-                   the format written by :func:`dtruntime.shard_loader.write_shard_file`.
-* ``dtrs``       — the DTRS v1 binary format from :mod:`dtruntime.shard_reader`.
+                   the format written by :func:`dtruntime.data.shard_writer.write_shard_file`.
+* ``dtrs``       — the DTRS v1 binary format from :mod:`dtruntime.data.shard_reader`.
 * ``jsonl``      — one JSON object per line.
 * ``parquet``    — Apache Parquet (requires ``pyarrow``); streamed by row group.
 * ``webdataset`` — POSIX tar of grouped files (``key.cls``, ``key.jpg`` ...),
@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, Iterator, Optional, Protocol, runtime_ch
 
 # shard_reader owns the DTRS v1 wire format; import it rather than restating
 # the layout here. It has no torch import at module scope, so this stays cheap.
-from dtruntime.shard_reader import (
+from dtruntime.data.shard_reader import (
     HEADER_SIZE,
     ShardHeader,
     native_module,
@@ -124,7 +124,7 @@ class DtrsFormat:
     def _header(self, path: Path) -> ShardHeader:
         """Parse the shard's DTRS header.
 
-        Delegates to :mod:`dtruntime.shard_reader`, which owns the format
+        Delegates to :mod:`dtruntime.data.shard_reader`, which owns the format
         definition — this must not re-implement it, or the two copies drift.
         """
         with open(path, "rb") as f:

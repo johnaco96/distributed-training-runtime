@@ -71,9 +71,9 @@ def main() -> int:
     from dtruntime import connect
     from dtruntime.data import DistributedShardDataset
     from dtruntime.data.formats import features_label_transform
+    from dtruntime.data.shard_writer import build_and_write_shards
     from dtruntime.data.versioning import register_versioned_dataset
     from dtruntime.generated import runtime_pb2
-    from dtruntime.shard_loader import build_and_write_shards
     from torch.utils.data import DataLoader
 
     proc = None
