@@ -155,6 +155,8 @@ dtruntime-admin --help                               # inspect/manage runs from 
 ```
 
 Integrate your own script in a few lines: **[docs/pytorch-integration.md](docs/pytorch-integration.md)**.
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Please report
+security issues through the private process in [SECURITY.md](SECURITY.md).
 
 ## Operational surface
 
@@ -171,7 +173,7 @@ Beyond the training path, the coordinator ships the pieces a control plane needs
 
 ## Scaling to production
 
-This branch is a **clean, focused prototype** — it proves the hard distributed-systems parts work, and everything above is validated locally, not against a managed cloud identity provider or a multi-node cluster. The remaining distance to a real cluster is mostly *deployment* surface: a Kubernetes operator, Helm packaging, SLO/alerting rules, image signing, and Volcano/Kueue scheduling integration. A **full implementation of all of it lives on the [`production-hardening`](../../tree/production-hardening) branch**; see **[docs/PATH-TO-PRODUCTION.md](docs/PATH-TO-PRODUCTION.md)** for the map from here to there.
+This branch is a **clean, focused prototype** — it proves the hard distributed-systems parts work, and everything above is validated locally, not against a managed cloud identity provider or a multi-node cluster. The remaining distance to a real cluster is mostly *deployment* surface: a Kubernetes operator, Helm packaging, SLO/alerting rules, image signing, and Volcano/Kueue scheduling integration. A **full implementation of all of it lives on the [`production-hardening`](https://github.com/johnaco96/distributed-training-runtime/tree/production-hardening) branch**; see **[docs/PATH-TO-PRODUCTION.md](docs/PATH-TO-PRODUCTION.md)** for the map from here to there.
 
 ## Status & honest limits
 

@@ -19,6 +19,10 @@ dist/
 build/
 *.egg-info/
 
+# Tool-specific local settings and generated validation evidence.
+.claude/settings.local.json
+/tools/evidence/
+
 # The optional Rust accelerator, built by scripts/build_native.py. Never
 # committed: it is a per-platform binary.
 python/dtruntime/_native.so

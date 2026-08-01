@@ -25,16 +25,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Rustfmt
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
 
       # dtruntime-native (PyO3 extension) is excluded: its build needs a
       # CPython >= 3.11 interpreter and it is exercised by the Python test
       # suite below via scripts/build_native.py instead.
       - name: Clippy
-        run: cargo clippy --workspace --exclude dtruntime-native --all-targets --features s3 -- -D warnings
+        run: cargo clippy --workspace --exclude dtruntime-native --all-targets --all-features -- -D warnings
 
       - name: Rust tests
-        run: cargo test --workspace --exclude dtruntime-native
+        run: cargo test --workspace --exclude dtruntime-native --all-features
 
       - name: Storage integration tests (MinIO + Postgres)
         run: |
@@ -80,6 +80,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev,parquet,s3]"
           pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Audit Python runtime dependencies
+        run: python -m pip_audit .
+
+      - name: Python lint
+        run: python -m ruff check .
+
+      - name: Build Python distributions
+        run: python -m build
 
       - name: Build Rust accelerator (dtruntime._native)
         run: python scripts/build_native.py

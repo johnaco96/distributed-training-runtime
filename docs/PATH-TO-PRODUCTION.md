@@ -9,7 +9,7 @@ leaves out the *deployment* layers (Kubernetes, Helm, operator, alerting rules,
 release signing) so the core stays easy to read and obviously works.
 
 A **full, production-hardened implementation of everything below already exists**
-on the [`production-hardening`](../../tree/production-hardening) branch — this
+on the [`production-hardening`](https://github.com/johnaco96/distributed-training-runtime/tree/production-hardening) branch — this
 document is the map from the prototype to that, in the order you'd actually
 tackle it.
 

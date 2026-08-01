@@ -107,6 +107,10 @@ def _run_launcher(
             "DTRUNTIME_TEST_DIR": str(test_dir),
             "DTRUNTIME_HEARTBEAT_INTERVAL": "1",
             "DTRUNTIME_TEST_GRACE": "120",
+            # A crashed peer can leave the survivor blocked inside a collective.
+            # Keep that wait comfortably below this helper's own timeout; the
+            # production default is intentionally much more conservative.
+            "DTRUNTIME_PG_TIMEOUT": "30",
             # Keep everything on loopback so hostname resolution quirks on CI
             # machines cannot break store connectivity.
             "DTRUNTIME_WORKER_HOST": "127.0.0.1",
