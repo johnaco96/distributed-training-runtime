@@ -3,12 +3,25 @@
 [![CI](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/ci.yml)
 [![Compatibility](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/compat.yml/badge.svg?branch=main)](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/compat.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/johnaco96/distributed-training-runtime/blob/main/LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9%E2%80%933.12-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](Cargo.toml)
+[![Quickstart](https://img.shields.io/badge/Quickstart-run_the_demo-2ea44f)](#see-it-work-in-one-command)
+[![Architecture](https://img.shields.io/badge/Architecture-design_%26_flows-8250df)](docs/architecture.md)
+[![Documentation](https://img.shields.io/badge/Documentation-guides-0969da)](docs/quickstart.md)
 
 A **high-performance runtime for distributed PyTorch training** — a Rust core + Python SDK that manage worker rendezvous, rank assignment, sharded data loading, checkpointing to object storage, and elastic recovery when the launcher can replace a failed worker. The Python API stays a handful of lines. The control plane runs in Rust; optional native components accelerate shard I/O and worker-direct checkpoint transfer, with Python fallbacks when they are not built.
 
 It is *not* a training framework (it uses `torch.distributed`) and *not* a GPU scheduler. It supplies coordination and data paths that an elastic training loop can use to replace a failed worker and restore the last committed checkpoint; work after that checkpoint is replayed.
 
 **Measured in the documented local benchmark runs** (details, environment, and repro commands in [Performance](#performance-measured)): the coordinator handled **5,000 simulated workers at ~99k RPC/s** (p99 25 ms, zero failed RPCs); the optional Rust data plane loaded shards at **~1M records/s (2 GB/s), 5.8× the pure-Python path**, with a zero-copy buffer handoff; and the worker-direct checkpoint path restored from S3 after its local staging files were deleted. Results are not multi-node production measurements.
+
+<p align="center">
+  <img src="docs/assets/architecture-flow.gif" width="960" alt="Animated architecture flow showing training workers registering with the Rust coordinator, receiving rank and shard metadata, using worker-direct S3 data paths, reporting checkpoint metadata and votes, detecting worker loss, re-forming the process group, and restoring globally committed state. The portable DCP path may route checkpoint artifacts through the coordinator.">
+</p>
+<p align="center">
+  <a href="docs/assets/architecture-flow.png">Static architecture image</a> ·
+  <a href="docs/architecture.md">Architecture details</a>
+</p>
 
 ## See it work in one command
 
