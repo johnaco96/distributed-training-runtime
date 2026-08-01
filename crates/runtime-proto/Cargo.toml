@@ -10,4 +10,4 @@ prost-types = "0.13"
 tonic = { version = "0.12", default-features = false, features = ["codegen", "transport", "prost"] }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14"
