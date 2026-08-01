@@ -10,6 +10,41 @@ updates:
       # Batch low-risk patch/minor bumps into a single PR to reduce churn.
       rust-minor-and-patch:
         update-types: ["minor", "patch"]
+    # Major bumps are proposed but not automated here.
+    #
+    # Every one opened against this workspace has been a breaking change that
+    # fails CI on its own: prost, prost-types and tonic-build must move as a
+    # set or codegen breaks, and pyo3 majors churn the raw `ffi::` surface that
+    # dtruntime-native's zero-copy buffer protocol depends on. Left enabled,
+    # they reopen weekly and accumulate as red PRs that make a healthy repo
+    # look unmaintained.
+    #
+    # Note `0.x` crates: Cargo treats a `0.x` minor as breaking, but Dependabot
+    # classifies it as `semver-minor`, so those are pinned individually below.
+    # Only breaking updates are ignored; patch releases still come through, so
+    # a security fix is never silently blocked.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+      # 0.x crates, where Cargo treats a minor bump as breaking.
+      - dependency-name: "prost"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "prost-types"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "tonic"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "tonic-build"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "pyo3"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "rusqlite"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "sqlx"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "x509-parser"
+        update-types: ["version-update:semver-minor"]
     labels: ["dependencies", "rust"]
 
   # Python SDK dependencies.

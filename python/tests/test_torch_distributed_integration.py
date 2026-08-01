@@ -195,6 +195,10 @@ def test_cancel_run_stops_training_without_restart(tmp_path: Path) -> None:
                 "DTRUNTIME_WORKER_HOST": "127.0.0.1",
                 # ~0.1s per step x 3000 steps: training stays busy until cancelled.
                 "DTRUNTIME_TEST_STEP_DELAY": "0.1",
+                # Same reasoning as the failover test: whichever rank notices the
+                # cancellation first leaves its peer blocked inside a collective,
+                # and at the 300s default that outlasts this test's 120s budget.
+                "DTRUNTIME_PG_TIMEOUT": "30",
             }
         )
         launcher = subprocess.Popen(
@@ -261,6 +265,13 @@ def test_coordinator_restart_mid_training_is_transparent(tmp_path: Path) -> None
                 "DTRUNTIME_WORKER_HOST": "127.0.0.1",
                 # ~40s of training: enough to cover the coordinator outage.
                 "DTRUNTIME_TEST_STEP_DELAY": "0.1",
+                # Bound the process-group timeout well under this test's own
+                # 300s budget for the launcher. Left at the 300s default, a
+                # single TCPStore reconnect during the coordinator restart
+                # blocks inside torch for the entire budget, so the test can
+                # never finish — it passes only when the reconnect happens to
+                # be immediate. That made it flaky on CI runners.
+                "DTRUNTIME_PG_TIMEOUT": "30",
             }
         )
         launcher = subprocess.Popen(
