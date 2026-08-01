@@ -16,7 +16,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # tls-native-tls enables TLS for postgres:// connections.
 # macros is NOT included — we use the runtime-checked query() API so the build
 # does not require a live database connection.
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
@@ -45,7 +45,7 @@ tempfile = "3"
 # The Postgres integration test resets the schema between runs so it can
 # exercise cold-start behaviour; that needs raw DDL, which the store's public
 # API deliberately does not expose.
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-native-tls",
     "postgres",
