@@ -1,11 +1,11 @@
 """Multi-node data locality and DataLoader-worker sharding.
 
-Two levels of splitting keep every record read exactly once per epoch with no
-cross-node data movement:
+In a failure-free epoch with a fixed world size and rank mapping, two levels of
+splitting give each record one reader and avoid cross-node data movement:
 
 1. **Rank locality (across nodes)** — the coordinator assigns each rank a
-   *stable* subset of shards (``shard_index % world_size == rank``).  The
-   subset does not change between epochs, so a rank streams only its own
+   deterministic subset of shards (``shard_index % world_size == rank``).  For
+   the same mapping, the subset does not change between epochs, so a rank streams only its own
    shards from its **local** cache; nothing is shuffled *between* nodes.  Only
    the visiting order changes per epoch (see :mod:`dtruntime.data.shuffle`).
 
@@ -14,7 +14,7 @@ cross-node data movement:
    slice of the rank's shards, or records would be duplicated N times.
    :func:`split_for_dataloader_worker` partitions the rank's shards by worker.
 
-The stable rank→shard mapping is what makes the disk cache worth having: a
+The fixed rank→shard mapping is what makes the disk cache worth having: a
 warm cache from a previous epoch (or a resumed run) is reused instead of
 re-downloaded.
 """

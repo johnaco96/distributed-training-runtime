@@ -2,17 +2,17 @@
 
 :class:`DistributedCheckpointer` saves model + optimizer state through DCP's
 sharded state-dict format and stores the resulting files as coordinator
-checkpoint artifacts under two-phase commit.  Because the on-disk format is
-DCP's, restores **reshard automatically across world sizes and parallelism
-strategies** — save from 4 FSDP ranks and restore into 2 DDP ranks, or vice
-versa.
+checkpoint artifacts under two-phase commit. DCP can reshard state across
+world sizes; this repository's integration coverage validates a two-rank DDP
+save restored by one rank. Cross-strategy restores are not validated here.
 
 Guarantees and behavior:
 
 - **Atomicity** — a checkpoint is restorable only after every rank's artifacts
   are uploaded and every rank has voted to commit (coordinator 2PC).  A crash
-  mid-upload leaves a partial checkpoint that is never selected for restore
-  and is garbage-collected by retention.
+  mid-upload leaves a partial checkpoint that is never selected for restore.
+  Failed/aborted attempts can be collected after a newer commit; attempts
+  stuck in a nonterminal state are not aged out automatically.
 - **Partial-upload recovery** — ``save`` retries failed artifact uploads;
   re-streaming an artifact is idempotent (same name, same bytes).
 - **Corruption handling** — every artifact download is checksum-verified

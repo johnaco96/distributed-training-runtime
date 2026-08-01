@@ -105,6 +105,9 @@ python demo/run_demo.py
 Or drive the underlying example directly through the launcher:
 
 ```bash
+# Keep this coordinator running in a separate terminal first:
+cargo run -p runtime-coordinator -- --addr 127.0.0.1:50051
+
 python -m dtruntime.launch --coordinator 127.0.0.1:50051 --run-name smoke \
     --nproc-per-node 2 python/examples/pytorch_ddp_train.py -- --steps 20
 ```

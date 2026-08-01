@@ -2,9 +2,10 @@
 
 How the Distributed Training Runtime is structured and how the pieces
 interact. The system is deliberately split into a **control plane** (the Rust
-coordinator: decisions and metadata) and a **data plane** (Rust I/O paths on
-the workers: shard and checkpoint bytes). On the S3 path, no artifact byte
-ever crosses the coordinator.
+coordinator: decisions and metadata) and a **data plane** (worker-side I/O
+paths, optionally accelerated by Rust). In worker-direct `AsyncCheckpointer`
+S3 mode, artifact bytes bypass the coordinator. The portable DCP path streams
+artifacts through coordinator RPCs.
 
 ## Main components
 
@@ -12,8 +13,8 @@ ever crosses the coordinator.
 The authoritative control-plane service (tokio + tonic gRPC): run/worker
 registration, heartbeat-based failure detection, round-based rendezvous with
 stable rank assignment, dataset registration and per-rank shard assignment,
-the two-phase checkpoint commit, and durable metadata (SQLite for dev,
-PostgreSQL for HA — rehydrated on restart). A periodic reconcile task marks
+the two-phase checkpoint commit, and durable metadata (SQLite for dev;
+PostgreSQL with advisory-lock leader/standby — rehydrated on restart). A periodic reconcile task marks
 silent workers stale/failed, detects stuck runs, and enforces checkpoint
 retention. Requests pass through a layered authenticator (JWT/OIDC → SPIFFE
 peer certs → dev metadata headers) with role-based authorization and
@@ -91,7 +92,7 @@ flowchart LR
       S3[S3 / MinIO / local FS]
     end
 
-    SDK -->|gRPC: control + metadata only| COORD
+    SDK -->|gRPC: control + portable DCP artifacts| COORD
     COORD --> META
     SDK --> NATIVE
     SDK --> UP
@@ -131,10 +132,13 @@ clusters.
 
 **Worker-direct S3 mode (`AsyncCheckpointer`):** training blocks only for
 the in-memory snapshot; a background pipeline serializes to local staging,
-streams the artifact to S3 through `runtime-uploader`, reports
+streams the artifact to S3 through `runtime-uploader` when that optional
+binary is available (or boto3 otherwise), reports
 `{uri, size, sha256}` to the coordinator, and casts the 2PC vote. Restore
 prefers the local staged copy (checksum-verified) and otherwise streams the
-artifact back from S3, failing loudly on any manifest checksum mismatch.
+artifact back from S3, failing loudly on any manifest checksum mismatch. The
+Rust downloader writes to `.part` and renames on success; the boto3 fallback
+does not provide that same temporary-file behavior.
 The coordinator handles metadata and votes only.
 
 ```mermaid
@@ -153,17 +157,19 @@ stateDiagram-v2
 shards are fetched through the LRU disk cache (S3 or file) → DTRS shards
 decode through `_native` when built (one GIL-released pass, zero-copy
 tensors) or pure Python otherwise → records stream to the training loop with
-bounded-queue backpressure. Progress is reported back so a restarted worker
-resumes mid-shard. Measured A/B numbers:
+bounded-queue backpressure. Progress is reported as a best-effort resume hint;
+it is not an exactly-once consumption cursor. Measured A/B numbers:
 [benchmarks/data-plane-throughput.md](benchmarks/data-plane-throughput.md).
 
 ## Current boundaries
 
-- Single-coordinator control plane (PostgreSQL + advisory-lock HA exists;
-  full multi-replica failover coverage lives on `production-hardening`).
+- Single-leader control plane (PostgreSQL advisory-lock leader/standby exists;
+  broader deployment and failover assets live on `production-hardening`).
 - Scale numbers are single-machine/loopback protocol-level measurements —
   see the benchmark docs for exact caveats.
 - Not yet validated on a multi-node GPU cluster (same rendezvous/NCCL path,
   unproven claim — stated in the README too).
-- Kubernetes/Helm/observability/security hardening live on the
-  [`production-hardening`](PATH-TO-PRODUCTION.md) branch, not here.
+- Broader Kubernetes/Helm, operator, alerting, security-evidence, and release
+  assets live on the [`production-hardening`](PATH-TO-PRODUCTION.md) branch.
+  Both branches remain locally validated prototypes rather than
+  production-proven deployments.
