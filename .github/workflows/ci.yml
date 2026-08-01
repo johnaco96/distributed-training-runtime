@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install protoc (with well-known-type includes)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
