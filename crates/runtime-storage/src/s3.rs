@@ -2,9 +2,8 @@ use crate::object_key::{normalize_key_prefix, storage_key_to_object_key};
 use crate::{
     run_with_timeout_retry, StorageBackend, StorageError, StorageKey, StorageOperationPolicy,
 };
-use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::config::Region;
+use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;

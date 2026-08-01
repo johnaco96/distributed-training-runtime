@@ -13,9 +13,10 @@ updates:
     # Major bumps are proposed but not automated here.
     #
     # Every one opened against this workspace has been a breaking change that
-    # fails CI on its own: prost, prost-types and tonic-build must move as a
-    # set or codegen breaks, and pyo3 majors churn the raw `ffi::` surface that
-    # dtruntime-native's zero-copy buffer protocol depends on. Left enabled,
+    # fails CI on its own: prost, prost-types, tonic-prost, and
+    # tonic-prost-build must move as a set or codegen breaks. PyO3 minors can
+    # churn the raw `ffi::` surface that dtruntime-native's zero-copy buffer
+    # protocol depends on. Left enabled,
     # they reopen weekly and accumulate as red PRs that make a healthy repo
     # look unmaintained.
     #
@@ -33,7 +34,9 @@ updates:
         update-types: ["version-update:semver-minor"]
       - dependency-name: "tonic"
         update-types: ["version-update:semver-minor"]
-      - dependency-name: "tonic-build"
+      - dependency-name: "tonic-prost"
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: "tonic-prost-build"
         update-types: ["version-update:semver-minor"]
       - dependency-name: "pyo3"
         update-types: ["version-update:semver-minor"]

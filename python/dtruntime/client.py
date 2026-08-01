@@ -344,15 +344,13 @@ class RuntimeClient:
                     idempotency_key=idempotency_key,
                 )
             )
-            seq = 0
-            for offset in range(0, total_size, chunk_size):
+            for sequence, offset in enumerate(range(0, total_size, chunk_size)):
                 yield self._runtime_pb2.StreamCheckpointArtifactRequest(
                     chunk=self._runtime_pb2.StreamCheckpointArtifactChunk(
                         data=data[offset : offset + chunk_size],
-                        sequence=seq,
+                        sequence=sequence,
                     )
                 )
-                seq += 1
 
         return self._stub.StreamCheckpointArtifact(
             _generate_requests(),
@@ -721,7 +719,9 @@ class RuntimeClient:
     def __enter__(self) -> "RuntimeClient":
         return self
 
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> Optional[bool]:
+    def __exit__(
+        self, _exc_type: object, _exc: object, _traceback: object
+    ) -> Optional[bool]:
         self.close()
         return None
 

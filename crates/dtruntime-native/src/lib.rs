@@ -347,7 +347,7 @@ impl ShardStream {
         };
         slf.spawn_until_full();
         let py = slf.py();
-        let result = py.allow_threads(move || {
+        let result = py.detach(move || {
             handle
                 .join()
                 .unwrap_or_else(|_| Err("shard fetch thread panicked".into()))
@@ -365,9 +365,7 @@ impl ShardStream {
 /// Decode a full DTRS v1 shard from an in-memory bytes-like object.
 #[pyfunction]
 fn decode_dtrs(py: Python<'_>, data: &[u8]) -> PyResult<DtrsBatch> {
-    let decoded = py
-        .allow_threads(|| decode(data))
-        .map_err(PyValueError::new_err)?;
+    let decoded = py.detach(|| decode(data)).map_err(PyValueError::new_err)?;
     batch_from(py, decoded)
 }
 

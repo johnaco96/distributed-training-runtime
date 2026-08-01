@@ -316,7 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     supervisor = WorkerSupervisor(config, run_id)
 
-    def _handle_term(signum: int, frame: object) -> None:  # pragma: no cover
+    def _handle_term(_signum: int, _frame: object) -> None:  # pragma: no cover
         supervisor.terminate_all()
         raise SystemExit(143)
 

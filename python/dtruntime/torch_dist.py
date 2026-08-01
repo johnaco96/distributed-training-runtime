@@ -223,7 +223,7 @@ class TrainingContext:
     def __enter__(self) -> "TrainingContext":
         return self
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+    def __exit__(self, exc_type: object, _exc: object, _tb: object) -> None:
         self.shutdown(DEREGISTER_COMPLETED if exc_type is None else DEREGISTER_ERROR)
 
     # ── properties ───────────────────────────────────────────────────────────

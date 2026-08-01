@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/ci.yml)
 [![Compatibility](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/compat.yml/badge.svg?branch=main)](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/compat.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/johnaco96/distributed-training-runtime/blob/main/LICENSE)
 
 A **high-performance runtime for distributed PyTorch training** — a Rust core + Python SDK that manage the parts PyTorch doesn't: worker rendezvous, rank assignment, sharded data loading, fault-tolerant checkpointing to object storage, and **automatic recovery when a worker dies**. The Python API stays a handful of lines; the byte-moving I/O paths (shard decode/fetch, checkpoint upload/restore) and the always-on control plane run in Rust.
 
@@ -56,7 +56,7 @@ These are *systems* numbers — the point isn't state-of-the-art accuracy (it's 
 
 Every number below has a reproduction command and an environment disclosure in its linked writeup — and where a result has a caveat, the writeup says so.
 
-**Control plane at scale** — [docs/benchmarks/control-plane-scale.md](docs/benchmarks/control-plane-scale.md) (WSL2 loopback, simulated protocol-level workers):
+**Control plane at scale** — [benchmark methodology and results](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/benchmarks/control-plane-scale.md) (WSL2 loopback, simulated protocol-level workers):
 
 | | |
 |---|---|
@@ -67,7 +67,7 @@ Every number below has a reproduction command and an environment disclosure in i
 
 The load generator runs every simulated worker as its own concurrent task over pooled HTTP/2 channels with a bounded in-flight budget, so the offered load is exactly what the flags specify — the writeup details the methodology.
 
-**Rust data plane** — [docs/benchmarks/data-plane-throughput.md](docs/benchmarks/data-plane-throughput.md) (local NVMe; s3:// leg vs MinIO):
+**Rust data plane** — [benchmark methodology and results](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/benchmarks/data-plane-throughput.md) (local NVMe; s3:// leg vs MinIO):
 
 | | Pure Python | Rust (`_native`) |
 |---|---|---|
@@ -75,7 +75,7 @@ The load generator runs every simulated worker as its own concurrent task over p
 | Prefetching stream, disk, incl. SHA-256 | — | **1.23M rec/s** |
 | Prefetching stream, S3 (MinIO), incl. SHA-256 | — | **792 MB/s** |
 
-**Checkpoint durability** — [docs/checkpointing-distributed.md](docs/checkpointing-distributed.md): training stalls only for the in-memory snapshot (`t_stall_s`); upload, 2PC commit, and restore stream through Rust. Verified against real MinIO: a worker whose staging disk is wiped restores from S3 alone, and a tampered S3 object fails the manifest checksum instead of loading bad state.
+**Checkpoint durability** — [distributed checkpoint design](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/checkpointing-distributed.md): training stalls only for the in-memory snapshot (`t_stall_s`); upload, 2PC commit, and restore stream through Rust. Verified against real MinIO: a worker whose staging disk is wiped restores from S3 alone, and a tampered S3 object fails the manifest checksum instead of loading bad state.
 
 ## The problem it solves
 
@@ -154,9 +154,9 @@ python -m dtruntime.launch --help                    # the torchrun-style launch
 dtruntime-admin --help                               # inspect/manage runs from the CLI
 ```
 
-Integrate your own script in a few lines: **[docs/pytorch-integration.md](docs/pytorch-integration.md)**.
-Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Please report
-security issues through the private process in [SECURITY.md](SECURITY.md).
+Integrate your own script in a few lines: **[PyTorch integration guide](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/pytorch-integration.md)**.
+Contributions are welcome; see the [contribution guide](https://github.com/johnaco96/distributed-training-runtime/blob/main/CONTRIBUTING.md). Please report
+security issues through the [private reporting process](https://github.com/johnaco96/distributed-training-runtime/blob/main/SECURITY.md).
 
 ## Operational surface
 
@@ -173,7 +173,7 @@ Beyond the training path, the coordinator ships the pieces a control plane needs
 
 ## Scaling to production
 
-This branch is a **clean, focused prototype** — it proves the hard distributed-systems parts work, and everything above is validated locally, not against a managed cloud identity provider or a multi-node cluster. The remaining distance to a real cluster is mostly *deployment* surface: a Kubernetes operator, Helm packaging, SLO/alerting rules, image signing, and Volcano/Kueue scheduling integration. A **full implementation of all of it lives on the [`production-hardening`](https://github.com/johnaco96/distributed-training-runtime/tree/production-hardening) branch**; see **[docs/PATH-TO-PRODUCTION.md](docs/PATH-TO-PRODUCTION.md)** for the map from here to there.
+This branch is a **clean, focused prototype** — it proves the hard distributed-systems parts work, and everything above is validated locally, not against a managed cloud identity provider or a multi-node cluster. The remaining distance to a real cluster is mostly *deployment* surface: a Kubernetes operator, Helm packaging, SLO/alerting rules, image signing, and Volcano/Kueue scheduling integration. A **full implementation of all of it lives on the [`production-hardening`](https://github.com/johnaco96/distributed-training-runtime/tree/production-hardening) branch**; see the **[path to production](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/PATH-TO-PRODUCTION.md)** for the map from here to there.
 
 ## Status & honest limits
 

@@ -37,7 +37,7 @@ PENDING ──► RUNNING ◄──►│──► RECOVERING
 ## Admin lifecycle operations
 
 Operators drive these transitions with the `dtruntime-admin run <action>`
-commands (see [admin-cli.md](../README.md)) or the corresponding
+commands (see the [README operational surface](../README.md#operational-surface)) or the corresponding
 `RuntimeClient`/gRPC calls. `PAUSED` and `DRAINING` are **non-terminal** — a
 paused run is resumable and a draining run still completes normally.
 

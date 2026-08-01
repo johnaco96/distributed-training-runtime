@@ -79,7 +79,7 @@ def _parse_run_state(pb2: Any, value: str) -> int:
             f"unknown run state {value!r}",
             remediation=f"Valid states: {valid}.",
             exit_code=errors.EXIT_USAGE,
-        )
+        ) from None
 
 
 def _parse_worker_state(pb2: Any, value: str) -> int:
@@ -96,7 +96,7 @@ def _parse_worker_state(pb2: Any, value: str) -> int:
             f"unknown worker state {value!r}",
             remediation=f"Valid states: {valid}.",
             exit_code=errors.EXIT_USAGE,
-        )
+        ) from None
 
 
 def _artifact_owner(artifact_uri: str) -> str:
