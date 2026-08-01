@@ -13,8 +13,8 @@ dict into whatever the training loop wants (usually tensors); a default
 Built-in formats
 ----------------
 * ``npz``        — numpy ``.npz`` with ``features`` (2-D) + ``labels`` (1-D);
-                   the format written by :func:`dtruntime.shard_loader.write_shard_file`.
-* ``dtrs``       — the DTRS v1 binary format from :mod:`dtruntime.shard_reader`.
+                   the format written by :func:`dtruntime.data.shard_writer.write_shard_file`.
+* ``dtrs``       — the DTRS v1 binary format from :mod:`dtruntime.data.shard_reader`.
 * ``jsonl``      — one JSON object per line.
 * ``parquet``    — Apache Parquet (requires ``pyarrow``); streamed by row group.
 * ``webdataset`` — POSIX tar of grouped files (``key.cls``, ``key.jpg`` ...),
@@ -30,6 +30,15 @@ import struct
 import tarfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, Optional, Protocol, runtime_checkable
+
+# shard_reader owns the DTRS v1 wire format; import it rather than restating
+# the layout here. It has no torch import at module scope, so this stays cheap.
+from dtruntime.data.shard_reader import (
+    HEADER_SIZE,
+    ShardHeader,
+    native_module,
+    read_shard_header,
+)
 
 Record = Dict[str, Any]
 Transform = Callable[[Record], Any]
@@ -111,27 +120,22 @@ class NpzFormat:
 
 class DtrsFormat:
     name = "dtrs"
-    _HEADER_SIZE = 32
-    _MAGIC = b"DTRS"
 
-    def _header(self, path: Path) -> tuple[int, int, int]:
+    def _header(self, path: Path) -> ShardHeader:
+        """Parse the shard's DTRS header.
+
+        Delegates to :mod:`dtruntime.data.shard_reader`, which owns the format
+        definition — this must not re-implement it, or the two copies drift.
+        """
         with open(path, "rb") as f:
-            head = f.read(self._HEADER_SIZE)
-        if len(head) < self._HEADER_SIZE:
-            raise ValueError(f"dtrs shard {path} too short for header")
-        magic, version, record_count, input_dim, num_classes = struct.unpack_from(
-            "<4sIIII", head, 0
-        )
-        if magic != self._MAGIC:
-            raise ValueError(f"dtrs shard {path}: bad magic {magic!r}")
-        if version != 1:
-            raise ValueError(f"dtrs shard {path}: unsupported version {version}")
-        return record_count, input_dim, num_classes
+            head = f.read(HEADER_SIZE)
+        try:
+            return read_shard_header(head)
+        except ValueError as exc:
+            raise ValueError(f"dtrs shard {path}: {exc}") from exc
 
     def iter_records(self, path: Path, *, start: int = 0) -> Iterator[Record]:
         import numpy as np
-
-        from dtruntime.shard_reader import native_module
 
         native = native_module()
         if native is not None:
@@ -148,20 +152,21 @@ class DtrsFormat:
                 yield {"features": feats[i].copy(), "label": int(labels[i])}
             return
 
-        record_count, input_dim, _ = self._header(path)
-        record_size = input_dim * 4 + 4
+        header = self._header(path)
+        record_size = header.record_size
+        feature_bytes = header.input_dim * 4
         with open(path, "rb") as f:
-            f.seek(self._HEADER_SIZE + max(0, start) * record_size)
-            for _ in range(max(0, start), record_count):
+            f.seek(HEADER_SIZE + max(0, start) * record_size)
+            for _ in range(max(0, start), header.record_count):
                 buf = f.read(record_size)
                 if len(buf) < record_size:
                     break
-                features = np.frombuffer(buf[: input_dim * 4], dtype="<f4").copy()
-                label = struct.unpack_from("<i", buf, input_dim * 4)[0]
+                features = np.frombuffer(buf[:feature_bytes], dtype="<f4").copy()
+                label = struct.unpack_from("<i", buf, feature_bytes)[0]
                 yield {"features": features, "label": int(label)}
 
     def count_records(self, path: Path) -> Optional[int]:
-        return self._header(path)[0]
+        return self._header(path).record_count
 
 
 # ── jsonl ───────────────────────────────────────────────────────────────────

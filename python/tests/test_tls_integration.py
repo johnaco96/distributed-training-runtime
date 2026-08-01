@@ -12,9 +12,8 @@ import os
 import shutil
 import subprocess
 
+import harness
 import pytest
-
-import ops_common as ops
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("DTRUNTIME_RUN_LOCAL_INTEGRATION") != "1",
@@ -45,11 +44,11 @@ def test_coordinator_serves_over_tls_without_panicking(tmp_path):
     pytest.importorskip("grpc")
     from dtruntime.client import RuntimeClient
 
-    binary = ops.require_binary("runtime-coordinator")
+    binary = harness.require_binary("runtime-coordinator")
     cert, key = _make_self_signed_cert(tmp_path)
-    address = f"127.0.0.1:{ops.free_tcp_port()}"
+    address = f"127.0.0.1:{harness.free_tcp_port()}"
 
-    proc = ops.start_coordinator(
+    proc = harness.start_coordinator(
         binary, address,
         ["--metadata-db", str(tmp_path / "meta.db"),
          "--storage-root", str(tmp_path / "storage"),
@@ -59,8 +58,9 @@ def test_coordinator_serves_over_tls_without_panicking(tmp_path):
         # If the crypto-provider regression returns, the process panics/exits
         # here instead of becoming reachable.
         deadline_ok = False
-        import grpc
         import time
+
+        import grpc
         creds = grpc.ssl_channel_credentials(root_certificates=cert.read_bytes())
         end = time.monotonic() + 30
         last = None
@@ -84,4 +84,4 @@ def test_coordinator_serves_over_tls_without_panicking(tmp_path):
         client.list_runs(timeout=8)
         client.close()
     finally:
-        ops.stop_process(proc)
+        harness.stop_process(proc)

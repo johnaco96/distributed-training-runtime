@@ -1,4 +1,8 @@
-#![forbid(unsafe_code)]
+//! SQLite-backed [`MetadataStore`] — the single-node and development
+//! backend. Uses WAL journalling, and applies schema changes through the
+//! versioned, forward-only migration runner at the bottom of this file.
+
+use super::*;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -14,145 +18,6 @@ use runtime_checkpoint::{
 };
 use runtime_proto::runtime::v1::CheckpointId as ProtoCheckpointId;
 
-/// Boxed error returned by all [`MetadataStore`] methods.
-///
-/// Using a boxed trait object keeps the trait object-safe and avoids forcing a
-/// single error type on SQLite and PostgreSQL implementations.
-pub type PersistResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
-
-// ─── persistence data transfer types ─────────────────────────────────────────
-
-/// A single shard-progress record as seen by the persistence layer.
-#[derive(Clone, Debug)]
-pub struct ShardProgressEntry {
-    pub run_id: String,
-    pub dataset_id: String,
-    pub shard_id: String,
-    pub worker_id: String,
-    pub lease_epoch: u64,
-    pub progress_offset: i64,
-    pub is_complete: bool,
-    pub updated_at_millis: u64,
-}
-
-/// A single audit-event record as seen by the persistence layer.
-#[derive(Clone, Debug)]
-pub struct AuditEventEntry {
-    pub occurred_at_millis: u64,
-    pub kind: Option<String>,
-    pub outcome: Option<String>,
-    pub subject: Option<String>,
-    pub role: Option<String>,
-    pub worker_id: Option<String>,
-    pub run_id: Option<String>,
-    pub dataset_id: Option<String>,
-    pub checkpoint_id: Option<String>,
-    pub reason: Option<String>,
-    pub request_name: Option<String>,
-}
-
-/// Trait that abstracts over the coordinator's metadata persistence back-end.
-///
-/// Both [`SqliteMetadataStore`] (single-node, local dev) and
-/// [`crate::pg_store::PostgresMetadataStore`] (distributed, production)
-/// implement this trait so [`crate::state::CoordinatorState`] can hold an
-/// `Arc<dyn MetadataStore>` without caring which back-end is in use.
-pub trait MetadataStore: Send + Sync {
-    // ── original methods ──────────────────────────────────────────────────────
-    fn save_run(&self, run: &RunRecord) -> PersistResult<()>;
-    /// Load every persisted run.  Called once on coordinator startup to
-    /// re-hydrate the run registry (durable run lifecycle states).
-    fn load_all_runs(&self) -> PersistResult<Vec<RunRecord>>;
-    fn save_worker(&self, w: &WorkerRecord, world_size: u32) -> PersistResult<()>;
-    fn save_dataset(&self, d: &DatasetRecord) -> PersistResult<()>;
-    fn save_checkpoint(
-        &self,
-        run_id: &str,
-        idempotency_key: &str,
-        rec: &CoordinatorCheckpointRecord,
-    ) -> PersistResult<()>;
-    fn save_checkpoint_artifact(
-        &self,
-        run_id: &str,
-        checkpoint_id: &str,
-        a: &ArtifactRecord,
-    ) -> PersistResult<()>;
-    fn mark_checkpoint_committed(
-        &self,
-        run_id: &str,
-        checkpoint_id: &str,
-        committed_at_millis: u64,
-    ) -> PersistResult<()>;
-    fn load_latest_checkpoint(
-        &self,
-        run_id: &str,
-    ) -> PersistResult<Option<CoordinatorCheckpointRecord>>;
-    /// All checkpoints for a run, newest step first, with artifacts.
-    fn load_checkpoints_for_run(
-        &self,
-        run_id: &str,
-    ) -> PersistResult<Vec<CoordinatorCheckpointRecord>>;
-    /// Mark a checkpoint FAILED (corrupt-checkpoint reporting).
-    fn mark_checkpoint_failed(&self, run_id: &str, checkpoint_id: &str) -> PersistResult<()>;
-    /// Point (or clear) the run's latest-committed-checkpoint pointer.
-    fn set_latest_checkpoint(&self, run_id: &str, latest: Option<(&str, u64)>)
-        -> PersistResult<()>;
-    /// Remove a checkpoint's rows entirely (retention GC).
-    fn delete_checkpoint(&self, run_id: &str, checkpoint_id: &str) -> PersistResult<()>;
-
-    // ── Gap 1: shard-progress persistence (resume-from-mid-shard) ────────────
-
-    /// Upsert a shard-progress record.  Keyed on (run_id, dataset_id, shard_id).
-    fn save_shard_progress(&self, p: &ShardProgressEntry) -> PersistResult<()>;
-
-    /// Load all shard-progress records (across all runs).  Called once on
-    /// coordinator startup to re-hydrate the in-memory DashMap.
-    fn load_all_shard_progress(&self) -> PersistResult<Vec<ShardProgressEntry>>;
-
-    // ── Gap 2: distributed 2PC checkpoint commit tracking ────────────────────
-
-    /// Record that *worker_id* voted to commit *checkpoint_id*.
-    /// Idempotent — duplicate calls are silently ignored.
-    fn record_checkpoint_commit(
-        &self,
-        run_id: &str,
-        checkpoint_id: &str,
-        worker_id: &str,
-        committed_at_millis: u64,
-    ) -> PersistResult<()>;
-
-    /// Return every (run_id, checkpoint_id, worker_id) commit vote.
-    /// Called once on coordinator startup to re-hydrate the in-memory vote
-    /// set for any in-progress checkpoints.
-    fn load_all_checkpoint_commits(&self) -> PersistResult<Vec<(String, String, String)>>;
-
-    // ── Gap 5: durable audit log ─────────────────────────────────────────────
-
-    /// Append one audit event to durable storage.
-    fn insert_audit_event(&self, event: &AuditEventEntry) -> PersistResult<()>;
-
-    // ── durable run state machine (full hydration on restart) ────────────────
-
-    /// Upsert one idempotency-key mapping.
-    /// `scope` IN (run, worker, dataset, checkpoint, checkpoint_artifact).
-    fn save_idempotency_key(&self, scope: &str, key: &str, value: &str) -> PersistResult<()>;
-
-    /// Return every (scope, key, value) idempotency mapping.
-    fn load_all_idempotency_keys(&self) -> PersistResult<Vec<(String, String, String)>>;
-
-    /// Return every worker across all runs. Deadline fields are placeholders;
-    /// the caller must re-arm liveness deadlines after a restart.
-    fn load_all_workers(&self) -> PersistResult<Vec<WorkerRecord>>;
-
-    /// Return every dataset (with shards) across all runs.
-    fn load_all_datasets(&self) -> PersistResult<Vec<DatasetRecord>>;
-
-    /// Return every checkpoint (any state) with artifacts and the expected
-    /// worker set, as `(run_id, record)` pairs.
-    fn load_all_checkpoints(&self) -> PersistResult<Vec<(String, CoordinatorCheckpointRecord)>>;
-}
-
-#[derive(Clone, Debug)]
 pub struct SqliteMetadataStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -180,7 +45,7 @@ impl SqliteMetadataStore {
     }
 
     /// Bring the database schema up to the current version via the tracked,
-    /// forward-only migration runner ([`run_sqlite_migrations`]).  Idempotent
+    /// forward-only migration runner (`run_sqlite_migrations`).  Idempotent
     /// and safe to call on every startup.
     pub fn init_schema(&self) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite lock poisoned");
@@ -288,7 +153,7 @@ CREATE TABLE IF NOT EXISTS latest_checkpoints (
   checkpoint_id TEXT NOT NULL,
   committed_at_millis INTEGER NOT NULL
 );
--- Gap 1: shard progress — enables resume-from-mid-shard across coordinator restarts
+-- shard progress — enables resume-from-mid-shard across coordinator restarts
 CREATE TABLE IF NOT EXISTS shard_progress (
   run_id             TEXT NOT NULL,
   dataset_id         TEXT NOT NULL,
@@ -300,7 +165,7 @@ CREATE TABLE IF NOT EXISTS shard_progress (
   updated_at_millis  INTEGER NOT NULL,
   PRIMARY KEY (run_id, dataset_id, shard_id)
 );
--- Gap 2: per-worker checkpoint commit votes (distributed 2PC)
+-- per-worker checkpoint commit votes (distributed 2PC)
 CREATE TABLE IF NOT EXISTS checkpoint_commits (
   run_id              TEXT NOT NULL,
   checkpoint_id       TEXT NOT NULL,
@@ -308,7 +173,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_commits (
   committed_at_millis INTEGER NOT NULL,
   PRIMARY KEY (run_id, checkpoint_id, worker_id)
 );
--- Gap 5: durable audit log
+-- durable audit log
 CREATE TABLE IF NOT EXISTS audit_events (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
   occurred_at_millis INTEGER NOT NULL,
@@ -508,28 +373,6 @@ CREATE TABLE IF NOT EXISTS audit_events (
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
-    pub fn load_workers_for_run(
-        &self,
-        run_id: &str,
-    ) -> rusqlite::Result<Vec<(String, u32, u32, i32)>> {
-        let conn = self.conn.lock().expect("sqlite");
-        let mut stmt = conn.prepare(
-            "SELECT worker_id, rank, world_size, status FROM workers WHERE run_id=?1 ORDER BY worker_id",
-        )?;
-
-        let workers = stmt
-            .query_map(params![run_id], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get::<_, i64>(1)? as u32,
-                    r.get::<_, i64>(2)? as u32,
-                    r.get::<_, i32>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        Ok(workers)
-    }
     pub fn save_dataset(&self, d: &DatasetRecord) -> rusqlite::Result<()> {
         let labels_json = serde_json::to_string(&d.labels).unwrap_or_else(|_| "{}".to_string());
         let conn = self.conn.lock().expect("sqlite");
@@ -681,16 +524,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
             rows
         {
             let artifacts = artifact_stmt
-                .query_map(params![run_id, ckpt_id], |r| {
-                    Ok(ArtifactRecord {
-                        worker_id: DomainWorkerId(r.get(0)?),
-                        artifact_name: r.get(1)?,
-                        storage_key: r.get(2)?,
-                        size_bytes: r.get::<_, i64>(3)? as u64,
-                        checksum: r.get(4)?,
-                        checksum_algorithm: r.get(5)?,
-                    })
-                })?
+                .query_map(params![run_id, ckpt_id], artifact_from_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let expected_worker_ids: Vec<String> =
                 serde_json::from_str(&expected_json).unwrap_or_default();
@@ -783,16 +617,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
         };
         let mut stmt=conn.prepare("SELECT worker_id,artifact_name,artifact_uri,size_bytes,checksum,checksum_algorithm FROM checkpoint_artifacts WHERE run_id=?1 AND checkpoint_id=?2 ORDER BY worker_id,artifact_name")?;
         let artifacts = stmt
-            .query_map(params![run_id, checkpoint_id], |r| {
-                Ok(ArtifactRecord {
-                    worker_id: DomainWorkerId(r.get(0)?),
-                    artifact_name: r.get(1)?,
-                    storage_key: r.get(2)?,
-                    size_bytes: r.get::<_, i64>(3)? as u64,
-                    checksum: r.get(4)?,
-                    checksum_algorithm: r.get(5)?,
-                })
-            })?
+            .query_map(params![run_id, checkpoint_id], artifact_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         let expected_worker_ids = artifacts
             .iter()
@@ -848,16 +673,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
         let mut records = Vec::with_capacity(rows.len());
         for (checkpoint_id, step, state, created, updated, committed_at, initiator) in rows {
             let artifacts = artifact_stmt
-                .query_map(params![run_id, checkpoint_id], |r| {
-                    Ok(ArtifactRecord {
-                        worker_id: DomainWorkerId(r.get(0)?),
-                        artifact_name: r.get(1)?,
-                        storage_key: r.get(2)?,
-                        size_bytes: r.get::<_, i64>(3)? as u64,
-                        checksum: r.get(4)?,
-                        checksum_algorithm: r.get(5)?,
-                    })
-                })?
+                .query_map(params![run_id, checkpoint_id], artifact_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             let expected_worker_ids: Vec<String> =
                 artifacts.iter().map(|a| a.worker_id.0.clone()).collect();
@@ -938,39 +754,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
         Ok(())
     }
 
-    pub fn load_dataset(
-        &self,
-        run_id: &str,
-        dataset_id: &str,
-    ) -> rusqlite::Result<Option<(String, Vec<ShardRecord>)>> {
-        let conn = self.conn.lock().expect("sqlite");
-        let name: Option<String> = conn
-            .query_row(
-                "SELECT name FROM datasets WHERE run_id=?1 AND dataset_id=?2",
-                params![run_id, dataset_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(name) = name else { return Ok(None) };
-        let mut stmt=conn.prepare("SELECT shard_id,shard_uri,size_bytes FROM shards WHERE run_id=?1 AND dataset_id=?2 ORDER BY shard_index")?;
-        let shards = stmt
-            .query_map(params![run_id, dataset_id], |r| {
-                Ok(ShardRecord {
-                    shard_id: r.get(0)?,
-                    dataset_id: dataset_id.to_string(),
-                    shard_uri: r.get(1)?,
-                    byte_range_start: 0,
-                    byte_range_end: 0,
-                    size_bytes: r.get(2)?,
-                    checksum: String::new(),
-                    checksum_algorithm: String::new(),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some((name, shards)))
-    }
-
-    // ── Gap 1: shard progress ────────────────────────────────────────────────
+    // ── shard progress ───────────────────────────────────────────────────────
 
     pub fn save_shard_progress_inner(&self, p: &ShardProgressEntry) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite");
@@ -1014,7 +798,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
         Ok(entries)
     }
 
-    // ── Gap 2: checkpoint commit votes (2PC) ─────────────────────────────────
+    // ── checkpoint commit votes (2PC) ────────────────────────────────────────
 
     pub fn record_checkpoint_commit_inner(
         &self,
@@ -1045,7 +829,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
         Ok(rows)
     }
 
-    // ── Gap 5: audit events ──────────────────────────────────────────────────
+    // ── audit events ─────────────────────────────────────────────────────────
 
     pub fn insert_audit_event_inner(&self, event: &AuditEventEntry) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("sqlite");
@@ -1193,6 +977,23 @@ fn from_millis(millis: u64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis)
 }
 
+/// Build an [`ArtifactRecord`] from a row of the artifact columns.
+///
+/// Every checkpoint read path selects those columns in the same order and maps
+/// them here, so the column list and the field assignment stay in lockstep —
+/// if they drifted apart, checksums and URIs would land in each other's fields
+/// with no compile error to catch it.
+fn artifact_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord> {
+    Ok(ArtifactRecord {
+        worker_id: DomainWorkerId(r.get(0)?),
+        artifact_name: r.get(1)?,
+        storage_key: r.get(2)?,
+        size_bytes: r.get::<_, i64>(3)? as u64,
+        checksum: r.get(4)?,
+        checksum_algorithm: r.get(5)?,
+    })
+}
+
 fn now_millis_i64() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1212,7 +1013,7 @@ fn now_millis_i64() -> i64 {
 //   3. Each migration is transactional: a failure rolls back and leaves the
 //      ledger unchanged, so a re-run retries cleanly.
 //
-// See docs/schema-migrations.md.
+// The PostgreSQL store keeps a parallel ledger; see `pg_store::init_schema`.
 
 struct SqliteMigration {
     version: i64,
@@ -1234,7 +1035,7 @@ const SQLITE_MIGRATIONS: &[SqliteMigration] = &[
     SqliteMigration {
         version: 2,
         name: "runs_add_retry_count",
-        // Admin retry counter (Phase 7).  PRAGMA-guarded so re-running against
+        // Admin retry counter, bumped by RetryRun.  PRAGMA-guarded so re-running against
         // a database that already has the column (e.g. one that adopted it via
         // the baseline retrofit on a newer build) is a no-op.
         apply: |conn| {
@@ -1295,24 +1096,6 @@ pub fn latest_sqlite_migration_version() -> i64 {
         .unwrap_or(0)
 }
 
-/// Round-trip a persisted `state as i32` back to the domain enum.
-pub(crate) fn checkpoint_state_from_i32(value: i32) -> DomainCheckpointState {
-    use DomainCheckpointState as S;
-    for candidate in [
-        S::Initiated,
-        S::UploadInProgress,
-        S::Validating,
-        S::Committed,
-        S::Failed,
-        S::Aborted,
-    ] {
-        if candidate as i32 == value {
-            return candidate;
-        }
-    }
-    S::Initiated
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1371,10 +1154,12 @@ mod tests {
         store.save_dataset(&dataset).unwrap();
 
         let reopened = SqliteMetadataStore::open(&path).unwrap();
-        let (name, shards) = reopened
-            .load_dataset("run-1", "dataset-1")
-            .unwrap()
+        let datasets = reopened.load_all_datasets().unwrap();
+        let loaded = datasets
+            .iter()
+            .find(|d| d.run_id == "run-1" && d.dataset_id == "dataset-1")
             .expect("dataset should load");
+        let (name, shards) = (&loaded.name, &loaded.shards);
 
         assert_eq!(name, "training-set");
         assert_eq!(shards.len(), 2);
@@ -1532,11 +1317,15 @@ mod tests {
         store.save_worker(&worker, 4).unwrap();
 
         let reopened = SqliteMetadataStore::open(&path).unwrap();
-        let workers = reopened.load_workers_for_run("run-1").unwrap();
-        assert_eq!(workers.len(), 1);
-        assert_eq!(workers[0].0, "worker-0");
-        assert_eq!(workers[0].1, 2);
-        assert_eq!(workers[0].2, 4);
+        let workers: Vec<_> = reopened
+            .load_all_workers()
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.run_id == "run-1")
+            .collect();
+        assert_eq!(workers.len(), 1, "re-saving the same worker must upsert");
+        assert_eq!(workers[0].worker_id, "worker-0");
+        assert_eq!(workers[0].rank, 2);
     }
 
     // ── schema migrations ────────────────────────────────────────────────────

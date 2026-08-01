@@ -31,6 +31,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, Optional, Tuple
 from urllib.parse import urlparse
+from urllib.request import url2pathname
+
+# Internal helper module — stdlib-only at import time (boto3 stays lazy inside
+# make_s3_client), so importing it here costs nothing.
+from dtruntime._util import make_s3_client
 
 # torch is imported lazily inside the functions that build/read tensors so this
 # module (and the torch-free shard I/O + `_fetch_shard_bytes` used by
@@ -82,8 +87,7 @@ class ShardHeader:
 
 
 def write_shard_header(f: io.RawIOBase, header: ShardHeader) -> None:
-    packed = struct.pack(
-        "<4sIIII3I",
+    packed = HEADER_STRUCT.pack(
         MAGIC,
         VERSION,
         header.record_count,
@@ -98,7 +102,7 @@ def write_shard_header(f: io.RawIOBase, header: ShardHeader) -> None:
 def read_shard_header(data: bytes) -> ShardHeader:
     if len(data) < HEADER_SIZE:
         raise ValueError(f"shard data too short for header ({len(data)} < {HEADER_SIZE})")
-    fields = struct.unpack_from("<4sIIII3I", data, 0)
+    fields = HEADER_STRUCT.unpack_from(data, 0)
     magic, version, record_count, input_dim, num_classes = fields[:5]
     if magic != MAGIC:
         raise ValueError(f"bad magic: expected {MAGIC!r}, got {magic!r}")
@@ -177,8 +181,6 @@ def _fetch_shard_bytes(
     parsed = urlparse(shard_uri)
 
     if parsed.scheme == "s3":
-        from dtruntime._util import make_s3_client
-
         bucket = parsed.netloc
         key = parsed.path.lstrip("/")
         client = make_s3_client(
@@ -195,7 +197,6 @@ def _fetch_shard_bytes(
         if parsed.scheme == "file":
             # url2pathname handles Windows drive letters in file:// URIs
             # correctly on all platforms (e.g. /C:/path → C:\path on Windows).
-            from urllib.request import url2pathname
             path = Path(url2pathname(parsed.path))
         else:
             path = Path(shard_uri)
@@ -354,8 +355,6 @@ def upload_shard_to_s3(
     s3_region: str = "us-east-1",
 ) -> str:
     """Upload *data* to S3 and return the canonical ``s3://bucket/key`` URI."""
-    from dtruntime._util import make_s3_client
-
     client = make_s3_client(
         endpoint=s3_endpoint,
         access_key=s3_access_key,
@@ -374,8 +373,6 @@ def ensure_s3_bucket(
     s3_region: str = "us-east-1",
 ) -> None:
     """Create *bucket* if it does not already exist."""
-    from dtruntime._util import make_s3_client
-
     client = make_s3_client(
         endpoint=s3_endpoint,
         access_key=s3_access_key,

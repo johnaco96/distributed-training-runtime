@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -48,7 +49,6 @@ def main() -> int:
 
     # Fresh state every run: a stale metadata DB would rehydrate the previous
     # (completed) run and reject the new workers.
-    import shutil
     workdir = REPO / "target" / "demo"
     shutil.rmtree(workdir, ignore_errors=True)
     reports = workdir / "reports"

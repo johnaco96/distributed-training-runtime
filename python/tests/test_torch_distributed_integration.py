@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 
+import harness
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -35,16 +35,10 @@ def _gate() -> None:
     pytest.importorskip("grpc", reason="grpcio is required for this integration test")
 
 
-def _free_tcp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def _start_coordinator(
     log_dir: Path, extra_args: list[str] | None = None
 ) -> tuple[subprocess.Popen, str]:
-    address = f"127.0.0.1:{_free_tcp_port()}"
+    address = f"127.0.0.1:{harness.free_tcp_port()}"
     process = _restart_coordinator(log_dir, address, extra_args)
     return process, address
 
@@ -177,7 +171,6 @@ def test_cancel_run_stops_training_without_restart(tmp_path: Path) -> None:
     exit, and the launcher stops without burning its restart budget."""
     _gate()
     import grpc  # noqa: F401 - gated above
-
     from dtruntime import RuntimeClient
     from dtruntime.generated import runtime_pb2
 

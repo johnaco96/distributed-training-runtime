@@ -132,7 +132,7 @@ impl AuditSink for InMemoryAuditSink {
     }
 }
 
-// ─── Gap 5: durable database-backed audit sink ───────────────────────────────
+// ─── durable database-backed audit sink ──────────────────────────────────────
 
 /// Audit sink that writes every event to the coordinator's metadata store.
 ///

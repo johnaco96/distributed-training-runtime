@@ -1,17 +1,22 @@
-"""Shared helpers for the operational tests (failover / chaos / soak).
+"""Shared harness for the tests that drive real runtime processes.
 
-These tests exercise the real Rust coordinator (and, for chaos/soak, the
-`runtime-bench` load generator). They locate the prebuilt release binaries so a
-test run never pays a `cargo` compile; if a binary is missing the caller skips
-with a build hint.
+Used by every suite that spawns the Rust coordinator or the `runtime-bench`
+load generator — integration, TLS, failover, chaos, and soak. Binaries are
+located from the prebuilt `target/release` output so a test run never pays a
+`cargo` compile; when one is missing the caller skips with a build hint.
+
+Keeping port allocation and process start/stop here means the suites cannot
+drift into subtly different versions of the same setup.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -47,26 +52,53 @@ def free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def start_coordinator(binary: Path, address: str, extra_args: list[str]) -> subprocess.Popen:
-    """Spawn the coordinator; caller is responsible for stopping it."""
+def start_coordinator(
+    binary: Path,
+    address: str,
+    extra_args: list[str],
+    *,
+    output=None,
+) -> subprocess.Popen:
+    """Spawn the coordinator; caller is responsible for stopping it.
+
+    Pass ``output`` (an open file handle) for any coordinator that outlives a
+    single short check. The default ``PIPE`` is only safe when the process is
+    short-lived: nothing drains it, so once the OS pipe buffer fills, the
+    coordinator blocks forever on its next log write and the test hangs.
+    :func:`running_coordinator` always redirects to a file for this reason.
+    """
     return subprocess.Popen(
         [str(binary), "--addr", address, *extra_args],
-        stdout=subprocess.PIPE,
+        stdout=output if output is not None else subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
 
 
-def wait_for_grpc(address: str, process: subprocess.Popen, timeout: float = 60.0) -> None:
+def wait_for_grpc(
+    address: str,
+    process: subprocess.Popen,
+    timeout: float = 60.0,
+    log_path: Optional[Path] = None,
+) -> None:
+    """Block until the coordinator serves gRPC, or raise with its output.
+
+    ``log_path`` is where the process's output was redirected, if it was; it is
+    read back to explain an early exit when there is no pipe to read.
+    """
     import grpc
+
+    def _output() -> str:
+        if log_path is not None and log_path.exists():
+            return log_path.read_text(encoding="utf-8", errors="replace")
+        return process.stdout.read() if process.stdout else ""
 
     deadline = time.monotonic() + timeout
     last_error: Optional[Exception] = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            out = process.stdout.read() if process.stdout else ""
             raise AssertionError(
-                f"coordinator exited early (code {process.returncode}):\n{out}"
+                f"coordinator exited early (code {process.returncode}):\n{_output()}"
             )
         channel = grpc.insecure_channel(address)
         try:
@@ -77,6 +109,35 @@ def wait_for_grpc(address: str, process: subprocess.Popen, timeout: float = 60.0
         finally:
             channel.close()
     raise AssertionError(f"coordinator not reachable at {address}: {last_error}")
+
+
+@contextlib.contextmanager
+def running_coordinator(extra_args: Optional[list[str]] = None, *, timeout: float = 60.0):
+    """Yield the address of a coordinator that is up and serving gRPC.
+
+    Composes port allocation, spawn, readiness wait, and teardown so a test
+    fixture is three lines instead of twenty. Skips (rather than fails) when
+    the release binary is not built, matching the rest of the harness.
+
+    Usage::
+
+        with running_coordinator(["--storage-root", str(tmp)]) as addr:
+            ...
+    """
+    binary = require_binary("runtime-coordinator")
+    address = f"127.0.0.1:{free_tcp_port()}"
+    with tempfile.TemporaryDirectory(prefix="dtr-coordinator-") as tmp:
+        # Output goes to a file, never an undrained pipe: a module-scoped
+        # coordinator logs steadily and would otherwise block once the pipe
+        # buffer filled, hanging the whole suite.
+        log_path = Path(tmp) / "coordinator.log"
+        with log_path.open("w", encoding="utf-8") as log:
+            process = start_coordinator(binary, address, extra_args or [], output=log)
+            try:
+                wait_for_grpc(address, process, timeout=timeout, log_path=log_path)
+                yield address
+            finally:
+                stop_process(process)
 
 
 def hard_kill(process: subprocess.Popen) -> None:

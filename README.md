@@ -52,7 +52,7 @@ These are *systems* numbers — the point isn't state-of-the-art accuracy (it's 
 
 Every number below has a reproduction command and an environment disclosure in its linked writeup — and where a result has a caveat, the writeup says so.
 
-**Control plane at scale** — [docs/benchmarks/phase1-baseline.md](docs/benchmarks/phase1-baseline.md) (WSL2 loopback, simulated protocol-level workers):
+**Control plane at scale** — [docs/benchmarks/control-plane-scale.md](docs/benchmarks/control-plane-scale.md) (WSL2 loopback, simulated protocol-level workers):
 
 | | |
 |---|---|
@@ -63,7 +63,7 @@ Every number below has a reproduction command and an environment disclosure in i
 
 The load generator runs every simulated worker as its own concurrent task over pooled HTTP/2 channels with a bounded in-flight budget, so the offered load is exactly what the flags specify — the writeup details the methodology.
 
-**Rust data plane** — [docs/benchmarks/phase3-dataplane.md](docs/benchmarks/phase3-dataplane.md) (local NVMe; s3:// leg vs MinIO):
+**Rust data plane** — [docs/benchmarks/data-plane-throughput.md](docs/benchmarks/data-plane-throughput.md) (local NVMe; s3:// leg vs MinIO):
 
 | | Pure Python | Rust (`_native`) |
 |---|---|---|
@@ -152,9 +152,22 @@ dtruntime-admin --help                               # inspect/manage runs from 
 
 Integrate your own script in a few lines: **[docs/pytorch-integration.md](docs/pytorch-integration.md)**.
 
+## Operational surface
+
+Beyond the training path, the coordinator ships the pieces a control plane needs to be run by someone other than its author:
+
+| | |
+|---|---|
+| **Authentication** | Layered and enforced per-RPC: OIDC/JWT bearer tokens (signature, `exp`/`nbf`, issuer/audience, algorithm pinning, JWKS or HMAC key sets with **hot reload** for secret rotation) → SPIFFE X.509-SVID identity from the verified mTLS peer certificate → dev metadata headers, which hardened deployments disable. |
+| **Authorization** | Role/permission RBAC (`admin`/`operator`/`viewer`/`worker`) with worker-self scoping, so a worker can only act on its own identity. |
+| **Durable metadata** | SQLite (WAL) or PostgreSQL, with a versioned migration ledger; the coordinator rehydrates full run/worker/checkpoint state on restart. |
+| **HA** | PostgreSQL advisory-lock leader election — standby replicas don't bind the gRPC port, so a readiness probe routes traffic only to the leader. |
+| **Observability** | Prometheus `/metrics`, `/healthz`, `/readyz`, and an NDJSON audit log of every authorization decision. |
+| **Admin** | `dtruntime-admin` — inspect runs/workers/shards/checkpoints, pause/resume/retry/drain, verify checkpoint integrity, and a `doctor` diagnostic. |
+
 ## Scaling to production
 
-This branch is a **clean, focused prototype** — it proves the hard distributed-systems parts work. Taking it to a real cluster (Kubernetes operator, Helm, PostgreSQL HA, OIDC/SPIFFE auth, Prometheus/SLOs, image signing, Volcano/Kueue scheduling) is a well-understood next step, and a **full, production-hardened implementation of all of it lives on the [`production-hardening`](../../tree/production-hardening) branch**. See **[docs/PATH-TO-PRODUCTION.md](docs/PATH-TO-PRODUCTION.md)** for the map from here to there.
+This branch is a **clean, focused prototype** — it proves the hard distributed-systems parts work, and everything above is validated locally, not against a managed cloud identity provider or a multi-node cluster. The remaining distance to a real cluster is mostly *deployment* surface: a Kubernetes operator, Helm packaging, SLO/alerting rules, image signing, and Volcano/Kueue scheduling integration. A **full implementation of all of it lives on the [`production-hardening`](../../tree/production-hardening) branch**; see **[docs/PATH-TO-PRODUCTION.md](docs/PATH-TO-PRODUCTION.md)** for the map from here to there.
 
 ## Status & honest limits
 

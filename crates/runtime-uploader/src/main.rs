@@ -21,6 +21,13 @@
 //!
 //! On success prints one JSON line to stdout:
 //!   {"uri":"s3://…","size_bytes":N,"elapsed_ms":M}
+//!
+//! Unlike `runtime-coordinator` and `runtime-bench`, this binary parses its own
+//! arguments instead of using `clap`. That is deliberate: it is spawned once
+//! per checkpoint artifact by the SDK, always with the same six machine-
+//! generated flags, so it trades a dependency and the startup cost of building
+//! a clap `Command` for forty lines of `match`. Flags meant for humans belong
+//! in the two CLIs above.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

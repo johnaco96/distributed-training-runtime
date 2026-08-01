@@ -33,7 +33,7 @@ from typing import Callable, Dict, Optional
 # schemes (s3://, ...).
 from dtruntime._util import file_uri_to_path as _file_uri_to_path
 from dtruntime._util import sha256_file as _sha256_file
-from dtruntime.shard_reader import _fetch_shard_bytes
+from dtruntime.data.shard_reader import _fetch_shard_bytes
 
 
 class ChecksumMismatch(RuntimeError):

@@ -7,7 +7,6 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
-
 from dtruntime.data.cache import ChecksumMismatch, ShardCache
 from dtruntime.data.locality import split_for_dataloader_worker
 from dtruntime.data.shuffle import derive_seed, reservoir_shuffle, shuffled_order
@@ -15,7 +14,6 @@ from dtruntime.data.versioning import (
     compute_dataset_version,
     verify_dataset_version,
 )
-
 
 # ── cache ────────────────────────────────────────────────────────────────────
 

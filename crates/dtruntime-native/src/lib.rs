@@ -13,7 +13,7 @@
 //!   client, file:// or plain path), SHA-256-verified, and decoded
 //!   concurrently on Rust threads while Python consumes the current one.
 //!
-//! The DTRS v1 layout (spec: `python/dtruntime/shard_reader.py`):
+//! The DTRS v1 layout (spec: `python/dtruntime/data/shard_reader.py`):
 //! 32-byte header (`DTRS` magic, u32 version=1, u32 record_count,
 //! u32 input_dim, u32 num_classes, 12 reserved bytes), then fixed-stride
 //! records of `input_dim` little-endian f32 features + one i32 label.
@@ -141,6 +141,12 @@ unsafe fn fill_buffer(
     (*view).internal = std::ptr::null_mut();
     Ok(())
 }
+
+// F32Buffer and I32Buffer below are deliberately near-identical: `#[pyclass]`
+// cannot be generic, so each element type needs its own concrete class. All the
+// unsafe work lives once in `fill_buffer` — what repeats is only the typed
+// wrapper (element size and format code). A macro for two instantiations would
+// cost more readability than the duplication does.
 
 /// Contiguous little-endian f32 array exported via the buffer protocol.
 #[pyclass(frozen, module = "dtruntime._native")]

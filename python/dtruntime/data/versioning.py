@@ -21,7 +21,7 @@ def compute_dataset_version(shards: Sequence[Mapping[str, object]]) -> str:
     """Compute the content-addressed version for a shard manifest.
 
     ``shards`` is the list of dicts returned by
-    :func:`dtruntime.shard_loader.build_and_write_shards` (each with at least
+    :func:`dtruntime.data.shard_writer.build_and_write_shards` (each with at least
     ``shard_id`` and ``checksum``).  Shards are sorted by id first so the
     version is independent of manifest ordering.
     """

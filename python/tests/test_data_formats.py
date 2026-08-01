@@ -10,7 +10,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
 from dtruntime.data.formats import (
     DtrsFormat,
     JsonlFormat,

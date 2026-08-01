@@ -29,7 +29,7 @@ dependencies = [
     # Runtime must be >= the gencode version embedded in the committed
     # python/dtruntime/generated stubs (see grpcio-tools pin below).
     "protobuf>=6.33.5",
-    # dtruntime.shard_loader reads/writes .npz shards with numpy.
+    # dtruntime.data.shard_writer reads/writes .npz shards with numpy.
     "numpy",
 ]
 
@@ -73,6 +73,12 @@ s3 = [
 [tool.ruff]
 # Machine-generated gRPC/protobuf stubs are not held to lint standards.
 extend-exclude = ["python/dtruntime/generated"]
+
+[tool.ruff.lint]
+# Beyond the defaults (pyflakes + core pycodestyle): "I" sorts and groups
+# imports, so import placement is enforced by the linter rather than left to
+# reviewers to notice.
+extend-select = ["I"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests import after pytest.importorskip()/sys.path setup by design.

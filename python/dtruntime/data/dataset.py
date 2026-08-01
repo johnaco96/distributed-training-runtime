@@ -45,6 +45,7 @@ extra coordination and a resumed worker reproduces its order exactly.
 from __future__ import annotations
 
 import logging
+import tempfile
 from typing import Any, Callable, Iterator, List, Optional
 
 from dtruntime.data.cache import ShardCache
@@ -110,8 +111,6 @@ class DistributedShardDataset(_IterableDataset):
         self._last_assigned: List["_Assigned"] = []
 
         self._fmt = get_format(dataset_format)
-        import tempfile
-
         self._cache = ShardCache(
             cache_dir or tempfile.mkdtemp(prefix="dtruntime-data-"),
             max_bytes=cache_max_bytes,

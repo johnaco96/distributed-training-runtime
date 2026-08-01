@@ -8,7 +8,6 @@ import types
 from pathlib import Path
 
 import pytest
-
 from dtruntime.checkpointing import (
     AsyncSaveHandle,
     CheckpointError,

@@ -1,4 +1,4 @@
-# Phase 3 — Rust data plane (measured)
+# Rust data plane throughput (measured)
 
 **What changed:** DTRS shard decode and shard fetch moved from Python into
 `dtruntime._native` (PyO3, `crates/dtruntime-native`). Feature tensors are

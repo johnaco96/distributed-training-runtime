@@ -30,7 +30,7 @@ from pathlib import Path
 # Allow running from the repo root without installing the package.
 sys.path.insert(0, str(Path(__file__).parents[2] / "python"))
 
-from dtruntime.shard_reader import (
+from dtruntime.data.shard_reader import (
     ensure_s3_bucket,
     generate_shard_bytes,
     upload_shard_to_s3,

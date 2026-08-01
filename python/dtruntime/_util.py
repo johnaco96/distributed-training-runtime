@@ -1,7 +1,7 @@
 """Shared internal helpers: file hashing, URI handling, S3 client construction.
 
 One implementation for the idioms that used to be copy-pasted across
-``async_checkpoint``, ``data.cache``, and ``shard_reader`` — the kind of
+``async_checkpoint``, ``data.cache``, and ``data.shard_reader`` — the kind of
 subtly-divergent duplication (Windows drive letters, env-var fallbacks) that
 breeds cross-platform bugs.
 """

@@ -2,19 +2,22 @@
 
 This quickstart gives a concise local setup and validation path for the Distributed Training Runtime prototype.
 
-For a system-level map of components and flows, see [Architecture Overview](architecture.md).
-
-For command copy/paste coverage, see [Example commands](../README.md).
-
-For workflow sequencing, see [Runbooks](PATH-TO-PRODUCTION.md).
-
-For common setup/runtime issues, see [Troubleshooting](troubleshooting.md). For current project boundaries, see [Status and limitations](../README.md).
+- [Architecture Overview](architecture.md) — components, flows, and where each
+  responsibility lives.
+- [README](../README.md) — the headline demo, measured performance, and the
+  project's honest limits.
+- [PyTorch integration](pytorch-integration.md) — adapting an existing training
+  script in a few lines.
+- [Troubleshooting](troubleshooting.md) — common setup and runtime issues.
+- [Path to production](PATH-TO-PRODUCTION.md) — what a real cluster deployment
+  additionally needs.
 
 ## Prerequisites
 
 Required:
 - Rust toolchain (`rustup`, `cargo`)
-- Python 3.10+ (3.12 validated recently)
+- Python 3.9+ (the CI compatibility matrix covers 3.9–3.12 on Linux, macOS,
+  and Windows; 3.12 is the primary target)
 - `protoc` (Protocol Buffers compiler)
 - `PYTHONPATH=python` when running Python commands from repo root
 
@@ -57,10 +60,15 @@ export PYTHONPATH=python
 Run these from repo root:
 
 ```bash
-cargo check --workspace
-cargo test --workspace
+cargo check --workspace --exclude dtruntime-native
+cargo test --workspace --exclude dtruntime-native
 PYTHONPATH=python python -m pytest python/tests
 ```
+
+`dtruntime-native` is the optional PyO3 accelerator; building it needs a
+CPython >= 3.11 interpreter that `cargo` cannot locate on its own, so it is
+excluded here. Build it separately with `python scripts/build_native.py` —
+the Python suite exercises it (and its pure-Python fallback) either way.
 
 ## Run coordinator/local demo
 
@@ -126,6 +134,6 @@ rm -rf .dtruntime-demo .dtruntime-pytorch-smoke
   the demo injects a real worker crash and recovers from it.
 - S3/MinIO support is implemented and MinIO-tested, but production cloud
   readiness is not claimed by default.
-- Use the benchmark commands in [benchmarks/phase1-baseline.md](benchmarks/phase1-baseline.md)
-  and [benchmarks/phase3-dataplane.md](benchmarks/phase3-dataplane.md) as the
+- Use the benchmark commands in [benchmarks/control-plane-scale.md](benchmarks/control-plane-scale.md)
+  and [benchmarks/data-plane-throughput.md](benchmarks/data-plane-throughput.md) as the
   source of performance evidence for your environment.

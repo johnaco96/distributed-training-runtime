@@ -1,6 +1,6 @@
 """Enforce protobuf/gRPC backward/forward compatibility rules.
 
-The wire compatibility contract (see docs/protocol-compatibility.md):
+The wire compatibility contract:
 
 - **Field numbers are forever.** A field's number and type must never change
   once shipped, and a number must never be reused for a different field.
@@ -20,7 +20,6 @@ reviewable.
 """
 
 from __future__ import annotations
-
 
 from proto_compat import build_manifest, current_manifest, load_snapshot
 

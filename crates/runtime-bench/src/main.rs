@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use runtime_bench::{
     parse_workers_list, run_checkpoint_restore, run_checkpoint_write, run_dataset_read,
     run_logical_workers, run_scaling_workers, run_sharded_data_load, run_worker_rpc,
-    validate_worker_counts, write_outputs, write_outputs_many, DEFAULT_SCALING_WORKERS,
-    DEFAULT_SIMULATED_SCALING_WORKERS,
+    validate_worker_counts, write_outputs, write_outputs_many, LogicalWorkersConfig,
+    DEFAULT_SCALING_WORKERS, DEFAULT_SIMULATED_SCALING_WORKERS,
 };
 use std::path::PathBuf;
 
@@ -279,7 +279,7 @@ fn main() -> Result<(), String> {
             out_csv,
             out_json,
         } => (
-            vec![run_logical_workers(
+            vec![run_logical_workers(LogicalWorkersConfig {
                 target,
                 workers,
                 duration_secs,
@@ -293,7 +293,7 @@ fn main() -> Result<(), String> {
                 failure_rate,
                 recover_failed_workers,
                 start_coordinator,
-            )?],
+            })?],
             out_csv,
             out_json,
         ),

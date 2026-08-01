@@ -10,7 +10,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROTO_DIR = REPO_ROOT / "proto"
 PROTO_FILE = PROTO_DIR / "runtime.proto"
