@@ -177,12 +177,12 @@ class JsonlFormat:
 
     def iter_records(self, path: Path, *, start: int = 0) -> Iterator[Record]:
         with open(path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
+            for i, raw_line in enumerate(f):
                 if i < start:
                     continue
-                line = line.strip()
-                if line:
-                    yield json.loads(line)
+                text = raw_line.strip()
+                if text:
+                    yield json.loads(text)
 
     def count_records(self, path: Path) -> Optional[int]:
         with open(path, "r", encoding="utf-8") as f:

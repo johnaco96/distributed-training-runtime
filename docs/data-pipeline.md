@@ -2,7 +2,7 @@
 
 `dtruntime.data` is a streaming, shufflable, cache-backed dataset layer that
 plugs into PyTorch `DataLoader`. It turns the coordinator's shard-assignment
-protocol into a production data path: workers stream their assigned shards
+protocol into a data path: workers read their assigned shards
 from a warm local cache, records are shuffled deterministically per epoch, and
 progress is reported for resume. The shard-assignment RPCs it builds on are
 defined in [proto/runtime.proto](../proto/runtime.proto); when the Rust
@@ -37,14 +37,14 @@ for epoch in range(epochs):
 
 | Requirement | Implementation |
 |---|---|
-| **Streaming** | Shards are the unit of caching/locality; records stream out of a cached shard file lazily (`ShardFormat.iter_records`), so a shard never fully materialises. Parquet streams by row group, WebDataset by tar member, jsonl by line. |
-| **Epoch shuffling** | Two composed, deterministic shuffles keyed on `(seed, epoch)`: shard visiting order (`shuffle.shuffled_order`) and within-shard records (a bounded reservoir shuffle, `shuffle.reservoir_shuffle`). Same `(seed, epoch)` reproduces the exact order — required for correct resume; different epoch reorders. |
+| **Streaming** | Shards are the unit of caching/locality and are downloaded as complete cache files. JSONL iterates by line, WebDataset by tar member, Parquet by row group, and DTRS by record/batch. NPZ loading materializes its arrays in memory. |
+| **Epoch shuffling** | Two composed, deterministic shuffles keyed on `(seed, epoch)`: shard visiting order (`shuffle.shuffled_order`) and within-shard records (a bounded reservoir shuffle, `shuffle.reservoir_shuffle`). With the same inputs and library behavior, the same `(seed, epoch)` reproduces order; different epochs reorder. This does not make failure recovery exactly once. |
 | **Versioning** | Content-addressed: `compute_dataset_version(shards)` hashes the ordered `(shard_id, checksum)` pairs into `sha256:...`. `register_versioned_dataset` sets it at registration; `verify_dataset_version` pins a run to exact data and catches drift. |
 | **Cache management** | `ShardCache`: size-bounded LRU disk cache with atomic downloads, per-key download dedup, checksum verification, pinning during streaming, and adoption of shards left on disk from a previous run (warm restart). |
 | **Prefetching / backpressure** | `ShardPrefetcher` warms the next `prefetch_shards` shards with a thread pool and streams decoded records through a bounded `queue.Queue(maxsize=prefetch_records)`. A slow training loop blocks the producers (backpressure) instead of reading the whole dataset into memory. |
 | **Formats beyond .npz** | Pluggable registry: `npz`, `dtrs` (the binary format), `jsonl`, `parquet` (pyarrow), `webdataset` (tar). Register custom formats with `register_format`. |
-| **DataLoader / IterableDataset** | `DistributedShardDataset` **is** a `torch.utils.data.IterableDataset`; pass it straight to `DataLoader`. `num_workers>0` is handled: each worker process reads a disjoint round-robin slice of the rank's shards, so records are delivered exactly once. |
-| **Multi-node data locality** | The coordinator gives each rank a **stable** shard subset (`shard_index % world_size == rank`). Between epochs only the order changes, never which node owns a shard — so the local disk cache stays warm and no data moves between nodes. The dataset reports its warm shard set as a cache hint for sticky placement. |
+| **DataLoader / IterableDataset** | `DistributedShardDataset` **is** a `torch.utils.data.IterableDataset`; pass it straight to `DataLoader`. In a failure-free epoch, `num_workers>0` splits the rank's shards into disjoint round-robin slices. Failure recovery is not exactly once. |
+| **Multi-node data locality** | For a fixed world size and rank mapping, the coordinator assigns shards by `shard_index % world_size == rank`; epochs change order, not ownership. A world-size/rank change can change ownership. Warm-shard cache hints reorder eligible candidates under cache-aware placement; they do not pin a shard to a host. |
 
 ## Determinism and resume
 
@@ -52,9 +52,12 @@ All shuffling is a pure function of `(seed, epoch)`, so:
 
 - every rank and DataLoader worker computes a consistent view with **no extra
   coordination** (they derive the same permutations from the shared seed);
-- a worker that crashes and resumes at the same epoch reproduces its exact
-  order, so the coordinator's per-shard `progress_offset` (records already
-  consumed) correctly skips finished records on the first resumed epoch.
+- the same inputs reproduce the same shuffle order. Cross-environment order
+  still depends on format/library behavior;
+- the coordinator's per-shard `progress_offset` is applied only for epoch 0.
+  It is a best-effort hint reported after records are decoded and enqueued,
+  not after the training loop consumes them. A crash can replay records or
+  skip records that were buffered but not consumed.
 
 `set_epoch(epoch)` must be called before each pass (as with PyTorch's
 `DistributedSampler`).
@@ -88,8 +91,8 @@ cache.unpin(uri)
 ```
 
 Downloads are atomic (`temp + os.replace`), so a crash never leaves a
-half-written shard that looks cached. Concurrent gets of the same shard fetch
-once. Set `verify_on_hit=True` to re-checksum on every read (catches bit-rot at
+half-written shard that looks cached. Concurrent gets of the same shard within
+one process fetch once. Set `verify_on_hit=True` to re-checksum on every read (catches bit-rot at
 the cost of I/O); by default hits are trusted after the download-time check.
 
 ## Validation
@@ -99,7 +102,8 @@ the cost of I/O); by default hits are trusted after the download-time check.
   cache LRU/pin/dedup/checksum, deterministic shuffle, versioning, DataLoader
   worker split, torch `DataLoader` integration). No coordinator required.
 - `python/tests/test_data_integration.py` — two ranks stream a coordinator-
-  registered versioned dataset and cover it exactly once with no overlap,
+  registered versioned dataset and, in the failure-free test, cover it once
+  with no overlap,
   keeping each rank's shard set stable across epochs. Gate:
   `DTRUNTIME_RUN_LOCAL_INTEGRATION=1`.
 - Working example:

@@ -21,8 +21,9 @@ cargo run --release -p runtime-bench -- logical-workers \
 tokio task** on its configured heartbeat cadence, multiplexed over a shared
 pool of HTTP/2 channels (`--channels`), with total in-flight RPCs bounded by
 `--concurrency`. Offered load is therefore exactly what the flags specify:
-`workers × ticks × 2` RPCs per run (Heartbeat + GetShardAssignment per
-tick), and a run's op count matching that product proves no ticks were
+`workers + workers × ticks × 2` RPCs per run: one RegisterWorker per worker,
+then Heartbeat + GetShardAssignment per tick. A run's op count matching that
+sum proves no scheduled ticks were
 dropped. Latencies are recorded per RPC from each worker task, so the
 percentiles reflect the coordinator under genuine concurrent load rather
 than a single serialized request stream.
@@ -40,8 +41,9 @@ than a single serialized request stream.
 | 5000 | 512 | 305,000 (== offered) | 11.7 ms | 21.8 ms | 31.0 ms | 34 MB |
 | 5000 @ 100 ms cadence | 1024 | 1,220,668 (**~40k RPC/s, saturated**) | 24.2 ms | 43.6 ms | 62.3 ms | 50 MB |
 
-Zero failed RPCs in every run. The 100 ms-cadence run is the interesting one:
-offered load is ~100k RPC/s and the coordinator could only clear ~40k.
+Zero failed RPCs occurred in the recorded runs. At the 100 ms cadence, the
+offered load was approximately 100k RPC/s and the coordinator completed about
+40k RPC/s before the optimization described below.
 
 ## Hotspot found and fixed
 
@@ -68,10 +70,12 @@ from a global recount so silently-dead workers still surface.
 | Failed RPCs (all runs) | 0 | 0 |
 | Peak RSS at 100 ms cadence | 50 MB | 56 MB |
 
-The coordinator now sustains ~99k RPC/s on loopback — 5000 workers
-heartbeating every 100 ms with zero failures — with room to spare at the
-1 s cadence real workers use (SDK default is 300 s process-group timeout and
-seconds-scale heartbeats, so 5000 real workers generate ~10k RPC/s).
+In this recorded loopback run, the coordinator sustained ~99k RPC/s from
+5,000 simulated workers issuing both RPCs every 100 ms with zero failures.
+That is deliberately much more frequent than the SDK's default 10-second
+heartbeat interval. Real data-assignment frequency depends on the training
+input loop, so this synthetic RPC rate should not be translated directly into
+a real-worker rate.
 
 ## Known next targets (profiled, not yet fixed)
 
@@ -83,7 +87,7 @@ straight from the map. Also unmeasured here: SQLite `persist_worker` runs on
 every heartbeat (I/O, invisible to CPU profiles); batching heartbeat
 durability (votes stay synchronous) is the likely next latency win.
 
-## Caveats, honestly
+## Limitations
 
 - Loopback: no network latency/jitter/packet loss; a real cluster adds RTTs.
 - Simulated workers: no gRPC-per-worker connection churn (channels are

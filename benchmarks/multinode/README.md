@@ -11,6 +11,10 @@ Measures **checkpoint stall time**, **end-to-end durability time**, and
 All numbers are CPU-tensor state; this benchmark isolates the checkpoint data
 path and coordination, not GPU math.
 
+This directory is a benchmark harness and runbook. No 3-VM result artifact is
+tracked in this repository, so it documents how to run the experiment rather
+than claiming that the topology below has been validated.
+
 ## Topology (3 VMs, e.g. 8 vCPU / 32 GB each)
 
 | Host | Runs |
@@ -79,23 +83,24 @@ torchrun --nnodes=2 --node-rank=<r> --nproc-per-node=1 \
   with `--measure-recovery` (same `--run-key`). Reported as `recovery_s` —
   time from process start to the latest committed checkpoint restored.
   DCP equivalent: rerun `bench_dcp.py --measure-recovery`.
-- **Coordinator recovery:** `kill -9` the coordinator on `coord`, restart the
-  same command. Workers continue without re-registration (durable run state
-  machine); time the gap with `time` around the restart plus the first
-  successful RPC.
+- **Coordinator recovery experiment:** `kill -9` the coordinator on `coord`,
+  then restart the same command. Durable run state should rehydrate, but
+  in-flight RPCs can fail and workers may need to retry or re-register. Record
+  the observed behavior; no completed 3-VM failover result is tracked here.
 
 ## Report
 
 Collect every `results/*.json` onto one machine and:
 
 ```bash
+mkdir -p docs/perf
 python benchmarks/multinode/report.py results/ --out docs/perf/multinode-report.md
 ```
 
 ## Local dress rehearsal (single machine, Docker)
 
 Validates the entire harness before spending VM time. Numbers are
-loopback-only — never publish them as the multi-node results.
+loopback-only and must not be reported as multi-node results.
 
 ```bash
 docker compose -f benchmarks/multinode/storage-compose.yml up -d

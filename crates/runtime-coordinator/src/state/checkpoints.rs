@@ -1,6 +1,7 @@
 //! The distributed checkpoint two-phase commit: a checkpoint becomes committed
-//! only once every expected worker has reported its artifacts and voted, so a
-//! crash always resumes from a globally consistent state.
+//! only once every expected worker has reported its artifacts and voted.
+//! Restore code can therefore select a globally consistent committed state;
+//! the training loop remains responsible for invoking restore after a crash.
 
 use super::*;
 

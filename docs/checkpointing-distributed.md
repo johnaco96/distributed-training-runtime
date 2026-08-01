@@ -42,9 +42,9 @@ stored and every rank has voted to commit (2PC).
 |---|---|
 | Distributed model + optimizer state | `torch.distributed.checkpoint.state_dict.get_state_dict` normalises DDP/FSDP wrappers; DCP writes sharded state per rank |
 | Restore across machines | Artifacts are fetched back through the coordinator (`FetchCheckpointArtifact` streaming RPC), so workers on any node can restore regardless of where the coordinator stores bytes (local disk or S3 write-through) |
-| World-size compatibility | DCP's load planner reshards saved state onto the current world size — save from 2 ranks, restore into 1 or 4 (validated in e2e: save@2 → restore@1 with identical parameters) |
-| Parallelism-strategy compatibility | The saved format is wrapper-agnostic (fully-qualified parameter names); save from DDP and load into FSDP or a plain module and vice versa |
-| Partial-upload recovery | Per-artifact retries with idempotent re-streaming; an interrupted save leaves a non-committed checkpoint that is never selected for restore and is GC'd |
+| World-size compatibility | DCP's load planner can reshard saved state for a different world size. This repository's end-to-end test validates save at 2 ranks → restore at 1 with identical parameters; 2 → 4 is not tested here. |
+| Parallelism-strategy compatibility | State collection uses PyTorch's wrapper-aware state-dict APIs. DDP is integration-tested; FSDP and DeepSpeed adapters have unit coverage, but cross-strategy restore is not validated here. |
+| Partial-upload recovery | Per-artifact retries use idempotent re-streaming. An interrupted save is never selected for restore. Failed/aborted attempts can be reclaimed after a newer commit, but attempts stuck forever in a nonterminal upload state are not automatically aged out. |
 | Corruption detection & repair | Artifacts are checksummed at write (post-write verification), re-checksummed while streaming out, and verified against the manifest on download. A mismatch triggers `ReportCheckpointCorrupt`: the checkpoint is marked FAILED, the latest pointer falls back to the previous committed checkpoint, and restore retries automatically (validated in e2e with deliberately corrupted artifacts) |
 | Retention / GC | `--checkpoint-keep-last <N>` on the coordinator keeps the newest N committed checkpoints per run; the reconcile task drops the older records **and reclaims their artifacts** — local files, and objects on the worker-direct S3 path through the coordinator's S3 client. Deletes are idempotent, so a sweep interrupted part-way converges on the next tick. A coordinator with no S3 backend configured logs the objects it cannot reach rather than dropping them silently |
 | Async save | `save_async` stages state (DCP async staging where available) and runs upload + 2PC on a background thread; `handle.result()` waits for the global commit. For the fully staged worker-direct S3 pipeline see `AsyncCheckpointer` below |
@@ -53,11 +53,15 @@ stored and every rank has voted to commit (2PC).
 ## Failure interactions
 
 - A worker dying mid-save leaves the checkpoint uncommitted; survivors'
-  commit votes never complete it, training recovers via re-rendezvous
+  commit votes never complete it. With `run_elastic`, a replacement worker,
+  and remaining restart budget, training can recover via re-rendezvous
   ([run-lifecycle.md](run-lifecycle.md)), and the next `save` uses a fresh
-  checkpoint id. The partial checkpoint ages out via retention.
+  checkpoint id. The partial checkpoint is non-restorable; an attempt left in
+  a nonterminal state requires operator cleanup because current retention does
+  not age it out.
 - After elastic membership changes, restore with the **new** world size —
-  resharding is exactly the DCP path validated above.
+  resharding uses DCP. The repository validates 2-rank save to 1-rank restore,
+  not every world-size or strategy combination.
 - Restoring a run that has no committed checkpoint returns `None` (fresh
   start), so the same training script handles cold starts and resumes.
 
@@ -101,9 +105,10 @@ isn't built) → **stage 3** report `{uri, size, sha256}` to the coordinator
 and cast this worker's 2PC commit vote.
 
 Restore prefers the local staged copy when its SHA-256 matches the committed
-manifest; otherwise the artifact is streamed back from S3 (written to
-`.part`, renamed on success) and verified against the manifest checksum —
-a tampered or truncated object fails restore instead of loading bad state.
+manifest; otherwise the artifact is downloaded from S3 and verified against
+the manifest checksum. The Rust downloader uses `.part` plus rename; the
+boto3 fallback writes the target directly. In either case, a tampered or
+truncated object fails restore instead of loading bad state.
 This is tested end-to-end against MinIO, including total loss of the local
 staging directory (`python/tests/test_async_checkpoint.py`, gated behind
 `DTRUNTIME_RUN_MINIO_TESTS=1`).

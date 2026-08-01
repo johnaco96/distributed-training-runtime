@@ -4,22 +4,21 @@ This quickstart gives a concise local setup and validation path for the Distribu
 
 - [Architecture Overview](architecture.md) — components, flows, and where each
   responsibility lives.
-- [README](../README.md) — the headline demo, measured performance, and the
-  project's honest limits.
+- [README](../README.md) — the main demo, measured performance, and current
+  limitations.
 - [PyTorch integration](pytorch-integration.md) — adapting an existing training
   script in a few lines.
 - [Troubleshooting](troubleshooting.md) — common setup and runtime issues.
-- [Path to production](PATH-TO-PRODUCTION.md) — what a real cluster deployment
+- [Path to production](PATH-TO-PRODUCTION.md) — what a cluster deployment
   additionally needs.
 
 ## Prerequisites
 
 Required:
 - Rust toolchain (`rustup`, `cargo`)
-- Python 3.9+ (the CI compatibility matrix covers 3.9–3.12 on Linux, macOS,
-  and Windows; 3.12 is the primary target)
+- Python 3.9+ (CI covers every minor from 3.9–3.12 on Linux and the primary
+  3.12 target on Linux, macOS, and Windows)
 - `protoc` (Protocol Buffers compiler)
-- `PYTHONPATH=python` when running Python commands from repo root
 
 Optional:
 - PyTorch (only needed for PyTorch examples)
@@ -33,8 +32,7 @@ From repository root:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e .
-$env:PYTHONPATH = "python"
+python -m pip install -e ".[dev]"
 ```
 
 Verify core tools:
@@ -51,8 +49,7 @@ protoc --version
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e .
-export PYTHONPATH=python
+python -m pip install -e ".[dev]"
 ```
 
 ## Fast validation path
@@ -62,18 +59,19 @@ Run these from repo root:
 ```bash
 cargo check --workspace --exclude dtruntime-native
 cargo test --workspace --exclude dtruntime-native
-PYTHONPATH=python python -m pytest python/tests
+python -m pytest python/tests
 ```
 
 `dtruntime-native` is the optional PyO3 accelerator; building it needs a
 CPython >= 3.11 interpreter that `cargo` cannot locate on its own, so it is
 excluded here. Build it separately with `python scripts/build_native.py` —
-the Python suite exercises it (and its pure-Python fallback) either way.
+the Python suite always exercises the pure-Python path and exercises the native
+path when the extension is present.
 
 ## Run coordinator/local demo
 
 ```bash
-PYTHONPATH=python python python/examples/local_demo.py
+python python/examples/local_demo.py
 ```
 
 ## Run benchmark smoke
@@ -90,15 +88,14 @@ If PyTorch is installed:
 ### Single-worker fresh + resume
 
 ```bash
-PYTHONPATH=python python python/examples/pytorch_train.py --epochs 1 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-smoke
-PYTHONPATH=python python python/examples/pytorch_train.py --epochs 2 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-smoke --resume
+python python/examples/pytorch_train.py --epochs 1 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-smoke
+python python/examples/pytorch_train.py --epochs 2 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-smoke --resume
 ```
 
-### Real 2-worker DDP with crash recovery
+### Two-worker DDP with crash recovery
 
-The flagship path — real multi-process gloo `torch.distributed`, a worker
-killed mid-training, re-rendezvous, and resume from the last committed
-checkpoint:
+This example runs multi-process gloo `torch.distributed`, terminates a worker
+during training, re-rendezvouses, and resumes from the last committed checkpoint:
 
 ```bash
 python demo/run_demo.py
@@ -107,6 +104,9 @@ python demo/run_demo.py
 Or drive the underlying example directly through the launcher:
 
 ```bash
+# Keep this coordinator running in a separate terminal first:
+cargo run -p runtime-coordinator -- --addr 127.0.0.1:50051
+
 python -m dtruntime.launch --coordinator 127.0.0.1:50051 --run-name smoke \
     --nproc-per-node 2 python/examples/pytorch_ddp_train.py -- --steps 20
 ```

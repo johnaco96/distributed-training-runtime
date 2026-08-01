@@ -29,7 +29,7 @@ RUN cargo build --release -p runtime-coordinator -p runtime-bench
 # Not the default target. Build it with `--target worker`.
 FROM python:3.12-slim-bookworm AS worker
 WORKDIR /app
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md LICENSE ./
 COPY python ./python
 # Install the SDK properly rather than leaning on PYTHONPATH, so the console
 # scripts (dtruntime-launch, dtruntime-admin) are on PATH and the dependency

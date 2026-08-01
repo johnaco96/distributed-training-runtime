@@ -13,7 +13,8 @@ and [data-pipeline.md](data-pipeline.md).
 ## Prerequisites
 
 ```bash
-pip install dtruntime            # the SDK
+# From a checkout (the package is not claimed as published yet):
+pip install -e .                 # the SDK
 pip install torch                # your existing torch install
 ```
 
@@ -54,6 +55,10 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 - `ddp` → `DistributedDataParallel` (device from `ctx.local_rank` on CUDA).
 - `fsdp` → `FullyShardedDataParallel`.
 - `deepspeed` → `deepspeed.initialize` (pass DeepSpeed kwargs through).
+
+DDP is covered by local multi-process integration tests. The FSDP and
+DeepSpeed adapters have unit coverage, but this repository does not claim
+validated multi-node or cross-strategy checkpoint restores for them.
 
 ## Step 3 — restore + checkpoint through the coordinator
 
@@ -173,7 +178,7 @@ loader = torch.utils.data.DataLoader(dataset, batch_size=64, num_workers=4)
 | Concern | Plain torch.distributed / torchrun | With dtruntime |
 |---|---|---|
 | Rendezvous | c10d store / etcd you operate | Coordinator-backed, no extra store |
-| Rank assignment | static, launcher-assigned | Coordinator-assigned, stable across rejoins |
+| Rank assignment | static, launcher-assigned | Coordinator-assigned; preserved across rejoins when possible |
 | Elastic membership | manual / limited | `run_elastic` + coordinator failure detection |
 | Checkpoint durability | your `torch.save` | DCP + 2PC commit + corruption fallback |
 | Data sharding | your `DistributedSampler` | Optional coordinator shard assignment + cache |

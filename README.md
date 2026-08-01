@@ -2,13 +2,13 @@
 
 [![CI](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/ci.yml)
 [![Compatibility](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/compat.yml/badge.svg?branch=main)](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/compat.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/johnaco96/distributed-training-runtime/blob/main/LICENSE)
 
-A **high-performance runtime for distributed PyTorch training** — a Rust core + Python SDK that manage the parts PyTorch doesn't: worker rendezvous, rank assignment, sharded data loading, fault-tolerant checkpointing to object storage, and **automatic recovery when a worker dies**. The Python API stays a handful of lines; the byte-moving I/O paths (shard decode/fetch, checkpoint upload/restore) and the always-on control plane run in Rust.
+A **high-performance runtime for distributed PyTorch training** — a Rust core + Python SDK that manage worker rendezvous, rank assignment, sharded data loading, checkpointing to object storage, and elastic recovery when the launcher can replace a failed worker. The Python API stays a handful of lines. The control plane runs in Rust; optional native components accelerate shard I/O and worker-direct checkpoint transfer, with Python fallbacks when they are not built.
 
-It is *not* a training framework (it uses `torch.distributed`) and *not* a GPU scheduler. It's the coordination brain and data plane that let a training job survive worker crashes and resume from the last checkpoint without losing progress.
+It is *not* a training framework (it uses `torch.distributed`) and *not* a GPU scheduler. It supplies coordination and data paths that an elastic training loop can use to replace a failed worker and restore the last committed checkpoint; work after that checkpoint is replayed.
 
-**Measured, reproducibly** (details + repro commands in [Performance](#performance-measured)): the coordinator sustains **5,000 concurrently heartbeating workers at ~99k RPC/s** (p99 25 ms, zero failed RPCs); the Rust data plane loads shards at **~1M records/s (2 GB/s), 5.8× the pure-Python path**, handing tensors to PyTorch zero-copy; checkpoint restore works from S3 alone after a node loses every local file.
+**Measured in the documented local benchmark runs** (details, environment, and repro commands in [Performance](#performance-measured)): the coordinator handled **5,000 simulated workers at ~99k RPC/s** (p99 25 ms, zero failed RPCs); the optional Rust data plane loaded shards at **~1M records/s (2 GB/s), 5.8× the pure-Python path**, with a zero-copy buffer handoff; and the worker-direct checkpoint path restored from S3 after its local staging files were deleted. Results are not multi-node production measurements.
 
 ## See it work in one command
 
@@ -31,32 +31,32 @@ This starts the Rust coordinator, launches a **real 2-worker gloo DDP training j
 
 ## Real training numbers
 
-The 30-second demo above uses a toy model so it needs no dataset. To prove the same machinery works with a **real model on real data**, `demo/run_benchmark.py` trains a genuine **torchvision ResNet-18 on the real CIFAR-10 dataset** across 2 gloo DDP workers, crashes a worker mid-training, and resumes from the last distributed checkpoint:
+The 30-second demo above uses a toy model and no dataset. `demo/run_benchmark.py` exercises the same recovery path with torchvision ResNet-18 and CIFAR-10 across 2 local gloo DDP workers. It terminates one worker during training and resumes from the last distributed checkpoint:
 
 ```bash
 pip install -e ".[demo]"          # adds torch + torchvision
 python demo/run_benchmark.py      # downloads CIFAR-10 once (~168 MB), then trains
 ```
 
-Measured on a laptop CPU (2 workers × batch 32, 100 steps, `results.json` written alongside):
+Example output recorded from one laptop CPU run (2 workers × batch 32, 100 steps). The script writes a fresh `results.json`; the original result file is not tracked, so treat these figures as illustrative rather than a reproducible baseline:
 
 | Metric | Measured |
 |---|---|
 | Throughput | **128 img/s** aggregate · 506 ms/step/rank |
-| Loss (start → end) | **2.28 → 1.37** — the model genuinely learns |
+| Loss (start → end) | **2.28 → 1.37** |
 | Accuracy (start → end) | **0.19 → 0.49** — vs. 0.10 random baseline |
 | Distributed checkpoint (DCP) | **~760 ms**, ~135 MB each |
 | Fault injected | worker killed at step 60 |
 | Recovered from | committed checkpoint at step 49, in **~0.7 s** |
 | Total wall time | **~104 s** (incl. crash + rebuild + resume) |
 
-These are *systems* numbers — the point isn't state-of-the-art accuracy (it's a sub-epoch CPU run), it's that a real DDP job **loses a worker and resumes from a globally-consistent checkpoint without losing progress**, and that failure detection is bounded (a configurable process-group timeout, not the 5-minute default).
+This benchmark evaluates recovery behavior rather than model quality. In the recorded run, the launcher replaced the failed local worker and the elastic training loop restored the last globally committed checkpoint. Training then replayed the work performed after that checkpoint.
 
 ## Performance (measured)
 
 Every number below has a reproduction command and an environment disclosure in its linked writeup — and where a result has a caveat, the writeup says so.
 
-**Control plane at scale** — [docs/benchmarks/control-plane-scale.md](docs/benchmarks/control-plane-scale.md) (WSL2 loopback, simulated protocol-level workers):
+**Control plane at scale** — [benchmark methodology and results](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/benchmarks/control-plane-scale.md) (WSL2 loopback, simulated protocol-level workers):
 
 | | |
 |---|---|
@@ -67,7 +67,7 @@ Every number below has a reproduction command and an environment disclosure in i
 
 The load generator runs every simulated worker as its own concurrent task over pooled HTTP/2 channels with a bounded in-flight budget, so the offered load is exactly what the flags specify — the writeup details the methodology.
 
-**Rust data plane** — [docs/benchmarks/data-plane-throughput.md](docs/benchmarks/data-plane-throughput.md) (local NVMe; s3:// leg vs MinIO):
+**Rust data plane** — [benchmark methodology and results](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/benchmarks/data-plane-throughput.md) (local NVMe; s3:// leg vs MinIO):
 
 | | Pure Python | Rust (`_native`) |
 |---|---|---|
@@ -75,16 +75,16 @@ The load generator runs every simulated worker as its own concurrent task over p
 | Prefetching stream, disk, incl. SHA-256 | — | **1.23M rec/s** |
 | Prefetching stream, S3 (MinIO), incl. SHA-256 | — | **792 MB/s** |
 
-**Checkpoint durability** — [docs/checkpointing-distributed.md](docs/checkpointing-distributed.md): training stalls only for the in-memory snapshot (`t_stall_s`); upload, 2PC commit, and restore stream through Rust. Verified against real MinIO: a worker whose staging disk is wiped restores from S3 alone, and a tampered S3 object fails the manifest checksum instead of loading bad state.
+**Checkpoint durability** — [distributed checkpoint design](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/checkpointing-distributed.md): `AsyncCheckpointer` measures the synchronous snapshot time as `t_stall_s`, then serializes and transfers in the background. Worker-direct S3 transfer uses the Rust uploader when built and boto3 otherwise; 2PC itself is coordinator metadata. MinIO-gated tests delete local staging before restore and reject a tampered S3 object by checksum.
 
 ## The problem it solves
 
-Run training across many processes/machines and someone has to answer: *Are all N workers here? What rank is each? One just crashed — restart, shrink, or fail? Where's the last good checkpoint, and is it intact?* Vanilla `torchrun` handles the happy path thinly. This runtime centralizes those decisions in a **durable, recoverable service**:
+Distributed training requires coordination for worker membership, rank assignment, failure handling, and checkpoint selection. This runtime centralizes those responsibilities in a durable service:
 
-- **Rendezvous & rank assignment** — workers find each other through the coordinator (no external etcd to operate); ranks are stable across restarts.
+- **Rendezvous & rank assignment** — workers find each other through the coordinator (no external etcd to operate); the launcher preserves worker identities and ranks when possible.
 - **Elastic failure recovery** — a dead worker is detected via heartbeats; survivors re-rendezvous and resume. (That's the demo.)
-- **Distributed checkpointing with 2-phase commit** — a checkpoint becomes "committed" only when *every* worker's artifacts are in, so a crash always resumes from a globally-consistent state. Corrupt checkpoints are detected and fall back to the previous good one.
-- **Worker-direct S3 checkpoints** — with `AsyncCheckpointer`, artifact bytes stream worker ↔ object storage through Rust in both directions (the coordinator holds only metadata + the commit); training stalls only for the in-memory snapshot, and a worker that loses its entire local disk restores from S3 with the manifest checksum verified. Tested against real MinIO, including tamper detection.
+- **Distributed checkpointing with 2-phase commit** — a checkpoint becomes committed only when every expected worker's artifacts and commit vote are in. `DistributedCheckpointer` selects globally committed state and can report corruption and retry an older committed generation.
+- **Worker-direct S3 checkpoints** — with `AsyncCheckpointer`, artifact bytes move directly between the worker and object storage (the coordinator holds metadata + commit state). The optional Rust uploader handles both directions when built; boto3 is the fallback. MinIO-gated tests cover loss of local staging and tamper detection.
 - **Coordinator durability** — run/worker state is persisted (SQLite or PostgreSQL), so the coordinator can restart without losing the job.
 - **Sharded data, decoded in Rust** — deterministic per-rank shard assignment with a local cache, and a native module (`dtruntime._native`) that fetches, integrity-checks, and batch-decodes shards with the GIL released, handing tensors to PyTorch **zero-copy** through the buffer protocol. Pure-Python fallback included (`DTRUNTIME_NATIVE=0`), asserted bit-identical.
 
@@ -99,10 +99,10 @@ Run training across many processes/machines and someone has to answer: *Are all 
   │  data        (IterableDataset)              │ failure detection / recovery │
   │  launch      (torchrun-style supervisor)    │ durable metadata (SQLite/PG) │
   ├──────────────────────────────┤              └──────────────────────────────┘
-  │ Rust data plane (in-process) │                     metadata only — no
-  │  _native: shard fetch+decode,│                     checkpoint/shard bytes
-  │  zero-copy tensors, prefetch │                     cross the coordinator
-  │  runtime-uploader: checkpoint│                     on the S3 path
+  │ Optional Rust data movers    │                     portable DCP artifacts
+  │  _native: shard fetch+decode,│                     can cross coordinator;
+  │  zero-copy buffers, prefetch │                     worker-direct S3 bytes
+  │  runtime-uploader: checkpoint│                     bypass it
   │  stream up/down + sha256     │
   └──────────────┬───────────────┘
                  │ artifact bytes (streamed, verified)
@@ -115,12 +115,12 @@ Run training across many processes/machines and someone has to answer: *Are all 
 
 | Choice | Why |
 |---|---|
-| **Rust** for the coordinator | It's the always-on control plane that must *never* be the thing that takes the cluster down. Memory safety (no segfaults/GC pauses), fearless concurrency for thousands of workers heartbeating at once, and predictable low latency — exactly what a stateful control plane needs. Built on `tokio` + `tonic`. Measured: 5,000 heartbeating workers in 56 MB of RSS. |
+| **Rust** for the coordinator | The always-on control plane benefits from memory safety, concurrency, and predictable latency. Built on `tokio` + `tonic`. In the documented loopback benchmark, 5,000 simulated workers used 56 MB peak RSS. |
 | **Rust** for the I/O hot paths | Shard decode and checkpoint transfer are byte-moving loops where Python pays per-object overhead on every record. The PyO3 extension decodes with the GIL released and hands PyTorch a zero-copy view (5.8× measured); the uploader streams artifacts to/from S3 without buffering them in RAM. |
 | **Python** for the SDK | ML engineers and PyTorch live in Python. The SDK meets them there, wrapping `torch.distributed`, Distributed Checkpoint (DCP), and `DataLoader` so integrating is a handful of lines (see `docs/pytorch-integration.md`). Every Rust acceleration hides behind the same API with a pure-Python fallback. |
-| **gRPC + Protobuf** | A strongly-typed, versioned, cross-language contract between the Rust control plane and Python workers — the natural seam for a two-language system, and it makes backward-compatibility enforceable. |
-| **`torch.distributed` (gloo/NCCL)** | Reuse PyTorch's battle-tested collectives. The runtime owns *coordination*, not the math — the right boundary. |
-| **SQLite → PostgreSQL** | SQLite for zero-dependency local/dev; PostgreSQL for durable, HA metadata in production. The coordinator rehydrates its state on restart from whichever is configured. |
+| **gRPC + Protobuf** | A strongly typed, versioned contract between the Rust control plane and Python workers. The compatibility snapshot detects incompatible changes to the protocol. |
+| **`torch.distributed` (gloo/NCCL)** | PyTorch provides the collective operations; this runtime provides coordination around them. |
+| **SQLite → PostgreSQL** | SQLite for zero-dependency local/dev; PostgreSQL for durable metadata and advisory-lock leader/standby operation. The coordinator rehydrates its state on restart from either backend; real multi-replica failover has not been validated here. |
 
 ## Repository layout
 
@@ -154,7 +154,9 @@ python -m dtruntime.launch --help                    # the torchrun-style launch
 dtruntime-admin --help                               # inspect/manage runs from the CLI
 ```
 
-Integrate your own script in a few lines: **[docs/pytorch-integration.md](docs/pytorch-integration.md)**.
+Integrate your own script in a few lines: **[PyTorch integration guide](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/pytorch-integration.md)**.
+Contributions are welcome; see the [contribution guide](https://github.com/johnaco96/distributed-training-runtime/blob/main/CONTRIBUTING.md). Please report
+security issues through the [private reporting process](https://github.com/johnaco96/distributed-training-runtime/blob/main/SECURITY.md).
 
 ## Operational surface
 
@@ -171,8 +173,8 @@ Beyond the training path, the coordinator ships the pieces a control plane needs
 
 ## Scaling to production
 
-This branch is a **clean, focused prototype** — it proves the hard distributed-systems parts work, and everything above is validated locally, not against a managed cloud identity provider or a multi-node cluster. The remaining distance to a real cluster is mostly *deployment* surface: a Kubernetes operator, Helm packaging, SLO/alerting rules, image signing, and Volcano/Kueue scheduling integration. A **full implementation of all of it lives on the [`production-hardening`](../../tree/production-hardening) branch**; see **[docs/PATH-TO-PRODUCTION.md](docs/PATH-TO-PRODUCTION.md)** for the map from here to there.
+This branch is a prototype validated locally rather than against a managed cloud identity provider or multi-node cluster. The separate [`production-hardening`](https://github.com/johnaco96/distributed-training-runtime/tree/production-hardening) branch contains broader Kubernetes, operator, observability, security-evidence, and release assets. That branch is also prototype-grade and has not been validated as a production deployment. See the **[path to production](https://github.com/johnaco96/distributed-training-runtime/blob/main/docs/PATH-TO-PRODUCTION.md)** for details.
 
-## Status & honest limits
+## Status and limitations
 
-Validated locally with real multi-process (gloo) training, checkpoint restore, live MinIO object storage, and `perf`-profiled load testing at 5,000 simulated workers. The scale numbers are **single-machine, loopback, protocol-level** — they bound the control plane, not a cluster. **Not** yet run on a real multi-node GPU cluster or managed cloud — the same rendezvous/NCCL path is used, but that's the next milestone, not a proven claim. This is a portfolio/reference-grade runtime focused on correct coordination, recovery semantics, and measured performance.
+Local validation covers multi-process gloo training, checkpoint restore, MinIO object storage, and `perf`-profiled load testing with 5,000 simulated workers. The scale measurements use a single machine, loopback networking, and protocol-level workers; they do not represent cluster performance. Multi-node GPU training and managed-cloud deployment have not been validated. This is a portfolio/reference implementation focused on coordination, recovery semantics, and measured local performance.

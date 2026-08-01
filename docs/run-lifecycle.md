@@ -1,7 +1,7 @@
 # Run lifecycle and failure semantics
 
-This document defines the durable run lifecycle state machine and the exact
-behavior for every failure class: worker death (during training and during
+This document describes the implemented durable run lifecycle and the covered
+behavior for worker death (during training and during
 gradient synchronization), coordinator failover during active RPCs, stuck
 jobs, and cleanup. It complements [failure-recovery.md](failure-recovery.md)
 (shard leases, checkpoint recovery) and
@@ -37,7 +37,7 @@ PENDING ──► RUNNING ◄──►│──► RECOVERING
 ## Admin lifecycle operations
 
 Operators drive these transitions with the `dtruntime-admin run <action>`
-commands (see [admin-cli.md](../README.md)) or the corresponding
+commands (see the [README operational surface](../README.md#operational-surface)) or the corresponding
 `RuntimeClient`/gRPC calls. `PAUSED` and `DRAINING` are **non-terminal** — a
 paused run is resumable and a draining run still completes normally.
 
@@ -55,9 +55,11 @@ optional operator-supplied reason. The per-run `retry_count` is persisted
 (schema migration v2) and survives coordinator restarts; it surfaces in
 `ListRuns` / `runs list`.
 
-`COMPLETED`, `FAILED`, and `CANCELLED` are **terminal and final** — later
-transition attempts (including cancellation racing completion) are ignored,
-and terminal runs reject `RegisterWorker` and `JoinRendezvous` with
+`COMPLETED`, `FAILED`, and `CANCELLED` are **terminal and final**. A
+`CancelRun` or internal terminal-state race against an already terminal run is
+an idempotent no-op; other invalid admin transitions return
+`FAILED_PRECONDITION`. Terminal runs reject `RegisterWorker` and
+`JoinRendezvous` with
 `FAILED_PRECONDITION`. Workers observe the run state on every heartbeat
 response and exit when it turns terminal; launchers check the state before
 restarting a failed worker so a cancelled run is never kept alive by restart
@@ -91,13 +93,16 @@ on `TrainingContext.shutdown()` / context-manager exit.
 **Coordinator failover / restart during active RPCs.** In-flight RPCs fail
 with a transport error; the contract is:
 
-- every mutating RPC carries an idempotency key, so client retries are safe;
+- mutating RPCs carry idempotency keys; replaying an operation with the same
+  key is handled idempotently by the corresponding coordinator handler;
 - run, worker, shard-progress, and 2PC-vote state rehydrate from the metadata
   store on startup (including `RegisterRun` idempotency mappings, so a
   re-registering launcher gets the same run back);
 - rendezvous state is deliberately in-memory. Completed process groups do not
-  depend on the coordinator, so **training continues through the outage**;
-  workers' heartbeats retry until the new leader answers. Workers that were
+  depend on the coordinator, so compute and collectives that do not require a
+  coordinator RPC can continue during an outage. Heartbeats and other
+  coordinator-dependent operations can fail or retry until the new leader
+  answers. Workers that were
   mid-rendezvous re-assert membership (the SDK re-joins automatically on
   transient errors), and round numbers are wall-clock-seeded so a restarted
   coordinator can never reuse a round a worker still holds.
@@ -125,11 +130,12 @@ exists.
 
 ## Admin operations
 
-`CancelRun` (admin role) is the first lifecycle admin operation; pause,
-resume, retry, and drain arrive with the admin CLI work. From Python:
+The admin role can cancel, pause, resume, retry, and drain runs. From Python:
 
 ```python
 client.cancel_run(run_id, reason="preempting for higher-priority job")
+client.pause_run(run_id, reason="maintenance")
+client.resume_run(run_id)
 status = client.get_run_status(run_id)   # .state, .state_reason
 ```
 

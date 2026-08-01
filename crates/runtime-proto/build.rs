@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let include_refs: Vec<&str> = includes.iter().map(String::as_str).collect();
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
         .compile_protos(&["../../proto/runtime.proto"], &include_refs)

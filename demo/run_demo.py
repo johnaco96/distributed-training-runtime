@@ -120,8 +120,8 @@ def main() -> int:
                if ok else "DEMO INCOMPLETE - see checks above.")
         if ok:
             print("  A worker died mid-training, the coordinator re-formed the\n"
-                  "  process group, and training resumed from the last checkpoint\n"
-                  "  without losing progress. Try `dtruntime-admin -a "
+                  "  process group, and training restored the last committed checkpoint;\n"
+                  "  work after that checkpoint was replayed. Try `dtruntime-admin -a "
                   f"{address} runs list` while it runs.\n")
         return 0 if ok else 1
     finally:

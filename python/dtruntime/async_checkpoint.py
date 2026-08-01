@@ -54,6 +54,11 @@ from ._util import sha256_file as _sha256_file
 # collective/membership error and tear down the process group.
 from .checkpointing import CheckpointError
 
+_PICKLE_TRUST_MESSAGE = (
+    "PyTorch is required for safe weights-only checkpoints; install PyTorch, "
+    "or set weights_only=False only for trusted state"
+)
+
 __all__ = ["AsyncCheckpointer", "CheckpointHandle", "CheckpointError"]
 
 _SENTINEL = object()
@@ -86,18 +91,24 @@ def _snapshot(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
-def _serialize_to(path: Path, state: Any) -> None:
+def _serialize_to(path: Path, state: Any, *, allow_pickle: bool = False) -> None:
     """Stage 1: write *state* atomically (tmp + fsync + rename)."""
     torch = _torch()
+    if torch is None and not allow_pickle:
+        raise CheckpointError(_PICKLE_TRUST_MESSAGE)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        if torch is not None:
-            torch.save(state, f)
-        else:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "wb") as f:
+            if torch is not None:
+                torch.save(state, f)
+            else:
+                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _find_uploader_bin() -> Optional[Path]:
@@ -166,6 +177,9 @@ class AsyncCheckpointer:
             ``file://`` / plain directory path.  ``None`` keeps artifacts
             local-only (the staged file itself is the artifact URI).
         uploader_bin: path to runtime-uploader; auto-detected when ``None``.
+        weights_only: use PyTorch's restricted weights-only loader (the default).
+            Setting this to ``False`` also permits the pickle fallback when
+            PyTorch is unavailable and must only be used with trusted state.
     """
 
     def __init__(
@@ -304,7 +318,9 @@ class AsyncCheckpointer:
         )
 
         # Stage 1: local durability.
-        _serialize_to(handle.staging_path, snapshot)
+        _serialize_to(
+            handle.staging_path, snapshot, allow_pickle=not self.weights_only
+        )
         del snapshot
         handle.sha256 = _sha256_file(handle.staging_path)
         handle.size_bytes = handle.staging_path.stat().st_size
@@ -413,5 +429,7 @@ class AsyncCheckpointer:
         torch = _torch()
         if torch is not None:
             return torch.load(path, map_location="cpu", weights_only=self.weights_only)
+        if self.weights_only:
+            raise CheckpointError(_PICKLE_TRUST_MESSAGE)
         with open(path, "rb") as f:
             return pickle.load(f)

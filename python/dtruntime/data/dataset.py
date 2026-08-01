@@ -29,17 +29,18 @@ Usage
 
 What it does each ``__iter__`` (i.e. each ``DataLoader`` pass):
 
-1. asks the coordinator for this rank's shards (stable per-rank subset),
-   sending the warm-cache hint for sticky placement;
+1. asks the coordinator for this rank's shards (deterministic for a fixed
+   world size and rank mapping), sending a warm-cache ordering hint;
 2. splits those shards across the DataLoader worker processes;
 3. shuffles the shard order for the current epoch (deterministic);
 4. streams records with prefetch + backpressure, optionally shuffling records
    within a shard via a reservoir buffer;
-5. reports per-shard progress to the coordinator (resume-from-offset) and
-   applies the user ``transform``.
+5. reports best-effort per-shard progress to the coordinator and applies the
+   user ``transform``. The offset is reported after prefetch enqueue, not after
+   training-loop consumption, so failure recovery is not exactly once.
 
-Determinism is keyed on ``(seed, epoch)`` so all ranks/workers agree without
-extra coordination and a resumed worker reproduces its order exactly.
+Determinism is keyed on ``(seed, epoch)`` so workers using the same inputs and
+library behavior reproduce the same shuffle order without extra coordination.
 """
 
 from __future__ import annotations

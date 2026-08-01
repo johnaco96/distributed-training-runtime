@@ -19,9 +19,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.12"]
         include:
-          # Also check the minimum supported Python on Linux.
+          # Check every supported Python minor on Linux; 3.12 is exercised on
+          # all three host platforms by the matrix above.
           - os: ubuntu-latest
             python: "3.9"
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.11"
     steps:
       - uses: actions/checkout@v7
 

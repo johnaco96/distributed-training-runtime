@@ -1,4 +1,4 @@
-"""Production data pipeline for the Distributed Training Runtime.
+"""Sharded data pipeline for the Distributed Training Runtime.
 
 Owns the full lifecycle of a shard — authoring it, reading it back, and
 streaming it into a PyTorch ``DataLoader``.

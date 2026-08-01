@@ -3,7 +3,9 @@
 The runtime launches and orchestrates real `torch.distributed` training:
 workers form process groups through a coordinator-backed rendezvous, receive
 coordinator-assigned ranks, and recover from worker death by re-rendezvousing
-with rank replacement. Elastic runs grow and shrink between configured bounds.
+with rank replacement. The rendezvous implementation supports world sizes
+between configured bounds; the repository's end-to-end training validation is
+local two-process gloo, not multi-node elastic scale-up/down.
 
 ## Quick start
 
@@ -87,8 +89,10 @@ python -m dtruntime.launch \
     train.py
 ```
 
-Training then runs at whatever world size the rendezvous settles on, shrinking
-when workers are lost and growing when replacements or new nodes join.
+Training runs at the world size on which the rendezvous settles. New rounds can
+settle at a different size when membership changes, provided at least the
+configured minimum joins. Provisioning replacement or new nodes is outside
+this repository.
 
 **Writing an elastic training loop.** Wrap the per-round training body in
 `run_elastic`; construct (or restore from the latest checkpoint) the model,
@@ -122,6 +126,10 @@ it propagates — genuine training bugs are not swallowed.
 | `ddp` | `torch.nn.parallel.DistributedDataParallel` | Default. Moves the model to `cuda:{local_rank}` and sets `device_ids` when CUDA is available. |
 | `fsdp` | `torch.distributed.fsdp.FullyShardedDataParallel` | Pass FSDP kwargs (`sharding_strategy`, `auto_wrap_policy`, ...) through `wrap_model`. |
 | `deepspeed` | `deepspeed.initialize` | Returns the DeepSpeed engine tuple. Requires `pip install deepspeed` (Linux). |
+
+DDP is exercised by the multi-process integration suite. FSDP and DeepSpeed
+adapter construction has unit coverage; multi-node execution and
+cross-strategy restore are not validated here.
 | `none` | — | Returns the model unchanged (single-worker debugging). |
 
 ## Launcher reference
@@ -171,4 +179,4 @@ Tuning knobs read by `torch_dist`:
 
 Validated locally with multi-process gloo on a single machine. Multi-node
 NCCL execution follows the same rendezvous path but has not been validated on
-a real GPU cluster yet; see [status-and-limitations.md](../README.md).
+a GPU cluster; see the [README status and limitations](../README.md#status-and-limitations).

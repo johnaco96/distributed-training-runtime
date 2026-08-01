@@ -81,13 +81,17 @@ PyTorch examples are optional and should be skipped when torch is unavailable.
 - Core Rust + Python SDK validation does not require torch.
 
 ### PyTorch 2.6+ `weights_only` considerations
-Checkpoint config/state should remain safe primitive types to avoid unsafe pickle-like restore patterns and compatibility surprises.
+Checkpoint config/state should remain safe primitive types to avoid unsafe
+pickle-like restore patterns and compatibility surprises. `AsyncCheckpointer`
+uses `weights_only=True` by default and refuses a pickle fallback when PyTorch
+is unavailable. Set `weights_only=False` only for artifacts you trust.
 
 ### GPU/CUDA not required
 All project examples are intended to run on CPU.
 
-### No torchvision/external dataset required
-Examples use synthetic/local data; external datasets are not required for basic validation.
+### External datasets are optional for basic validation
+Core examples and basic validation use synthetic or local data. The optional
+real-model benchmark requires torchvision and downloads CIFAR-10.
 
 ## E) Local demo / integration test issues
 

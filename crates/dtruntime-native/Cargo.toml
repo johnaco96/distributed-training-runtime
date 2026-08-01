@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 # protocol (bf_getbuffer) joined the limited API in 3.11, and zero-copy
 # tensor handoff is this module's whole point. The pure-Python fallback keeps
 # the SDK's 3.9 floor; this optional accelerator needs 3.11+.
-pyo3 = { version = "0.25", features = ["extension-module", "abi3-py311"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
 runtime-storage = { path = "../runtime-storage", features = ["s3"] }
 sha2 = "0.10"
 hex = "0.4"
