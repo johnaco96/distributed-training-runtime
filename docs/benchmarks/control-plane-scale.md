@@ -41,8 +41,9 @@ than a single serialized request stream.
 | 5000 | 512 | 305,000 (== offered) | 11.7 ms | 21.8 ms | 31.0 ms | 34 MB |
 | 5000 @ 100 ms cadence | 1024 | 1,220,668 (**~40k RPC/s, saturated**) | 24.2 ms | 43.6 ms | 62.3 ms | 50 MB |
 
-Zero failed RPCs in every run. The 100 ms-cadence run is the interesting one:
-offered load is ~100k RPC/s and the coordinator could only clear ~40k.
+Zero failed RPCs occurred in the recorded runs. At the 100 ms cadence, the
+offered load was approximately 100k RPC/s and the coordinator completed about
+40k RPC/s before the optimization described below.
 
 ## Hotspot found and fixed
 
@@ -86,7 +87,7 @@ straight from the map. Also unmeasured here: SQLite `persist_worker` runs on
 every heartbeat (I/O, invisible to CPU profiles); batching heartbeat
 durability (votes stay synchronous) is the likely next latency win.
 
-## Caveats, honestly
+## Limitations
 
 - Loopback: no network latency/jitter/packet loss; a real cluster adds RTTs.
 - Simulated workers: no gRPC-per-worker connection churn (channels are

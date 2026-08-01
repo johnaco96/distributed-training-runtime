@@ -4,12 +4,12 @@ This quickstart gives a concise local setup and validation path for the Distribu
 
 - [Architecture Overview](architecture.md) — components, flows, and where each
   responsibility lives.
-- [README](../README.md) — the headline demo, measured performance, and the
-  project's honest limits.
+- [README](../README.md) — the main demo, measured performance, and current
+  limitations.
 - [PyTorch integration](pytorch-integration.md) — adapting an existing training
   script in a few lines.
 - [Troubleshooting](troubleshooting.md) — common setup and runtime issues.
-- [Path to production](PATH-TO-PRODUCTION.md) — what a real cluster deployment
+- [Path to production](PATH-TO-PRODUCTION.md) — what a cluster deployment
   additionally needs.
 
 ## Prerequisites
@@ -92,11 +92,10 @@ python python/examples/pytorch_train.py --epochs 1 --samples 32 --batch-size 8 -
 python python/examples/pytorch_train.py --epochs 2 --samples 32 --batch-size 8 --out-dir .dtruntime-pytorch-smoke --resume
 ```
 
-### Real 2-worker DDP with crash recovery
+### Two-worker DDP with crash recovery
 
-The flagship path — real multi-process gloo `torch.distributed`, a worker
-killed mid-training, re-rendezvous, and resume from the last committed
-checkpoint:
+This example runs multi-process gloo `torch.distributed`, terminates a worker
+during training, re-rendezvouses, and resumes from the last committed checkpoint:
 
 ```bash
 python demo/run_demo.py

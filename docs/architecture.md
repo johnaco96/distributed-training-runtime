@@ -136,7 +136,7 @@ streams the artifact to S3 through `runtime-uploader` when that optional
 binary is available (or boto3 otherwise), reports
 `{uri, size, sha256}` to the coordinator, and casts the 2PC vote. Restore
 prefers the local staged copy (checksum-verified) and otherwise streams the
-artifact back from S3, failing loudly on any manifest checksum mismatch. The
+artifact back from S3 and returns an error on any manifest checksum mismatch. The
 Rust downloader writes to `.part` and renames on success; the boto3 fallback
 does not provide that same temporary-file behavior.
 The coordinator handles metadata and votes only.

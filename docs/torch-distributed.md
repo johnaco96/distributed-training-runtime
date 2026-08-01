@@ -179,4 +179,4 @@ Tuning knobs read by `torch_dist`:
 
 Validated locally with multi-process gloo on a single machine. Multi-node
 NCCL execution follows the same rendezvous path but has not been validated on
-a real GPU cluster yet; see the [README status and limits](../README.md#status--honest-limits).
+a GPU cluster; see the [README status and limitations](../README.md#status-and-limitations).

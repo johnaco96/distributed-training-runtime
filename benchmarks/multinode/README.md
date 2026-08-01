@@ -100,7 +100,7 @@ python benchmarks/multinode/report.py results/ --out docs/perf/multinode-report.
 ## Local dress rehearsal (single machine, Docker)
 
 Validates the entire harness before spending VM time. Numbers are
-loopback-only — never publish them as the multi-node results.
+loopback-only and must not be reported as multi-node results.
 
 ```bash
 docker compose -f benchmarks/multinode/storage-compose.yml up -d

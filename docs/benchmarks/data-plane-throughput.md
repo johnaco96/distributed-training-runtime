@@ -25,7 +25,7 @@ python benchmarks/dataloading/bench_dtrs.py --s3-bucket <bucket>
 | `ShardStream` file:// (prefetch=3 + SHA-256 verify) | — | 1,230,418 rec/s (2,525 MB/s) | — |
 | `ShardStream` s3:// MinIO loopback (prefetch=3 + SHA-256 verify) | — | 386,146 rec/s (792 MB/s) | — |
 
-Reading the table honestly:
+Interpretation:
 
 - The **batch path** is where zero-copy pays: one GIL-released decode pass,
   one `torch.frombuffer` view. 5.8× is the headline and it is real.

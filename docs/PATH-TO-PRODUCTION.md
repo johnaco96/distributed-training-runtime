@@ -1,6 +1,6 @@
 # Path to production
 
-This branch (`main`) is a **clean, focused prototype**: the Rust coordinator, the
+This branch (`main`) is a prototype containing the Rust coordinator, the
 Python SDK, and a one-command failure-recovery demo. It carries the pieces that
 make the control plane itself trustworthy — layered OIDC/SPIFFE authentication,
 RBAC, TLS/mTLS, durable SQLite/PostgreSQL metadata with advisory-lock HA,
@@ -48,11 +48,11 @@ The prototype already makes the choices that make scaling straightforward:
 3. **Security + observability** (#7–8) — before real workloads run on it.
 4. **Scheduling, release, scale-validation** (#5, #9–10) — as scale demands.
 
-## The honest gap
+## Current limitations
 
 Even the `production-hardening` branch is validated **locally and in `kind`**,
 not on a real multi-node GPU cluster or managed cloud at scale. The rendezvous
 and checkpoint paths are the same ones a real cluster would use, but multi-node
 NCCL training, AWS S3 at load, and live cloud IAM/SIEM integration are the next
 milestone. See that branch's `docs/support-matrix.md` and
-`docs/status-and-limitations.md` for the precise, honest boundaries.
+`docs/status-and-limitations.md` for the detailed boundaries.
