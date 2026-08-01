@@ -1,5 +1,9 @@
 # Distributed Training Runtime
 
+[![CI](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/ci.yml)
+[![Compatibility](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/compat.yml/badge.svg?branch=main)](https://github.com/johnaco96/distributed-training-runtime/actions/workflows/compat.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A **high-performance runtime for distributed PyTorch training** — a Rust core + Python SDK that manage the parts PyTorch doesn't: worker rendezvous, rank assignment, sharded data loading, fault-tolerant checkpointing to object storage, and **automatic recovery when a worker dies**. The Python API stays a handful of lines; the byte-moving I/O paths (shard decode/fetch, checkpoint upload/restore) and the always-on control plane run in Rust.
 
 It is *not* a training framework (it uses `torch.distributed`) and *not* a GPU scheduler. It's the coordination brain and data plane that let a training job survive worker crashes and resume from the last checkpoint without losing progress.
