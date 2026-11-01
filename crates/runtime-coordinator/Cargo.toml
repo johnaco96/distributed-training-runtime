@@ -26,7 +26,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util
 tokio-stream = "0.1"
 futures-core = "0.3"
 dashmap = "6"
-tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring"] }
+# Server::add_service needs the `router` feature. Workspace builds also get it
+# from runtime-bench's default tonic features, so list it here for `-p` builds.
+tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "router"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 serde_json = "1"
